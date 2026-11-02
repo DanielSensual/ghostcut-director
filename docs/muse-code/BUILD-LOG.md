@@ -69,10 +69,27 @@ Who did what, so the credit is exact.
 |---|---|---|
 | Brief | Project owner, with Claude Code | `SYNC-BRIEF.md`: the feature, contracts, limits and tests. |
 | Design | Meta **Muse Code** on **`muse-wonder-1.0`** | `SYNC-DESIGN.md` sections 1–13: module layout, data classes, probe/sidecar rules, the four methods, the combining order, edge cases, test list. |
-| Build | Meta **Muse Code** on **`muse-spark-1.3`** | `src/director/sync.py`, `tests/test_sync.py` (26 tests), the `sync` command in `src/director/cli.py`, the `AGENTS.md` layout line. TBD model calls; it ran the tests and fixed its own failures. |
-| Code review and live test | Claude Code, piloted by the owner | TBD by the owner (design section 13 gate: run the built command on a short real clip and look at the output). |
+| Build | Meta **Muse Code** on **`muse-spark-1.3`** | `src/director/sync.py`, `tests/test_sync.py` (26 tests), the `sync` command in `src/director/cli.py`, the `AGENTS.md` layout line. 69 model calls; it ran the tests and fixed its own failures. |
+| Code review and live test | Claude Code, piloted by the owner | Real recordings, below. Found the three waveform defects and the drift defect listed under Review fixes; Muse Code fixed them in two more runs (26 and 16 calls). |
 
-Muse Code token use: TBD (the owner fills them from the run log).
+Muse Code token use (from the run logs):
+
+| Run | Model | Calls | Input (cached) | Output | At list price |
+|---|---|---|---|---|---|
+| Design | `muse-wonder-1.0` | 23 | 2.65M (2.43M) | 38k | $2.11 |
+| Build | `muse-spark-1.3` | 69 | 9.56M (9.35M) | 94k | $2.07 |
+| Fix: scoring | `muse-spark-1.3` | 26 | 2.31M (2.17M) | 38k | $0.67 |
+| Fix: drift | `muse-spark-1.3` | 16 | 1.09M (0.97M) | 11k | $0.34 |
+
+The 11 errors Muse saw in `test_engine_render.py` and `test_render_runner.py` come from its sandbox blocking `ps`; outside it the full suite passes (346 tests).
+
+## Live test (2026-11-02, Claude Code)
+
+Three real recording pairs with known answers, plus one synthetic pair:
+
+- A 73.6 s camera clip against a 767 s lav recording, verified at +178.74 s. The first build placed it at +755.832 s (an 11 s edge overlap). After the fixes: +178.746 s at the clip's first frame, 132 ppm drift over 4 windows, Whisper agreeing to 6 ms. Measured independently at 1 ms, the whole-clip best lag is 178.752 s and the 20 s windows read 178.746 → 178.752 s, so the intercept is right.
+- Two interview pairs where the same stock question is asked in two different interviews: correctly left unplaced.
+- One 4K clip made into two cameras 6 s apart: +6.000 s, r 1.0.
 
 ## Build notes (Muse Code)
 
@@ -99,10 +116,23 @@ Who did what, so the credit is exact.
 |---|---|---|
 | Brief | Project owner, with Claude Code | `REFRAME-BRIEF.md`: the feature, contracts, rules and limits. |
 | Design | Meta **Muse Code** on **`muse-wonder-1.0`** | `REFRAME-DESIGN.md` sections 1–15: module layout, data classes, probe/proxy rules, shot detection and refinement, cost estimate and guard, SAM tracking, subject choice, gap filling and zero-phase smoothing, per-frame crop path, sendcmd render, payload, orchestrator and CLI, edge cases, test list. |
-| Build | Meta **Muse Code** on **`muse-spark-1.3`** | `src/director/reframe.py`, `tests/test_reframe.py` (29 tests), the `reframe` command in `src/director/cli.py`, the `AGENTS.md` layout line. TBD model calls; it ran the tests and fixed its own failures. |
-| Code review and live test | Claude Code, piloted by the owner | TBD by the owner (design section 14 gate: run the built command on a short real clip and look at the output). |
+| Build | Meta **Muse Code** on **`muse-spark-1.3`** | `src/director/reframe.py`, `tests/test_reframe.py` (29 tests), the `reframe` command in `src/director/cli.py`, the `AGENTS.md` layout line. 40 model calls; it ran the tests and fixed its own failures. |
+| Code review and live test | Claude Code, piloted by the owner | Real cut, below. No defects found. |
 
-Muse Code token use: TBD (the owner fills them from the run log).
+Muse Code token use (from the run logs):
+
+| Run | Model | Calls | Input (cached) | Output | At list price |
+|---|---|---|---|---|---|
+| Design | `muse-wonder-1.0` | 12 | 1.01M (0.86M) | 33k | $1.46 |
+| Build | `muse-spark-1.3` | 40 | 3.71M (3.57M) | 40k | $0.88 |
+
+## Live test (2026-11-02, Claude Code)
+
+A real 60 s 4K talking cut, five shots, the speaker deliberately off centre:
+
+- SAM 3.1 through guestlist: 350 frames billed, $0.07; the speaker followed in all five shots (presence 1.00).
+- Cuts found by scene detection and refined on the full-rate cut land within 1 ms of the reframe Claude Code wrote earlier in GhostCut (which Muse never saw); the smoothed crop path is within 1.9 px of it (mean 0.3 px), and frames at 8, 20, 30, 42 and 55 s are visually identical.
+- Render: 1080×1920, 3,595 frames, audio untouched (59.976 s); the crop moves by small steps inside shots and jumps only on the first frame of a new shot.
 
 ## Build notes (Muse Code)
 
