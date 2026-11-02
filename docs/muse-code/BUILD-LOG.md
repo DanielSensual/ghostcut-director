@@ -83,3 +83,28 @@ Muse Code token use: TBD (the owner fills them from the run log).
   own test alongside the Whisper voting tests.
 - Full suite: everything passes except 11 pre-existing errors in `tests/test_engine_render.py` and
   `tests/test_render_runner.py`, which fail identically on the untouched tree (the sandbox blocks `ps`).
+
+# Build log: `director reframe` (2026-11-02)
+
+Who did what, so the credit is exact.
+
+| Step | By | What |
+|---|---|---|
+| Brief | Project owner, with Claude Code | `REFRAME-BRIEF.md`: the feature, contracts, rules and limits. |
+| Design | Meta **Muse Code** on **`muse-wonder-1.0`** | `REFRAME-DESIGN.md` sections 1–15: module layout, data classes, probe/proxy rules, shot detection and refinement, cost estimate and guard, SAM tracking, subject choice, gap filling and zero-phase smoothing, per-frame crop path, sendcmd render, payload, orchestrator and CLI, edge cases, test list. |
+| Build | Meta **Muse Code** on **`muse-spark-1.3`** | `src/director/reframe.py`, `tests/test_reframe.py` (29 tests), the `reframe` command in `src/director/cli.py`, the `AGENTS.md` layout line. TBD model calls; it ran the tests and fixed its own failures. |
+| Code review and live test | Claude Code, piloted by the owner | TBD by the owner (design section 14 gate: run the built command on a short real clip and look at the output). |
+
+Muse Code token use: TBD (the owner fills them from the run log).
+
+## Build notes (Muse Code)
+
+- `parse_probe` refuses an already-vertical (or square) cut as well as `run`'s probe check, because the
+  design's test list requires the refusal at probe-parse level; `run` keeps its own check so the refusal
+  still fires when `probe_cut` is stubbed. Same message, same `ValueError`, nothing written either way.
+- The design's test gloss says a smoothed ramp stays within one sample-step everywhere; with the specified
+  reflected-boundary Gaussian the edge pull is ~sigma*sqrt(2/pi) ≈ 2.4 steps (measured 23.6 px on a
+  10 px/step ramp). The algorithm spec (§10.2) is normative — reflection is what makes the jitter test
+  pass — so the test asserts interior exactness within 1e-6 and edges bounded by 2.5 steps instead.
+- `shot_sample_range(shots, index, n_samples)` indexes into `shot_sample_ranges(shots, n_samples)`, since
+  sample ownership needs the whole shot list (bisect over start times).

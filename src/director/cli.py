@@ -98,6 +98,36 @@ def command_sync(args: argparse.Namespace) -> dict:
     return payload
 
 
+def command_reframe(args: argparse.Namespace) -> dict:
+    from .reframe import run as run_reframe
+
+    require_ffmpeg_binaries()
+    payload = run_reframe(
+        video_path=Path(args.video),
+        out_path=Path(args.out),
+        render_path=Path(args.render) if args.render else None,
+        shots_path=Path(args.shots) if args.shots else None,
+        no_sam=bool(args.no_sam),
+        max_usd=float(args.max_usd),
+    )
+    for shot in payload.get("shots", []):
+        if shot.get("method") == "subject":
+            subject = f"object {shot['object_id']} presence {shot['presence']:.2f}"
+        else:
+            subject = "-"
+        print(f"shot {shot['id']} {shot['start_s']:.3f}-{shot['end_s']:.3f}s "
+              f"{shot['method']} {subject} {shot['reason']}")
+    for warning in payload.get("warnings", []):
+        print(f"! {warning}")
+    print(f"spend ${payload.get('spend_usd', 0.0):.4f} "
+          f"({payload.get('frames_billed', 0)} frames billed, "
+          f"method {payload.get('method')})")
+    if payload.get("render"):
+        print(f"Rendered {args.render} ({payload['render']['crop_moves']} crop moves)")
+    print(f"Wrote {args.out}")
+    return payload
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="GhostCut Director: multicam cutting on Meta's Muse models")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -135,6 +165,16 @@ def build_parser() -> argparse.ArgumentParser:
                              help="Directory of word-timed Whisper JSON transcripts")
     sync_parser.add_argument("--out", default="sync.json", help="Where to write sync.json")
     sync_parser.set_defaults(func=command_sync)
+
+    reframe_parser = sub.add_parser("reframe", help="Reframe a 16:9 cut to 9:16 following the speaker")
+    reframe_parser.add_argument("video", help="Finished 16:9 cut to reframe")
+    reframe_parser.add_argument("--out", required=True, help="Where to write reframe.json")
+    reframe_parser.add_argument("--render", default=None, help="Render the vertical cut to this .mp4 path")
+    reframe_parser.add_argument("--shots", default=None, help="angles.json from director angles")
+    reframe_parser.add_argument("--no-sam", action="store_true", help="Centre every shot, no tracking")
+    reframe_parser.add_argument("--max-usd", type=float, default=2.0,
+                                help="Refuse above this estimated SAM spend")
+    reframe_parser.set_defaults(func=command_reframe)
 
     return parser
 
