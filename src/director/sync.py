@@ -503,12 +503,43 @@ def _get_envelope(path: str, has_audio: bool, hop_samples: int, envelopes: dict)
     return env
 
 
+N_EXACT_RESCORE = 8
+
+
+def _overlap_pearson(ref, tgt, lag: int) -> float:
+    """Exact Pearson correlation over the two segments' actual overlap.
+
+    With `lag = ref_index - target_index`, only the samples where both
+    envelopes exist take part; each segment is centred and scaled by its own
+    overlap statistics, so the result always lies within [-1, 1].
+    """
+    n, m = len(ref), len(tgt)
+    start = max(0, lag)
+    stop = min(n, m + lag)
+    if stop <= start:
+        return float("-inf")
+    x = np.asarray(ref[start:stop], dtype=np.float64)
+    y = np.asarray(tgt[start - lag:stop - lag], dtype=np.float64)
+    xc = x - float(np.mean(x))
+    yc = y - float(np.mean(y))
+    denom = float(np.sqrt(float(np.sum(xc * xc)) * float(np.sum(yc * yc))))
+    if denom == 0.0:
+        return float("-inf")
+    return float(max(-1.0, min(1.0, float(np.sum(xc * yc)) / denom)))
+
+
 def find_peak(ref_env, tgt_env, hop_s: float, *,
               window_s: tuple[float, float] | None = None) -> WaveformPeak | None:
     """Best lag of the target against the reference, as a relative offset.
 
     With `lag = ref_index - target_index`, `lag * hop_s` is
     `target.offset_s - anchor.offset_s`.
+
+    The FFT pass only proposes candidate lags; the reported r, second_r,
+    margin and clear come from the exact Pearson correlation computed over
+    each candidate's actual overlap, so short edge overlaps cannot inflate
+    past 1 and every search (coarse, refinement, guided, drift) compares
+    like with like.
     """
     if np is None:
         return None
@@ -531,25 +562,55 @@ def find_peak(ref_env, tgt_env, hop_s: float, *,
     raw = corr[np.where(lags >= 0, lags, size + lags)]
     counts = np.where(lags >= 0, np.minimum(n, m + lags) - lags, np.minimum(n, m + lags))
     counts = np.maximum(counts, 0)
-    r = np.full(n + m - 1, -np.inf)
+    approx = np.full(n + m - 1, -np.inf)
     ok = counts > 0
-    r[ok] = raw[ok] / counts[ok]
+    approx[ok] = raw[ok] / counts[ok]
     overlap_s = counts * hop_s
     required = min(MIN_OVERLAP_FLOOR_S, 0.5 * min(n, m) * hop_s)
-    r[overlap_s + 1e-9 < required] = -np.inf
+    approx[overlap_s + 1e-9 < required] = -np.inf
     if window_s is not None:
         centre, radius = window_s
-        r[np.abs(lags * hop_s - centre) > radius + 1e-12] = -np.inf
-    best = int(np.argmax(r))
-    if not np.isfinite(r[best]):
+        approx[np.abs(lags * hop_s - centre) > radius + 1e-12] = -np.inf
+    order = np.argsort(-approx, kind="stable")
+    # Spread the re-scored candidates across distinct peaks: neighbouring
+    # lags of one inflated hump must not crowd out a rival seconds away.
+    suppressed: list[int] = []
+    for i in order:
+        i = int(i)
+        if not np.isfinite(approx[i]):
+            continue
+        if all(abs(float(lags[i]) - float(lags[j])) * hop_s
+               >= SECOND_PEAK_EXCLUSION_S - 1e-9 for j in suppressed):
+            suppressed.append(i)
+        if len(suppressed) >= N_EXACT_RESCORE:
+            break
+    if not suppressed:
         return None
-    best_r = float(r[best])
-    far = np.abs(lags - lags[best]) * hop_s >= SECOND_PEAK_EXCLUSION_S - 1e-9
-    far_ok = far & np.isfinite(r)
-    second_r = float(np.max(r[far_ok])) if bool(np.any(far_ok)) else -1.0
+    exact = {i: _overlap_pearson(ref, tgt, int(lags[i])) for i in suppressed}
+    best = max(suppressed, key=lambda i: (exact[i], float(approx[i])))
+    best_r = float(exact[best])
+    if not np.isfinite(best_r):
+        return None
+    best_lag = int(lags[best])
+    far = np.abs(lags - best_lag) * hop_s >= SECOND_PEAK_EXCLUSION_S - 1e-9
+    rivals = [i for i in suppressed
+              if i != best and bool(far[i]) and np.isfinite(exact[i])]
+    second_r = -1.0
+    if rivals:
+        second_r = float(max(exact[i] for i in rivals))
+    else:
+        far_candidates = [int(i) for i in order
+                          if bool(far[int(i)])
+                          and np.isfinite(approx[int(i)])][:N_EXACT_RESCORE]
+        if far_candidates:
+            far_exact = [_overlap_pearson(ref, tgt, int(lags[i]))
+                         for i in far_candidates]
+            far_finite = [v for v in far_exact if np.isfinite(v)]
+            if far_finite:
+                second_r = float(max(far_finite))
     margin = best_r - second_r
     return WaveformPeak(
-        offset_s=float(lags[best]) * hop_s, r=best_r, second_r=second_r,
+        offset_s=float(best_lag) * hop_s, r=best_r, second_r=second_r,
         margin=margin, overlap_s=float(overlap_s[best]),
         clear=best_r >= R_CLEAR and margin >= MARGIN_CLEAR,
     )
@@ -612,15 +673,28 @@ def waveform_estimate(target: ClipResult, anchor: ClipResult, envelopes: dict, *
     if ref_f is None or tgt_f is None:
         return None
     if guide is None:
-        peak = find_peak(ref_f, tgt_f, REFINE_HOP_S,
+        fine = find_peak(ref_f, tgt_f, REFINE_HOP_S,
                          window_s=(coarse.offset_s, 0.015))
+        if fine is None:
+            return None
+        # The refinement only moves the offset to the 1 ms grid: r,
+        # second_r, margin and clear stay with the coarse global search,
+        # where the competing peaks exist.
+        peak_offset, peak_overlap = fine.offset_s, coarse.overlap_s
+        peak_r, second_r, margin, clear = (coarse.r, coarse.second_r,
+                                          coarse.margin, coarse.clear)
+        drift_centre = coarse.offset_s
     else:
         centre, radius, _method = guide
-        peak = find_peak(ref_f, tgt_f, REFINE_HOP_S, window_s=(centre, radius))
-    if peak is None:
-        return None
-    drift_centre = coarse.offset_s if guide is None else peak.offset_s
-    relative = peak.offset_s
+        guided = find_peak(ref_f, tgt_f, REFINE_HOP_S,
+                           window_s=(centre, radius))
+        if guided is None:
+            return None
+        peak_offset, peak_overlap = guided.offset_s, guided.overlap_s
+        peak_r, second_r, margin, clear = (guided.r, guided.second_r,
+                                          guided.margin, guided.clear)
+        drift_centre = guided.offset_s
+    relative = peak_offset
     drift_ppm: float | None = None
     drift_windows = 0
     measured = measure_drift(ref_f, tgt_f, drift_centre, target.camera.duration_s)
@@ -628,10 +702,10 @@ def waveform_estimate(target: ClipResult, anchor: ClipResult, envelopes: dict, *
         relative, drift_ppm, drift_windows = measured
     return Estimate(
         method="waveform", offset_s=anchor.offset_s + relative,
-        confidence=min(1.0, max(0.0, peak.r)), precision_s=PRECISION_S["waveform"],
+        confidence=min(1.0, max(0.0, peak_r)), precision_s=PRECISION_S["waveform"],
         against=anchor.label,
-        detail={"r": peak.r, "second_r": peak.second_r, "margin": peak.margin,
-                "clear": peak.clear, "overlap_s": peak.overlap_s,
+        detail={"r": peak_r, "second_r": second_r, "margin": margin,
+                "clear": clear, "overlap_s": peak_overlap,
                 "guided": guide is not None,
                 "guide_method": guide[2] if guide is not None else None,
                 "drift_ppm": drift_ppm, "drift_windows": drift_windows},

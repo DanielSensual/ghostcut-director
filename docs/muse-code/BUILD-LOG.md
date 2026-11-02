@@ -84,6 +84,12 @@ Muse Code token use: TBD (the owner fills them from the run log).
 - Full suite: everything passes except 11 pre-existing errors in `tests/test_engine_render.py` and
   `tests/test_render_runner.py`, which fail identically on the untouched tree (the sandbox blocks `ps`).
 
+## Review fixes (Muse Code on `muse-spark-1.3`; defects found on real audio by the owner and Claude Code)
+
+- The waveform score was a whole-clip z-scored FFT dot product divided by the overlap count, not a Pearson correlation (identical audio scored r 1.003, an 11 s edge overlap 0.744 and won): the FFT pass now only proposes candidate lags spread across distinct peaks, and the reported r is the exact Pearson over each candidate's actual overlap (top 8 rescored, best wins).
+- `clear` and `margin` came from the ±15 ms 1 ms refinement, whose window holds no rival 1 s away (second_r always −1, every peak "clear"): they now come from the coarse global search (exact-r best minus best exact-r at least 1 s away, also rescored exactly), while the refinement only moves the offset to the 1 ms grid.
+- The guided re-search compared its FFT-approximate r against the global one: it now reports the same exact Pearson, so the "guided r ≥ global r − 0.02" comparison is like with like.
+
 # Build log: `director reframe` (2026-11-02)
 
 Who did what, so the credit is exact.

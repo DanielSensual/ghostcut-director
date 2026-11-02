@@ -218,6 +218,15 @@ def _aperiodic_positions() -> list[float]:
     return positions
 
 
+def _positions_until(end: float) -> list[float]:
+    rng = __import__("random").Random(42)
+    positions, pos = [], 2.0
+    while pos < end:
+        positions.append(pos)
+        pos += rng.uniform(2.5, 6.5)
+    return positions
+
+
 def _envelopes(**paths: np.ndarray) -> dict:
     env: dict = {}
     for path, samples in paths.items():
@@ -277,6 +286,116 @@ class WaveformTests(unittest.TestCase):
         assert plain is not None
         drifted = plain.detail["drift_ppm"]
         self.assertTrue(drifted is None or abs(drifted) < 40.0)
+
+
+@unittest.skipUnless(HAS_NUMPY, "waveform sync needs numpy")
+class WaveformExactScoreTests(unittest.TestCase):
+    def test_identical_audio_scores_one_never_above(self) -> None:
+        assert np is not None
+        sr = sync.SAMPLE_RATE
+        content = _bursts(70.0, _aperiodic_positions(), seed=7)
+        anchor_s = content[:60 * sr].copy()
+        target_s = content[int(6 * sr):int(66 * sr)].copy()
+        env = _envelopes(**{"/c/A.mp4": anchor_s, "/c/B.mp4": target_s})
+        est = sync.waveform_estimate(_clip("B", None), _clip("A", 0.0), env)
+        assert est is not None
+        self.assertAlmostEqual(est.offset_s, 6.0, delta=0.005)
+        self.assertLessEqual(est.detail["r"], 1.0)
+        self.assertAlmostEqual(est.detail["r"], 1.0, places=3)
+        self.assertLessEqual(est.detail["second_r"], 1.0)
+        self.assertGreaterEqual(est.detail["second_r"], -1.0)
+
+    def test_find_peak_scores_stay_within_bounds(self) -> None:
+        assert np is not None
+        rng = np.random.default_rng(11)
+        ref = sync.log_envelope(
+            rng.standard_normal(60 * sync.SAMPLE_RATE).astype(np.float32), 80)
+        tgt = sync.log_envelope(
+            rng.standard_normal(60 * sync.SAMPLE_RATE).astype(np.float32), 80)
+        peak = sync.find_peak(ref, tgt, sync.COARSE_HOP_S)
+        assert peak is not None
+        self.assertLessEqual(peak.r, 1.0)
+        self.assertGreaterEqual(peak.r, -1.0)
+        self.assertLessEqual(peak.second_r, 1.0)
+        self.assertGreaterEqual(peak.second_r, -1.0)
+        same = sync.find_peak(ref, ref, sync.COARSE_HOP_S)
+        assert same is not None
+        self.assertLessEqual(same.r, 1.0)
+        self.assertAlmostEqual(same.r, 1.0, places=6)
+
+    def test_short_clip_rejects_loud_edge_decoy(self) -> None:
+        assert np is not None
+        sr = sync.SAMPLE_RATE
+        ref = _bursts(150.0, _positions_until(125.0), seed=7, noise=0.02)
+        true_start, tgt_dur = 60.0, 30.0
+        span = ref[int(true_start * sr):int((true_start + tgt_dur) * sr)].copy()
+        target = (2.5 * span).copy()
+        target[:int(12 * sr)] *= 8.0
+        target = (target + 0.3 * np.random.default_rng(3).standard_normal(
+            len(target))).astype(np.float32)
+        loud = ref.copy()
+        loud[int(138 * sr):] = (
+            12.0 * np.random.default_rng(99).standard_normal(
+                len(loud) - int(138 * sr))).astype(np.float32)
+        env = _envelopes(**{"/c/A.mp4": loud, "/c/B.mp4": target})
+        est = sync.waveform_estimate(_clip("B", None, duration=tgt_dur),
+                                     _clip("A", 0.0, duration=150.0), env)
+        assert est is not None
+        self.assertAlmostEqual(est.offset_s, true_start, delta=0.02)
+        self.assertTrue(est.detail["clear"])
+        self.assertLessEqual(est.detail["r"], 1.0)
+        self.assertGreater(est.detail["overlap_s"], 20.0)
+
+    def test_strong_competing_peak_is_not_clear(self) -> None:
+        assert np is not None
+        sr = sync.SAMPLE_RATE
+        pattern = _bursts(20.0, _positions_until(18.0), seed=21, noise=0.02)
+        ref = (0.02 * np.random.default_rng(22).standard_normal(
+            int(80 * sr))).astype(np.float32)
+        ref[int(10 * sr):int(30 * sr)] = pattern
+        ref[int(40 * sr):int(60 * sr)] = pattern.copy()
+        target = pattern.copy()
+        env = _envelopes(**{"/c/A.mp4": ref, "/c/B.mp4": target})
+        est = sync.waveform_estimate(_clip("B", None, duration=20.0),
+                                     _clip("A", 0.0, duration=80.0), env)
+        assert est is not None
+        self.assertLess(min(abs(est.offset_s - 10.0), abs(est.offset_s - 40.0)),
+                        0.02)
+        self.assertFalse(est.detail["clear"])
+        self.assertGreater(est.detail["second_r"], 0.9)
+        self.assertLess(est.detail["margin"], sync.MARGIN_CLEAR)
+        self.assertAlmostEqual(est.detail["margin"],
+                               est.detail["r"] - est.detail["second_r"],
+                               places=9)
+
+    def test_whisper_hint_rescues_wrong_global_peak(self) -> None:
+        assert np is not None
+        sr = sync.SAMPLE_RATE
+        pattern = _bursts(20.0, _positions_until(18.0), seed=31, noise=0.02)
+        ref = (0.02 * np.random.default_rng(32).standard_normal(
+            int(100 * sr))).astype(np.float32)
+        ref[int(10 * sr):int(30 * sr)] = pattern
+        ref[int(60 * sr):int(80 * sr)] = (
+            0.8 * pattern + 0.05 * np.random.default_rng(33).standard_normal(
+                len(pattern))).astype(np.float32)
+        target = pattern.copy()
+        env = _envelopes(**{"/c/A.mp4": ref, "/c/B.mp4": target})
+        anchor = _clip("A", 0.0, duration=100.0)
+        viewer = _clip("B", None, duration=20.0)
+        glob = sync.waveform_estimate(viewer, anchor, env)
+        assert glob is not None
+        self.assertAlmostEqual(glob.offset_s, 10.0, delta=0.05)
+        guide = (60.0, sync.PRECISION_S["whisper"] + sync.GUIDE_EXTRA_S,
+                 "whisper")
+        guided = sync.waveform_estimate(viewer, anchor, env, guide=guide)
+        assert guided is not None
+        self.assertAlmostEqual(guided.offset_s, 60.0, delta=0.02)
+        self.assertLessEqual(guided.detail["r"], 1.0)
+        hint = _estimate("whisper", 60.0, "A", 2 / 3, 0.15, moments=2,
+                         votes=2, cluster_votes=2)
+        chosen, taken = sync.resolve_guided(glob, hint, guided)
+        self.assertIs(chosen, guided)
+        self.assertTrue(taken)
 
 
 @unittest.skipUnless(HAS_NUMPY, "waveform sync needs numpy")
