@@ -60,3 +60,26 @@ At list price with no cache discount that is at most about $9.60 of the event's 
     check named exactly that ("B brighter, warmer") on all three moments, for $0.027.
 - `angles --grade --render`: graded shots use their camera's cube, the Rec.709 reference renders untouched, the
   output is tagged BT.709 limited, video and audio both 59.977 s, 1.4 GB peak memory.
+
+# Build log: `director sync` (2026-11-02)
+
+Who did what, so the credit is exact.
+
+| Step | By | What |
+|---|---|---|
+| Brief | Project owner, with Claude Code | `SYNC-BRIEF.md`: the feature, contracts, limits and tests. |
+| Design | Meta **Muse Code** on **`muse-wonder-1.0`** | `SYNC-DESIGN.md` sections 1–13: module layout, data classes, probe/sidecar rules, the four methods, the combining order, edge cases, test list. |
+| Build | Meta **Muse Code** on **`muse-spark-1.3`** | `src/director/sync.py`, `tests/test_sync.py` (26 tests), the `sync` command in `src/director/cli.py`, the `AGENTS.md` layout line. TBD model calls; it ran the tests and fixed its own failures. |
+| Code review and live test | Claude Code, piloted by the owner | TBD by the owner (design section 13 gate: run the built command on a short real clip and look at the output). |
+
+Muse Code token use: TBD (the owner fills them from the run log).
+
+## Build notes (Muse Code)
+
+- `measure_drift` returns `(offset_at_start_s, drift_ppm, n_windows)` rather than the designed pair, because
+  the waveform detail is specified to carry `drift_windows` and there is no other channel for the count.
+- `tests/test_sync.py` has 26 test methods for the design's 24 items: item 21 is two tests (place against
+  a non-reference clip; stop after a trusted waveform against the reference) and `normalize_word` has its
+  own test alongside the Whisper voting tests.
+- Full suite: everything passes except 11 pre-existing errors in `tests/test_engine_render.py` and
+  `tests/test_render_runner.py`, which fail identically on the untouched tree (the sandbox blocks `ps`).

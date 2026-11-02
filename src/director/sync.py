@@ -1,0 +1,1170 @@
+"""Multicam sync: place every clip on one shared timeline.
+
+Each clip started at a different moment, so `director sync` finds where every
+clip sits on one timeline and writes `sync.json`. Several methods each estimate
+a clip's offset (timecode, capture clock, waveform cross-correlation, Whisper
+word matches), then they are checked against each other, because any single
+method can be confidently wrong. Convention: a clip's `offset_s` is where its
+first sample sits on the timeline, so clip time `t` is timeline time
+`t + offset_s`; the reference clip sits at 0.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import shutil
+import subprocess
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+
+from ghostcut.config import write_json
+from ghostcut.ffmpeg_tools import (
+    ToolingError,
+    coerce_float,
+    parse_fraction,
+    run_command,
+    snap_frame_rate,
+)
+
+try:
+    import numpy as np
+except ImportError:  # the director extra is optional
+    np = None  # type: ignore[assignment]
+
+METHODS = ("timecode", "clock", "waveform", "whisper")
+PRECISION_S = {"timecode": 0.0, "clock": 2.0, "waveform": 0.002, "whisper": 0.15}
+CONFIDENCE = {"timecode": 0.5, "clock": 0.2}
+
+SAMPLE_RATE = 8000
+BAND_HZ = (200, 3400)
+COARSE_HOP_S = 0.010
+REFINE_HOP_S = 0.001
+LOG_EPS = 1e-4
+MIN_OVERLAP_FLOOR_S = 10.0
+R_CLEAR = 0.45
+MARGIN_CLEAR = 0.08
+SECOND_PEAK_EXCLUSION_S = 1.0
+GUIDE_EXTRA_S = 0.5
+GUIDE_R_TOLERANCE = 0.02
+WHISPER_PHRASE_WORDS = 3
+WHISPER_CLUSTER_S = 0.3
+WHISPER_MIN_MOMENTS = 2
+WHISPER_MIN_CONFIDENCE = 0.6
+DRIFT_WINDOW_S = 20.0
+DRIFT_MIN_WINDOWS = 3
+DRIFT_WINDOW_MIN_R = 0.30
+DRIFT_SEARCH_S = 0.25
+DAY_S = 86400.0
+
+
+class SyncError(RuntimeError):
+    """A sync step failed (unprobeable clip, no usable streams)."""
+
+
+@dataclass(slots=True)
+class CameraInfo:
+    label: str
+    path: str
+    make: str = ""
+    model: str = ""
+    lens: str = ""
+    fps: float = 0.0
+    width: int = 0
+    height: int = 0
+    duration_s: float = 0.0
+    has_audio: bool = False
+    gamma: str = ""
+    timecode: str | None = None
+    tc_rate: float | None = None
+    captured_at: str | None = None
+
+
+@dataclass(slots=True)
+class Estimate:
+    method: str
+    offset_s: float
+    confidence: float
+    precision_s: float
+    against: str
+    detail: dict = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class EstimateCheck:
+    a: str
+    b: str
+    against_a: str
+    against_b: str
+    delta_s: float
+    threshold_s: float
+    agree: bool
+
+
+@dataclass(slots=True)
+class ClipResult:
+    label: str
+    camera: CameraInfo
+    offset_s: float | None
+    method: str | None
+    estimates: list[Estimate] = field(default_factory=list)
+    checks: list[EstimateCheck] = field(default_factory=list)
+    drift_ppm: float | None = None
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class SonySidecar:
+    gamma: str = ""
+    captured_raw: str | None = None
+    tc_fps: float | None = None
+    timecode: str | None = None
+
+
+@dataclass(slots=True)
+class TranscriptWord:
+    word: str
+    start_s: float
+    end_s: float
+
+
+@dataclass(slots=True)
+class WaveformPeak:
+    offset_s: float
+    r: float
+    second_r: float
+    margin: float
+    overlap_s: float
+    clear: bool
+
+
+def _label_for_index(i: int) -> str:
+    """A, …, Z, AA, AB, … for the i-th non-reference clip (0-based)."""
+    s = ""
+    n = i
+    while True:
+        s = chr(65 + n % 26) + s
+        n = n // 26 - 1
+        if n < 0:
+            return s
+
+
+# ---------------------------------------------------------------- probe
+
+
+def probe_clip(path: Path) -> dict:
+    """ffprobe format duration, stream kinds/rates/tags; SyncError if unusable."""
+    result = run_command(
+        ["ffprobe", "-v", "error", "-show_entries",
+         "format=duration:stream=index,codec_type,codec_name,width,height,"
+         "r_frame_rate,avg_frame_rate,sample_rate,channels,color_transfer"
+         ":stream_tags:format_tags",
+         "-of", "json", str(path)]
+    )
+    try:
+        probe = json.loads(result.stdout)
+    except ValueError:
+        raise SyncError(f"no usable streams: {path}")
+    streams = probe.get("streams") or []
+    kinds = {s.get("codec_type") for s in streams if isinstance(s, dict)}
+    if "video" not in kinds and "audio" not in kinds:
+        raise SyncError(f"no usable streams: {path}")
+    return probe
+
+
+def _merged_tags(streams: list[dict], format_tags: dict, skip: int) -> list[dict]:
+    """Tag dicts in search order: the video stream, format, then other streams."""
+    ordered = [s for s in streams if s.get("codec_type") == "video"]
+    rest = [s for s in streams if s.get("codec_type") != "video"]
+    scopes: list[dict] = []
+    for scope in ordered[:1]:
+        tags = scope.get("tags")
+        if isinstance(tags, dict):
+            scopes.append({str(k).lower(): v for k, v in tags.items()})
+    if isinstance(format_tags, dict):
+        scopes.append({str(k).lower(): v for k, v in format_tags.items()})
+    for scope in rest[skip:]:
+        tags = scope.get("tags")
+        if isinstance(tags, dict):
+            scopes.append({str(k).lower(): v for k, v in tags.items()})
+    return scopes
+
+
+def _first_tag(scopes: list[dict], *names: str) -> str | None:
+    for scope in scopes:
+        for name in names:
+            value = scope.get(name)
+            if value is not None and str(value).strip():
+                return str(value).strip()
+    return None
+
+
+def map_gamma(value: str | None) -> str:
+    """Sidecar equation or transfer string to the grade.py gamma vocabulary."""
+    s = (value or "").strip().lower()
+    if not s:
+        return ""
+    if "s-log3" in s and "cine" in s:
+        return "s-log3-cine"
+    if "s-log3" in s:
+        return "s-log3"
+    if "hlg" in s or "arib-std-b67" in s:
+        return "hlg"
+    if "pq" in s or "2084" in s or "smpte2084" in s:
+        return "pq"
+    if "709" in s:
+        return "rec709"
+    return s
+
+
+def find_sidecar(clip_path: Path) -> Path | None:
+    """The Sony XML next to the clip (`<stem>M01.XML`, exact case), if present."""
+    candidate = clip_path.parent / f"{clip_path.stem}M01.XML"
+    return candidate if candidate.exists() else None
+
+
+def decode_ltc_hex(value: str | None) -> str | None:
+    """8 hex digits (frames, seconds, minutes, hours) to `HH:MM:SS:FF`.
+
+    Each byte is BCD after masking off the flag bits that share the byte.
+    """
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-fA-F]{8}", value.strip()):
+        return None
+    raw = bytes(int(value.strip()[i:i + 2], 16) for i in (0, 2, 4, 6))
+    masked = (raw[0] & 0x3F, raw[1] & 0x7F, raw[2] & 0x7F, raw[3] & 0x3F)
+    parts = []
+    for byte in masked:
+        tens, units = byte >> 4, byte & 0x0F
+        if units > 9:
+            return None
+        parts.append(tens * 10 + units)
+    frames, seconds, minutes, hours = parts
+    if seconds > 59 or minutes > 59:
+        return None
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}:{frames:02d}"
+
+
+def _local(tag: str) -> str:
+    return tag.split("}", 1)[-1]
+
+
+def parse_sony_sidecar(path: Path | None) -> SonySidecar:
+    """Creation date, gamma, tc rate and frame-0 timecode; never raises."""
+    empty = SonySidecar()
+    if path is None:
+        return empty
+    try:
+        root = ET.parse(path).getroot()
+    except Exception:
+        return empty
+    try:
+        out = SonySidecar()
+        for elem in root.iter():
+            name = _local(elem.tag)
+            if name == "CreationDate" and out.captured_raw is None:
+                raw = elem.get("value") or (elem.text or "").strip() or None
+                out.captured_raw = raw.strip() if raw else None
+            elif name == "CaptureGammaEquation" and not out.gamma:
+                raw = elem.get("value") or (elem.text or "")
+                out.gamma = map_gamma(raw)
+        for table in root.iter():
+            if _local(table.tag) != "LtcChangeTable":
+                continue
+            rate = coerce_float(table.get("tcFps"))
+            out.tc_fps = rate if rate > 0 else None
+            for change in list(table):
+                if _local(change.tag) != "LtcChange":
+                    continue
+                if str(change.get("frameCount")) != "0":
+                    continue
+                decoded = decode_ltc_hex(change.get("value"))
+                if decoded is not None:
+                    out.timecode = decoded
+                break
+            break
+        return out
+    except Exception:
+        return empty
+
+
+def camera_from_probe(label: str, path: str, probe: dict, sidecar: SonySidecar) -> CameraInfo:
+    """CameraInfo from an ffprobe payload plus the Sony sidecar. Pure."""
+    streams = [s for s in (probe.get("streams") or []) if isinstance(s, dict)]
+    fmt = probe.get("format") or {}
+    format_tags = fmt.get("tags") if isinstance(fmt.get("tags"), dict) else {}
+    video = next((s for s in streams if s.get("codec_type") == "video"), None)
+    scopes = _merged_tags(streams, format_tags, 0)
+    duration_s = coerce_float(fmt.get("duration"))
+    if not duration_s and isinstance(video, dict):
+        duration_s = coerce_float(video.get("duration"))
+    raw_fps = 0.0
+    width = height = 0
+    if video is not None:
+        raw_fps = parse_fraction(video.get("avg_frame_rate") or video.get("r_frame_rate"))
+        width = int(video.get("width") or 0)
+        height = int(video.get("height") or 0)
+    fps = float(snap_frame_rate(raw_fps)) if raw_fps > 0 else 0.0
+    has_audio = any(s.get("codec_type") == "audio" for s in streams)
+    timecode = _first_tag(scopes, "timecode") or sidecar.timecode
+    if sidecar.tc_fps:
+        tc_rate: float | None = sidecar.tc_fps
+    elif timecode and raw_fps > 0:
+        snapped = snap_frame_rate(raw_fps)
+        tc_rate = snapped.numerator / 1000 if snapped.denominator == 1001 else float(snapped)
+    else:
+        tc_rate = None
+    gamma = sidecar.gamma or map_gamma(
+        video.get("color_transfer") if isinstance(video, dict) else None)
+    captured_at: str | None = None
+    quicktime = _first_tag(scopes, "com.apple.quicktime.creationdate")
+    generic = _first_tag(scopes, "creation_time")
+    for raw in (quicktime, sidecar.captured_raw, generic):
+        parsed = parse_captured_at(raw)
+        if parsed is not None:
+            captured_at = parsed.isoformat()
+            break
+    return CameraInfo(
+        label=label, path=path,
+        make=_first_tag(scopes, "make", "manufacturer",
+                        "com.apple.quicktime.make") or "",
+        model=_first_tag(scopes, "model", "com.apple.quicktime.model") or "",
+        lens=_first_tag(scopes, "lens", "lensmodel", "lens_model",
+                        "com.apple.quicktime.lensmodel") or "",
+        fps=fps, width=width, height=height, duration_s=duration_s,
+        has_audio=has_audio, gamma=gamma, timecode=timecode,
+        tc_rate=tc_rate, captured_at=captured_at,
+    )
+
+
+# ---------------------------------------------------------------- timecode
+
+_TC_RE = re.compile(r"^(\d{2}):(\d{2}):(\d{2})([:;])(\d{2})$")
+
+
+def timecode_to_seconds(tc: str, fps: float, tc_rate: float | None = None) -> float:
+    """A start timecode to real seconds since midnight. Pure."""
+    match = _TC_RE.match((tc or "").strip())
+    if not match:
+        raise ValueError(f"bad timecode: {tc!r}")
+    hh, mm, ss = int(match.group(1)), int(match.group(2)), int(match.group(3))
+    drop = match.group(4) == ";"
+    ff = int(match.group(5))
+    if mm >= 60 or ss >= 60:
+        raise ValueError(f"bad timecode: {tc!r}")
+    if tc_rate is not None and tc_rate > 0:
+        snapped_tc = snap_frame_rate(float(tc_rate))
+        rate = snapped_tc.numerator // 1000 if snapped_tc.denominator == 1001 else int(round(tc_rate))
+    elif fps > 0:
+        snapped = snap_frame_rate(fps)
+        rate = snapped.numerator // 1000 if snapped.denominator == 1001 else int(snapped)
+    else:
+        raise ValueError(f"timecode rate unknown: {tc!r}")
+    if ff >= rate:
+        raise ValueError(f"timecode frames beyond rate: {tc!r}")
+    if drop:
+        if rate not in (30, 60):
+            raise ValueError(f"drop-frame needs a 30 or 60 rate: {tc!r}")
+        skipped = rate // 15
+        total_minutes = hh * 60 + mm
+        dropped = skipped * (total_minutes - total_minutes // 10)
+        frames = (hh * 3600 + mm * 60 + ss) * rate + ff - dropped
+    else:
+        frames = (hh * 3600 + mm * 60 + ss) * rate + ff
+    if fps > 0 and snap_frame_rate(fps).denominator == 1001:
+        return frames / rate * 1001 / 1000
+    return frames / rate
+
+
+def wrap_day_delta(delta_s: float) -> float:
+    """The same time difference inside (-12 h, +12 h]: a midnight wrap."""
+    return (delta_s + DAY_S / 2) % DAY_S - DAY_S / 2
+
+
+def _tc_seconds(camera: CameraInfo) -> float:
+    if not camera.timecode:
+        raise ValueError("clip has no timecode")
+    return timecode_to_seconds(camera.timecode, camera.fps, camera.tc_rate)
+
+
+def timecode_estimate(target: ClipResult, anchor: ClipResult) -> Estimate | None:
+    """Offset from the two start timecodes, each in its own rate. Pure."""
+    if anchor.offset_s is None:
+        return None
+    try:
+        delta = wrap_day_delta(_tc_seconds(target.camera) - _tc_seconds(anchor.camera))
+    except ValueError:
+        return None
+    return Estimate(
+        method="timecode", offset_s=anchor.offset_s + delta,
+        confidence=CONFIDENCE["timecode"], precision_s=PRECISION_S["timecode"],
+        against=anchor.label,
+        detail={"target_timecode": target.camera.timecode,
+                "anchor_timecode": anchor.camera.timecode,
+                "target_tc_rate": target.camera.tc_rate,
+                "anchor_tc_rate": anchor.camera.tc_rate},
+    )
+
+
+# ---------------------------------------------------------------- capture clock
+
+_ZONE_RE = re.compile(r"([+-]\d{2})(\d{2})$")
+
+
+def parse_captured_at(value: str | None) -> datetime | None:
+    """A capture stamp to an aware datetime; never raises."""
+    if not value or not str(value).strip():
+        return None
+    s = str(value).strip()
+    if s[-1:] in ("Z", "z"):
+        s = s[:-1] + "+00:00"
+    if "T" not in s and " " in s:
+        s = s.replace(" ", "T", 1)
+    s = _ZONE_RE.sub(r"\1:\2", s)
+    try:
+        parsed = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def clock_estimate(target: ClipResult, anchor: ClipResult) -> Estimate | None:
+    """Offset from the two capture stamps. Pure; coarse (±2 s at best)."""
+    if anchor.offset_s is None:
+        return None
+    target_dt = parse_captured_at(target.camera.captured_at)
+    anchor_dt = parse_captured_at(anchor.camera.captured_at)
+    if target_dt is None or anchor_dt is None:
+        return None
+    return Estimate(
+        method="clock",
+        offset_s=anchor.offset_s + (target_dt - anchor_dt).total_seconds(),
+        confidence=CONFIDENCE["clock"], precision_s=PRECISION_S["clock"],
+        against=anchor.label,
+        detail={"target_captured_at": target.camera.captured_at,
+                "anchor_captured_at": anchor.camera.captured_at},
+    )
+
+
+# ---------------------------------------------------------------- waveform
+
+Envelopes = dict  # (clip_path, hop_samples) -> np.ndarray; (clip_path, "samples") cached audio
+
+
+def decode_command(path: Path) -> list[str]:
+    """Mono 8 kHz speech-band audio on stdout as f32le."""
+    low, high = BAND_HZ
+    return ["ffmpeg", "-v", "error", "-i", str(path), "-map", "0:a:0", "-ac", "1",
+            "-ar", str(SAMPLE_RATE), "-af", f"highpass=f={low},lowpass=f={high}",
+            "-f", "f32le", "pipe:1"]
+
+
+def decode_samples(path: Path, *, has_audio: bool = True):
+    """Decoded mono samples, or None when there is nothing to decode."""
+    if np is None or not has_audio:
+        return None
+    try:
+        done = subprocess.run(decode_command(Path(path)), capture_output=True, timeout=600)
+    except Exception:
+        return None
+    if done.returncode != 0 or not done.stdout:
+        return None
+    return np.frombuffer(done.stdout, dtype=np.float32).copy()
+
+
+def log_envelope(samples, hop_samples: int):
+    """Log RMS per non-overlapping block; what near and far mics share."""
+    blocks = len(samples) // int(hop_samples)
+    if blocks < 1:
+        return np.zeros(0) if np is not None else []
+    shaped = np.asarray(samples[:blocks * hop_samples], dtype=np.float64)
+    shaped = shaped.reshape(blocks, int(hop_samples))
+    rms = np.sqrt(np.mean(shaped * shaped, axis=1))
+    return np.log(rms + LOG_EPS)
+
+
+def _get_envelope(path: str, has_audio: bool, hop_samples: int, envelopes: dict):
+    cached = envelopes.get((path, hop_samples))
+    if cached is not None:
+        return cached
+    samples = envelopes.get((path, "samples"))
+    if samples is None and (path, "samples") not in envelopes:
+        samples = decode_samples(Path(path), has_audio=has_audio)
+        envelopes[(path, "samples")] = samples
+    if samples is None:
+        return None
+    env = log_envelope(samples, hop_samples)
+    if env is None or len(env) < 2:
+        return None
+    envelopes[(path, hop_samples)] = env
+    return env
+
+
+def find_peak(ref_env, tgt_env, hop_s: float, *,
+              window_s: tuple[float, float] | None = None) -> WaveformPeak | None:
+    """Best lag of the target against the reference, as a relative offset.
+
+    With `lag = ref_index - target_index`, `lag * hop_s` is
+    `target.offset_s - anchor.offset_s`.
+    """
+    if np is None:
+        return None
+    ref = np.asarray(ref_env, dtype=np.float64)
+    tgt = np.asarray(tgt_env, dtype=np.float64)
+    n, m = len(ref), len(tgt)
+    if n < 2 or m < 2:
+        return None
+    ref_std = float(np.std(ref))
+    tgt_std = float(np.std(tgt))
+    if ref_std == 0 or tgt_std == 0:
+        return None
+    ref_z = (ref - float(np.mean(ref))) / ref_std
+    tgt_z = (tgt - float(np.mean(tgt))) / tgt_std
+    size = 1
+    while size < n + m - 1:
+        size <<= 1
+    corr = np.fft.irfft(np.fft.rfft(ref_z, size) * np.conj(np.fft.rfft(tgt_z, size)), size)
+    lags = np.arange(-(m - 1), n)
+    raw = corr[np.where(lags >= 0, lags, size + lags)]
+    counts = np.where(lags >= 0, np.minimum(n, m + lags) - lags, np.minimum(n, m + lags))
+    counts = np.maximum(counts, 0)
+    r = np.full(n + m - 1, -np.inf)
+    ok = counts > 0
+    r[ok] = raw[ok] / counts[ok]
+    overlap_s = counts * hop_s
+    required = min(MIN_OVERLAP_FLOOR_S, 0.5 * min(n, m) * hop_s)
+    r[overlap_s + 1e-9 < required] = -np.inf
+    if window_s is not None:
+        centre, radius = window_s
+        r[np.abs(lags * hop_s - centre) > radius + 1e-12] = -np.inf
+    best = int(np.argmax(r))
+    if not np.isfinite(r[best]):
+        return None
+    best_r = float(r[best])
+    far = np.abs(lags - lags[best]) * hop_s >= SECOND_PEAK_EXCLUSION_S - 1e-9
+    far_ok = far & np.isfinite(r)
+    second_r = float(np.max(r[far_ok])) if bool(np.any(far_ok)) else -1.0
+    margin = best_r - second_r
+    return WaveformPeak(
+        offset_s=float(lags[best]) * hop_s, r=best_r, second_r=second_r,
+        margin=margin, overlap_s=float(overlap_s[best]),
+        clear=best_r >= R_CLEAR and margin >= MARGIN_CLEAR,
+    )
+
+
+def measure_drift(ref_env_1ms, tgt_env_1ms, coarse_offset_s: float,
+                  target_duration_s: float) -> tuple[float, float, int] | None:
+    """Re-measure the lag in 20 s windows; slope is drift, intercept is the offset."""
+    if np is None:
+        return None
+    ref_dur = len(ref_env_1ms) * REFINE_HOP_S
+    tgt_dur = target_duration_s if target_duration_s > 0 else len(tgt_env_1ms) * REFINE_HOP_S
+    lo = max(0.0, -coarse_offset_s)
+    hi = min(tgt_dur, ref_dur - coarse_offset_s)
+    centres: list[float] = []
+    offsets: list[float] = []
+    start = lo
+    while hi - start >= MIN_OVERLAP_FLOOR_S - 1e-9:
+        end = min(start + DRIFT_WINDOW_S, hi)
+        if end - start < MIN_OVERLAP_FLOOR_S:
+            break
+        ref_a = int(round((start + coarse_offset_s) / REFINE_HOP_S))
+        ref_b = int(round((end + coarse_offset_s) / REFINE_HOP_S))
+        tgt_a = int(round(start / REFINE_HOP_S))
+        tgt_b = int(round(end / REFINE_HOP_S))
+        ref_seg = np.asarray(ref_env_1ms[max(0, ref_a):ref_b])
+        tgt_seg = np.asarray(tgt_env_1ms[max(0, tgt_a):tgt_b])
+        peak = find_peak(ref_seg, tgt_seg, REFINE_HOP_S,
+                         window_s=(coarse_offset_s, DRIFT_SEARCH_S))
+        if peak is not None and peak.r >= DRIFT_WINDOW_MIN_R:
+            centres.append((start + end) / 2)
+            offsets.append(peak.offset_s)
+        if end >= hi - 1e-9:
+            break
+        start = end
+    if len(centres) < DRIFT_MIN_WINDOWS or max(centres) - min(centres) < 40.0:
+        return None
+    slope, intercept = (float(v) for v in np.polyfit(centres, offsets, 1))
+    return intercept, slope * 1e6, len(centres)
+
+
+def waveform_estimate(target: ClipResult, anchor: ClipResult, envelopes: dict, *,
+                      guide: tuple[float, float, str] | None = None) -> Estimate | None:
+    """Offset from log-envelope correlation, coarse then refined, drift-corrected."""
+    if np is None or anchor.offset_s is None:
+        return None
+    if not target.camera.has_audio or not anchor.camera.has_audio:
+        return None
+    coarse_hop = int(round(COARSE_HOP_S * SAMPLE_RATE))
+    refine_hop = int(round(REFINE_HOP_S * SAMPLE_RATE))
+    ref_c = _get_envelope(anchor.camera.path, True, coarse_hop, envelopes)
+    tgt_c = _get_envelope(target.camera.path, True, coarse_hop, envelopes)
+    if ref_c is None or tgt_c is None:
+        return None
+    coarse = find_peak(ref_c, tgt_c, COARSE_HOP_S)
+    if coarse is None:
+        return None
+    ref_f = _get_envelope(anchor.camera.path, True, refine_hop, envelopes)
+    tgt_f = _get_envelope(target.camera.path, True, refine_hop, envelopes)
+    if ref_f is None or tgt_f is None:
+        return None
+    if guide is None:
+        peak = find_peak(ref_f, tgt_f, REFINE_HOP_S,
+                         window_s=(coarse.offset_s, 0.015))
+    else:
+        centre, radius, _method = guide
+        peak = find_peak(ref_f, tgt_f, REFINE_HOP_S, window_s=(centre, radius))
+    if peak is None:
+        return None
+    drift_centre = coarse.offset_s if guide is None else peak.offset_s
+    relative = peak.offset_s
+    drift_ppm: float | None = None
+    drift_windows = 0
+    measured = measure_drift(ref_f, tgt_f, drift_centre, target.camera.duration_s)
+    if measured is not None:
+        relative, drift_ppm, drift_windows = measured
+    return Estimate(
+        method="waveform", offset_s=anchor.offset_s + relative,
+        confidence=min(1.0, max(0.0, peak.r)), precision_s=PRECISION_S["waveform"],
+        against=anchor.label,
+        detail={"r": peak.r, "second_r": peak.second_r, "margin": peak.margin,
+                "clear": peak.clear, "overlap_s": peak.overlap_s,
+                "guided": guide is not None,
+                "guide_method": guide[2] if guide is not None else None,
+                "drift_ppm": drift_ppm, "drift_windows": drift_windows},
+    )
+
+
+# ---------------------------------------------------------------- whisper
+
+_WORD_EDGE_RE = re.compile(r"^[^\w']+|[^\w']+$")
+
+
+def normalize_word(word: str) -> str:
+    """Lower-case and strip edge punctuation; internal apostrophes stay."""
+    return _WORD_EDGE_RE.sub("", (word or "").lower()).strip("'")
+
+
+def load_transcript_words(path: Path) -> list[TranscriptWord]:
+    """Word-timed Whisper JSON in either shape; malformed input gives []."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if not isinstance(data, dict):
+        return []
+    if isinstance(data.get("words"), list):
+        raw = data["words"]
+    else:
+        raw = [w for seg in data.get("segments", []) if isinstance(seg, dict)
+               for w in seg.get("words", [])]
+    parsed: list[TranscriptWord] = []
+    for w in raw:
+        if not isinstance(w, dict):
+            continue
+        text = normalize_word(str(w.get("word") or w.get("text") or ""))
+        start = w.get("start")
+        if not text or not isinstance(start, (int, float)):
+            continue
+        end = w.get("end")
+        parsed.append(TranscriptWord(text, float(start),
+                                    float(end) if isinstance(end, (int, float)) else -1.0))
+    parsed.sort(key=lambda t: t.start_s)
+    out: list[TranscriptWord] = []
+    for i, t in enumerate(parsed):
+        end = t.end_s
+        if end < 0:
+            if i + 1 < len(parsed):
+                end = parsed[i + 1].start_s
+            else:
+                end = t.start_s + 0.30
+        out.append(TranscriptWord(t.word, t.start_s, max(end, t.start_s)))
+    return out
+
+
+def get_transcript_words(clip: CameraInfo, transcripts_dir: Path | None,
+                         cache_dir: Path) -> list[TranscriptWord]:
+    """Words for one clip: `--transcripts`, the run cache, or local mlx_whisper."""
+    stem = Path(clip.path).stem
+    if transcripts_dir is not None:
+        return load_transcript_words(transcripts_dir / f"{stem}.json")
+    cache_dir = Path(cache_dir)
+    cached = cache_dir / f"{stem}.json"
+    try:
+        if cached.exists() and cached.stat().st_size > 0:
+            return load_transcript_words(cached)
+    except OSError:
+        pass
+    if shutil.which("mlx_whisper") is None:
+        return []
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        done = subprocess.run(
+            ["mlx_whisper", clip.path, "--output-format", "json",
+             "--output-dir", str(cache_dir), "--word-timestamps", "True",
+             "--verbose", "False"],
+            capture_output=True, timeout=3600)
+    except Exception:
+        return []
+    if done.returncode != 0:
+        return []
+    return load_transcript_words(cached)
+
+
+def whisper_estimate(target: ClipResult, anchor: ClipResult,
+                     target_words: list[TranscriptWord],
+                     anchor_words: list[TranscriptWord]) -> Estimate | None:
+    """Offset from once-each 3-word phrases; one matching sentence is refused."""
+    if anchor.offset_s is None:
+        return None
+
+    def phrases(words: list[TranscriptWord]) -> dict[tuple[str, ...], list[tuple[float, int]]]:
+        seq = [(w.word, w.start_s) for w in words if w.word]
+        out: dict[tuple[str, ...], list[tuple[float, int]]] = {}
+        for i in range(len(seq) - WHISPER_PHRASE_WORDS + 1):
+            key = tuple(seq[i + k][0] for k in range(WHISPER_PHRASE_WORDS))
+            out.setdefault(key, []).append((seq[i][1], i))
+        return out
+
+    target_phrases = phrases(target_words)
+    anchor_phrases = phrases(anchor_words)
+    votes: list[tuple[float, int, float]] = []
+    for key, tlist in target_phrases.items():
+        alist = anchor_phrases.get(key)
+        if alist is None or len(tlist) != 1 or len(alist) != 1:
+            continue
+        (target_start, _ti), (anchor_start, anchor_idx) = tlist[0], alist[0]
+        votes.append((anchor_start - target_start, anchor_idx, anchor_start))
+    if not votes:
+        return None
+    votes.sort(key=lambda v: v[0])
+    vals = [v[0] for v in votes]
+    best_i, best_j, best_spread = 0, 0, 0.0
+    best_count = 1
+    for i in range(len(votes)):
+        j = i
+        while (j + 1 < len(votes)
+               and vals[j + 1] - vals[i] <= WHISPER_CLUSTER_S + 1e-9):
+            j += 1
+        count, spread = j - i + 1, vals[j] - vals[i]
+        if count > best_count or (count == best_count and spread < best_spread - 1e-12):
+            best_i, best_j, best_spread, best_count = i, j, spread, count
+    winning = votes[best_i:best_j + 1]
+    by_anchor = sorted(winning, key=lambda v: v[1])
+    moments = 1
+    for prev, cur in zip(by_anchor, by_anchor[1:]):
+        if cur[1] - prev[1] > 1 or cur[2] - prev[2] > 2.0:
+            moments += 1
+    if moments < WHISPER_MIN_MOMENTS:
+        return None
+    ordered = sorted(v[0] for v in winning)
+    mid = len(ordered) // 2
+    median = ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2
+    return Estimate(
+        method="whisper", offset_s=anchor.offset_s + median,
+        confidence=min(1.0, moments / 3.0), precision_s=PRECISION_S["whisper"],
+        against=anchor.label,
+        detail={"votes": len(votes), "cluster_votes": len(winning), "moments": moments},
+    )
+
+
+# ---------------------------------------------------------------- combining
+
+_BACKING_METHODS = ("whisper", "timecode")
+
+
+def frame_duration_s(target: ClipResult, anchor: ClipResult) -> float:
+    """One frame on the target, else the anchor, else 1/30. Pure."""
+    if target.camera.fps > 0:
+        return 1.0 / target.camera.fps
+    if anchor.camera.fps > 0:
+        return 1.0 / anchor.camera.fps
+    return 1.0 / 30
+
+
+def estimates_agree(a: Estimate, b: Estimate, frame_s: float) -> bool:
+    """Within the larger precision plus one frame. Pure."""
+    return abs(a.offset_s - b.offset_s) <= max(a.precision_s, b.precision_s) + frame_s
+
+
+def build_checks(estimates: list[Estimate], frame_s: float) -> list[EstimateCheck]:
+    """One check per unordered pair, in estimate-list order. Pure."""
+    checks: list[EstimateCheck] = []
+    for i in range(len(estimates)):
+        for j in range(i + 1, len(estimates)):
+            a, b = estimates[i], estimates[j]
+            delta = abs(a.offset_s - b.offset_s)
+            threshold = max(a.precision_s, b.precision_s) + frame_s
+            checks.append(EstimateCheck(
+                a=a.method, b=b.method, against_a=a.against, against_b=b.against,
+                delta_s=delta, threshold_s=threshold, agree=delta <= threshold,
+            ))
+    return checks
+
+
+def resolve_guided(global_est: Estimate, guide_est: Estimate,
+                   guided_est: Estimate | None) -> tuple[Estimate, bool]:
+    """Keep the global waveform peak or take the guided re-search. Pure."""
+    if guided_est is None:
+        return global_est, False
+    if not global_est.detail.get("clear", False):
+        return guided_est, True
+    if guided_est.detail.get("r", 0.0) >= global_est.detail.get("r", 0.0) - GUIDE_R_TOLERANCE:
+        return guided_est, True
+    return global_est, False
+
+
+def penalise_whisper(whisper_est: Estimate, guided_est: Estimate | None,
+                     both_have_audio: bool) -> bool:
+    """Halve Whisper when the words match where the sound does not. Pure."""
+    if guided_est is None or not both_have_audio:
+        return False
+    if guided_est.detail.get("r", 0.0) >= R_CLEAR:
+        return False
+    whisper_est.detail["confidence_before_halving"] = whisper_est.confidence
+    whisper_est.confidence = whisper_est.confidence / 2
+    whisper_est.detail["confidence_halved"] = True
+    return True
+
+
+def _waveform_trusted(estimates: list[Estimate],
+                      checks: list[EstimateCheck]) -> Estimate | None:
+    """The first waveform estimate that is clear or backed. Pure."""
+    by_key = {(e.method, e.against): e for e in estimates}
+    for wave in (e for e in estimates if e.method == "waveform"):
+        if wave.detail.get("clear", False):
+            return wave
+        for check in checks:
+            sides = [((check.a, check.against_a), (check.b, check.against_b)),
+                     ((check.b, check.against_b), (check.a, check.against_a))]
+            for (mine, theirs) in sides:
+                if mine != (wave.method, wave.against):
+                    continue
+                other = by_key.get(theirs)
+                if (other is not None and other.method in _BACKING_METHODS
+                        and not other.detail.get("confidence_halved", False)
+                        and check.agree):
+                    return wave
+    return None
+
+
+def choose_pick(estimates: list[Estimate],
+                checks: list[EstimateCheck]) -> tuple[float | None, str | None]:
+    """Waveform, Whisper, timecode, clock, else unplaced. Pure; order is trust."""
+    trusted = _waveform_trusted(estimates, checks)
+    if trusted is not None:
+        return trusted.offset_s, "waveform"
+    for est in estimates:
+        if (est.method == "whisper" and est.detail.get("moments", 0) >= WHISPER_MIN_MOMENTS
+                and est.confidence >= WHISPER_MIN_CONFIDENCE):
+            return est.offset_s, "whisper"
+    for est in estimates:
+        if est.method == "timecode":
+            return est.offset_s, "timecode"
+    for est in estimates:
+        if est.method == "clock":
+            return est.offset_s, "clock"
+    return None, None
+
+
+def attempt_warnings(target: ClipResult, estimates: list[Estimate],
+                     checks: list[EstimateCheck], pick_method: str | None,
+                     pick_offset: float | None) -> list[str]:
+    """Plain-English warnings for one clip against its final pick. Pure."""
+    warnings: list[str] = []
+    if pick_method == "timecode":
+        warnings.append("Placed by timecode only: right only if the cameras were jammed.")
+    elif pick_method == "clock":
+        warnings.append("Placed by capture clock only: check by eye.")
+    if pick_method is None:
+        warnings.append("Could not be placed on the timeline.")
+        return warnings
+    picked = next((e for e in estimates
+                   if e.method == pick_method and e.offset_s == pick_offset), None)
+    seen: set[tuple[str, str]] = set()
+    for est in estimates:
+        if est.method not in ("timecode", "whisper"):
+            continue
+        if (est.method, est.against) in seen:
+            continue
+        seen.add((est.method, est.against))
+        if est is picked:
+            continue
+        matched: EstimateCheck | None = None
+        if picked is not None:
+            for check in checks:
+                pairs = {(check.a, check.against_a), (check.b, check.against_b)}
+                if (picked.method, picked.against) in pairs \
+                        and (est.method, est.against) in pairs:
+                    matched = check
+                    break
+        if matched is not None:
+            disagreeing = not matched.agree
+        else:
+            frame_s = 1.0 / target.camera.fps if target.camera.fps > 0 else 1.0 / 30
+            precision = max(est.precision_s,
+                            picked.precision_s if picked is not None else 0.0)
+            disagreeing = pick_offset is None or \
+                abs(est.offset_s - pick_offset) > precision + frame_s
+        if disagreeing and pick_offset is not None:
+            name = est.method.capitalize()
+            line = f"{name} disagrees with the chosen offset by {abs(est.offset_s - pick_offset):.3f} s."
+            if est.method == "timecode" and pick_method != "timecode":
+                line += " It is right only if the cameras were jammed."
+            warnings.append(line)
+    frame_s = 1.0 / target.camera.fps if target.camera.fps > 0 else 1.0 / 30
+    drift_sources = [e for e in estimates if e.method == "waveform" and e.detail.get("drift_ppm")]
+    if picked is not None and picked.method == "waveform" and picked.detail.get("drift_ppm"):
+        drift_sources = [picked]
+    elif drift_sources:
+        drift_sources = drift_sources[:1]
+    for source in drift_sources:
+        ppm = float(source.detail["drift_ppm"])
+        moved_s = abs(ppm) * 1e-6 * target.camera.duration_s
+        if moved_s > 0.5 * frame_s:
+            warnings.append(
+                f"Clock drift {ppm:+.0f} ppm moves sync by {moved_s * 1000:.0f} ms "
+                "over this clip (more than half a frame); "
+                "the offset is exact at the clip start.")
+    return warnings
+
+
+# ---------------------------------------------------------------- orchestration
+
+WAVEFORM_NO_NUMPY = "Waveform sync unavailable: numpy is not installed."
+
+
+def parse_methods(text: str | None) -> list[str]:
+    """Requested method names in canonical order; None means all of them."""
+    if text is None:
+        return list(METHODS)
+    names = [part.strip().lower() for part in text.split(",")]
+    names = [name for name in names if name]
+    for name in names:
+        if name not in METHODS:
+            raise ValueError(f"unknown sync method: {name}")
+    if not names:
+        raise ValueError("no sync methods")
+    return [m for m in METHODS if m in set(names)]
+
+
+def _round(value: float | None, places: int):
+    return None if value is None else round(float(value), places)
+
+
+def _estimate_payload(est: Estimate) -> dict:
+    detail = dict(est.detail)
+    for key in ("r", "second_r", "margin", "overlap_s", "confidence_before_halving"):
+        if isinstance(detail.get(key), (int, float)):
+            detail[key] = round(float(detail[key]), 3)
+    if isinstance(detail.get("drift_ppm"), (int, float)):
+        detail["drift_ppm"] = round(float(detail["drift_ppm"]), 1)
+    unguided = detail.get("unguided")
+    if isinstance(unguided, dict):
+        fixed = dict(unguided)
+        for key in ("offset_s", "r", "margin"):
+            if isinstance(fixed.get(key), (int, float)):
+                fixed[key] = round(float(fixed[key]), 3)
+        detail["unguided"] = fixed
+    return {"method": est.method, "offset_s": _round(est.offset_s, 3),
+            "confidence": _round(est.confidence, 3),
+            "precision_s": _round(est.precision_s, 3),
+            "against": est.against, "detail": detail}
+
+
+def build_payload(results: list[ClipResult], reference_path: str,
+                  methods: list[str]) -> dict:
+    """The sync.json payload; rounding happens only here. Pure."""
+    clips = []
+    for res in results:
+        cam = res.camera
+        clips.append({
+            "label": res.label,
+            "offset_s": _round(res.offset_s, 3),
+            "method": res.method,
+            "camera": {"path": cam.path, "make": cam.make, "model": cam.model,
+                       "lens": cam.lens, "fps": _round(cam.fps, 3),
+                       "width": cam.width, "height": cam.height,
+                       "duration_s": _round(cam.duration_s, 3),
+                       "has_audio": cam.has_audio, "gamma": cam.gamma,
+                       "timecode": cam.timecode, "tc_rate": cam.tc_rate,
+                       "captured_at": cam.captured_at},
+            "estimates": [_estimate_payload(e) for e in res.estimates],
+            "checks": [{"a": c.a, "b": c.b, "against_a": c.against_a,
+                        "against_b": c.against_b, "delta_s": _round(c.delta_s, 3),
+                        "threshold_s": _round(c.threshold_s, 3), "agree": c.agree}
+                       for c in res.checks],
+            "drift_ppm": _round(res.drift_ppm, 1),
+            "warnings": list(res.warnings),
+        })
+    return {"reference": reference_path, "methods": list(methods), "clips": clips}
+
+
+def _attempt_estimates(target: ClipResult, anchor: ClipResult, methods: list[str],
+                       envelopes: dict, words: dict[str, list[TranscriptWord]],
+                       transcripts_dir: Path | None, cache_dir: Path) -> list[Estimate]:
+    """One anchor's estimates in canonical method order."""
+    estimates: list[Estimate] = []
+    if "timecode" in methods:
+        est = timecode_estimate(target, anchor)
+        if est is not None:
+            estimates.append(est)
+    if "clock" in methods:
+        est = clock_estimate(target, anchor)
+        if est is not None:
+            estimates.append(est)
+    if "waveform" in methods and np is not None:
+        est = waveform_estimate(target, anchor, envelopes)
+        if est is not None:
+            estimates.append(est)
+    if "whisper" in methods:
+        if target.camera.path not in words:
+            words[target.camera.path] = get_transcript_words(
+                target.camera, transcripts_dir, cache_dir)
+        if anchor.camera.path not in words:
+            words[anchor.camera.path] = get_transcript_words(
+                anchor.camera, transcripts_dir, cache_dir)
+        est = whisper_estimate(target, anchor, words[target.camera.path],
+                               words[anchor.camera.path])
+        if est is not None:
+            estimates.append(est)
+    return estimates
+
+
+def run(*, clip_paths: list[Path], reference_path: Path | None,
+        methods: list[str], transcripts_dir: Path | None, out_path: Path) -> dict:
+    """Place every clip on the reference's timeline; write sync.json."""
+    paths = [Path(p) for p in clip_paths]
+    if len(paths) < 2:
+        raise ValueError("need at least two clips")
+    for path in paths:
+        if not path.exists():
+            raise FileNotFoundError(f"clip not found: {path}")
+    resolved = [p.resolve() for p in paths]
+    if len(set(resolved)) != len(resolved):
+        raise ValueError("the same clip was given twice")
+    cameras: list[CameraInfo] = []
+    for path in paths:
+        probe = probe_clip(path)
+        sidecar = parse_sony_sidecar(find_sidecar(path))
+        cameras.append(camera_from_probe("", str(path), probe, sidecar))
+    if reference_path is not None:
+        wanted = Path(reference_path).resolve()
+        ref_idx = next((i for i, r in enumerate(resolved) if r == wanted), None)
+        if ref_idx is None:
+            raise ValueError(f"--reference is not among the clips: {reference_path}")
+    else:
+        ref_idx = max(range(len(cameras)),
+                      key=lambda i: (cameras[i].duration_s, -i))
+    labels: dict[int, str] = {ref_idx: "A"}
+    others = [i for i in range(len(paths)) if i != ref_idx]
+    for order, i in enumerate(others):
+        labels[i] = _label_for_index(order + 1)
+    for i, cam in enumerate(cameras):
+        cam.label = labels[i]
+    reference = ClipResult(label="A", camera=cameras[ref_idx], offset_s=0.0,
+                           method="reference")
+    results = [reference]
+    envelopes: dict = {}
+    words: dict[str, list[TranscriptWord]] = {}
+    out_path = Path(out_path)
+    cache_dir = out_path.parent / "sync-transcripts"
+    order_of = {labels[i]: i for i in range(len(paths))}
+    for i in sorted(others, key=lambda k: order_of[labels[k]]):
+        target = ClipResult(label=labels[i], camera=cameras[i],
+                            offset_s=None, method=None)
+        anchors = [reference] + [res for res in results[1:] if res.offset_s is not None]
+        attempts: list[tuple[ClipResult, list[Estimate], list[EstimateCheck]]] = []
+        accepted: tuple[list[Estimate], list[EstimateCheck],
+                        float | None, str | None] | None = None
+        fallback: tuple[list[Estimate], list[EstimateCheck],
+                        float | None, str | None] | None = None
+        halved_notes: list[str] = []
+        for anchor in anchors:
+            estimates = _attempt_estimates(target, anchor, methods, envelopes,
+                                           words, transcripts_dir, cache_dir)
+            frame_s = frame_duration_s(target, anchor)
+            global_wave = next((e for e in estimates if e.method == "waveform"), None)
+            whispers = [e for e in estimates if e.method == "whisper"]
+            guide = whispers[0] if whispers else next(
+                (e for e in estimates if e.method in ("timecode", "clock")), None)
+            if global_wave is not None and guide is not None \
+                    and not estimates_agree(global_wave, guide, frame_s):
+                guided = waveform_estimate(
+                    target, anchor, envelopes,
+                    guide=(guide.offset_s - anchor.offset_s,
+                           guide.precision_s + GUIDE_EXTRA_S, guide.method))
+                chosen, taken = resolve_guided(global_wave, guide, guided)
+                if guided is not None and guide.method == "whisper" \
+                        and guided.detail.get("r", 0.0) < R_CLEAR \
+                        and target.camera.has_audio and anchor.camera.has_audio:
+                    whispered = next(e for e in estimates if e.method == "whisper")
+                    if penalise_whisper(whispered, guided, True):
+                        halved_notes.append(
+                            "Whisper matches words that do not match in sound "
+                            f"(guided waveform r={guided.detail.get('r', 0.0):.2f}); "
+                            "Whisper confidence halved.")
+                if taken and guided is not None:
+                    chosen.detail["unguided"] = {
+                        "offset_s": global_wave.offset_s,
+                        "r": global_wave.detail.get("r"),
+                        "margin": global_wave.detail.get("margin")}
+                    estimates[estimates.index(global_wave)] = chosen
+            checks = build_checks(estimates, frame_s)
+            pick_offset, pick_method = choose_pick(estimates, checks)
+            attempts.append((anchor, estimates, checks))
+            if pick_method == "waveform" and _waveform_trusted(estimates, checks) is not None:
+                accepted = (estimates, checks, pick_offset, pick_method)
+                break
+            if fallback is None and pick_method is not None:
+                fallback = (estimates, checks, pick_offset, pick_method)
+        union: list[Estimate] = []
+        seen_keys: set[tuple[str, str]] = set()
+        for _anchor, estimates, _checks in attempts:
+            for est in estimates:
+                if est.method in ("timecode", "clock"):
+                    if (est.method, est.against) in seen_keys:
+                        continue
+                    seen_keys.add((est.method, est.against))
+                union.append(est)
+        ref_frame = frame_duration_s(target, reference)
+        final_checks = build_checks(union, ref_frame)
+        if accepted is not None:
+            _est, _chk, pick_offset, pick_method = accepted
+        elif fallback is not None:
+            _est, _chk, pick_offset, pick_method = fallback
+        else:
+            pick_offset, pick_method = None, None
+        target.estimates = union
+        target.checks = final_checks
+        target.offset_s = pick_offset
+        target.method = pick_method
+        target.warnings = attempt_warnings(target, union, final_checks,
+                                           pick_method, pick_offset) + halved_notes
+        picked_wave = next((e for e in union if e.method == "waveform"
+                            and e.offset_s == pick_offset and pick_method == "waveform"),
+                           None)
+        if picked_wave is not None and picked_wave.detail.get("drift_ppm") is not None:
+            target.drift_ppm = picked_wave.detail["drift_ppm"]
+        else:
+            drifted = next((e for e in union if e.method == "waveform"
+                            and e.detail.get("drift_ppm") is not None), None)
+            target.drift_ppm = drifted.detail["drift_ppm"] if drifted else None
+        if "waveform" in methods and np is None:
+            target.warnings.append(WAVEFORM_NO_NUMPY)
+        elif ("waveform" in methods and not target.camera.has_audio
+                and not any(e.method == "waveform" for e in union)):
+            target.warnings.append(
+                f"Clip {target.label} has no audio: waveform sync skipped.")
+        if ("whisper" in methods
+                and not any(e.method == "whisper" for e in union)
+                and not words.get(target.camera.path)
+                and not any(words.get(a.camera.path) for a, _, _ in attempts)):
+            target.warnings.append("No word-timed transcript available: Whisper sync skipped.")
+        results.append(target)
+    payload = build_payload(results, str(paths[ref_idx]), methods)
+    write_json(out_path, payload)
+    return payload

@@ -62,6 +62,42 @@ def command_angles(args: argparse.Namespace) -> dict:
     return payload
 
 
+def command_sync(args: argparse.Namespace) -> dict:
+    from . import sync as sync_mod
+
+    require_ffmpeg_binaries()
+    payload = sync_mod.run(
+        clip_paths=[Path(p) for p in args.clips],
+        reference_path=Path(args.reference) if args.reference else None,
+        methods=sync_mod.parse_methods(args.methods),
+        transcripts_dir=Path(args.transcripts) if args.transcripts else None,
+        out_path=Path(args.out),
+    )
+    for item in payload.get("clips", []):
+        cam = item.get("camera", {})
+        parts = [str(item.get("label") or ""), Path(str(cam.get("path") or "")).name]
+        if cam.get("make"):
+            parts.append(str(cam["make"]))
+        if cam.get("model"):
+            parts.append(str(cam["model"]))
+        parts.append(str(cam.get("gamma") or "-"))
+        parts.append(f"{float(cam.get('fps') or 0.0):.2f}fps")
+        offset = item.get("offset_s")
+        parts.append("offset")
+        parts.append(f"{float(offset):+.3f}s" if offset is not None else "--")
+        parts.append("method")
+        parts.append(str(item.get("method") or "unplaced"))
+        print(" ".join(part for part in parts if part))
+        for check in item.get("checks", []):
+            verdict = "agree" if check.get("agree") else "DISAGREE"
+            print(f"  check {check['a']} vs {check['b']}: "
+                  f"{verdict} (delta {float(check['delta_s']):.3f}s)")
+        for warning in item.get("warnings", []):
+            print(f"  ! {warning}")
+    print(f"Wrote {args.out}")
+    return payload
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="GhostCut Director: multicam cutting on Meta's Muse models")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -88,6 +124,17 @@ def build_parser() -> argparse.ArgumentParser:
     grade_parser.add_argument("--check", action="store_true", help="Ask Muse Spark to check the match")
     grade_parser.add_argument("--model", default="muse-spark-1.3")
     grade_parser.set_defaults(func=command_grade)
+
+    sync_parser = sub.add_parser("sync", help="Place every clip on one shared timeline")
+    sync_parser.add_argument("clips", nargs="+", help="Clips to place on the timeline")
+    sync_parser.add_argument("--reference", default=None,
+                             help="Reference clip (default: the longest clip)")
+    sync_parser.add_argument("--methods", default=None,
+                             help="Subset of timecode,clock,waveform,whisper")
+    sync_parser.add_argument("--transcripts", default=None,
+                             help="Directory of word-timed Whisper JSON transcripts")
+    sync_parser.add_argument("--out", default="sync.json", help="Where to write sync.json")
+    sync_parser.set_defaults(func=command_sync)
 
     return parser
 

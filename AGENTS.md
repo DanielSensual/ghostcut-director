@@ -23,6 +23,8 @@ skips is normal.
     per camera (guestlist, optional) → mechanical checks overrule → shot-by-shot render under the uncut audio.
   - `grade.py`: per-camera `.cube` from published curves (S-Log3, HLG) → probed decode range → exposure and white
     balance matched to a reference → optional Muse check.
+  - `sync.py`: timecode, capture-clock, waveform and Whisper offsets per clip → checked against each other →
+    one shared timeline in `sync.json`.
 - `app/` — the Director Mac app: `main.py` (pywebview window), `engine.py` (local server), `muse.py` (Muse edits),
   `render*.py` (re-render accepted edits, verify, promote, revert), `make_demo.py` (timeline from a cut).
 - `scripts/` — the first end-to-end Director test run and the day-1 take-picking spike.
