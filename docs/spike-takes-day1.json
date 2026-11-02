@@ -1,0 +1,355 @@
+{
+  "proxy": "C2764_proxy_640p12.mp4",
+  "model": "muse-spark-1.3",
+  "effort": "medium",
+  "usd": 0.1493,
+  "seconds": 51.2,
+  "cached": false,
+  "usage": {
+    "input_tokens": 95367,
+    "input_tokens_details": {
+      "cache_write_tokens": null,
+      "cached_tokens": 0
+    },
+    "output_tokens": 7071,
+    "output_tokens_details": {
+      "reasoning_tokens": 5101
+    },
+    "total_tokens": 102438
+  },
+  "score": {
+    "picked_keeper_seconds": 676.0,
+    "truth_seconds": 658.0,
+    "recall_of_truth": 0.764,
+    "precision_vs_truth": 0.743,
+    "removed_spans_still_kept_s": {
+      "T03 off-camera look": 13.6,
+      "T07 flub 'cut that there'": 0.0,
+      "T10 repeated stumble": 4.6,
+      "still-hold thumbnail plates": 42.0,
+      "receiver troubleshooting": 0.0
+    },
+    "takes": {
+      "T01": {
+        "seconds": 60.3,
+        "picked_coverage": 0.998,
+        "any_attempt_coverage": 0.998,
+        "start_err_s": 6.84,
+        "end_err_s": 0.11
+      },
+      "T02": {
+        "seconds": 35.1,
+        "picked_coverage": 1.0,
+        "any_attempt_coverage": 1.0,
+        "start_err_s": 5.93,
+        "end_err_s": 41.04
+      },
+      "T03": {
+        "seconds": 76.1,
+        "picked_coverage": 1.0,
+        "any_attempt_coverage": 1.0,
+        "start_err_s": 16.47,
+        "end_err_s": 32.84
+      },
+      "T04": {
+        "seconds": 46.0,
+        "picked_coverage": 1.0,
+        "any_attempt_coverage": 1.0,
+        "start_err_s": 30.59,
+        "end_err_s": 15.37
+      },
+      "T05a": {
+        "seconds": 12.6,
+        "picked_coverage": 0.0,
+        "any_attempt_coverage": 0.0,
+        "start_err_s": 33.54,
+        "end_err_s": 46.17
+      },
+      "T05b": {
+        "seconds": 8.4,
+        "picked_coverage": 0.0,
+        "any_attempt_coverage": 1.0,
+        "start_err_s": 68.57,
+        "end_err_s": 76.95
+      },
+      "T06": {
+        "seconds": 8.2,
+        "picked_coverage": 0.0,
+        "any_attempt_coverage": 0.923,
+        "start_err_s": 113.37,
+        "end_err_s": 121.54
+      },
+      "T07": {
+        "seconds": 49.7,
+        "picked_coverage": 0.0,
+        "any_attempt_coverage": 0.0,
+        "start_err_s": 69.33,
+        "end_err_s": 7.31
+      },
+      "T08": {
+        "seconds": 97.8,
+        "picked_coverage": 0.233,
+        "any_attempt_coverage": 0.233,
+        "start_err_s": 22.41,
+        "end_err_s": 0.35
+      },
+      "T09": {
+        "seconds": 204.9,
+        "picked_coverage": 1.0,
+        "any_attempt_coverage": 1.0,
+        "start_err_s": 5.36,
+        "end_err_s": 0.23
+      },
+      "T10": {
+        "seconds": 59.0,
+        "picked_coverage": 0.977,
+        "any_attempt_coverage": 0.977,
+        "start_err_s": 12.7,
+        "end_err_s": 1.35
+      }
+    }
+  },
+  "recording_summary": "Solo creator in white shirt and black cap films multiple short pieces to camera: Rode internal-audio recap, Omni 1.1 editing demo, Gemini 4 / AI models update, ChatGPT Image 2.5, Bachata After Dark updates, Visto Azul promo attempt, Ghost AI website pitch, and long Daniel Sensual dancer advice plus practice frequency, with asides to AI editor, mic/receiver troubleshooting, thumbnail still pose, and long silent phone-check at end.",
+  "segments": [
+    {
+      "confidence": 0.9,
+      "group": "",
+      "kind": "keeper_take",
+      "pick_in_group": true,
+      "reason": "Usable to-camera recap of missed Rode demo explaining internal audio to camera sync.",
+      "t_end": 67.0,
+      "t_start": 0.0,
+      "topic": "Rode internal audio demo recap"
+    },
+    {
+      "confidence": 0.95,
+      "group": "",
+      "kind": "aside_to_editor",
+      "pick_in_group": false,
+      "reason": "Planning talk to AI about making Daniel AI creator and Ghost AI content, not audience-facing.",
+      "t_end": 112.0,
+      "t_start": 67.0,
+      "topic": "Planning Daniel AI and Ghost AI content"
+    },
+    {
+      "confidence": 0.9,
+      "group": "",
+      "kind": "setup_or_technical",
+      "pick_in_group": false,
+      "reason": "Adjusting mic placement for consistent audio before starting takes.",
+      "t_end": 129.0,
+      "t_start": 112.0,
+      "topic": "Mic placement setup"
+    },
+    {
+      "confidence": 0.85,
+      "group": "",
+      "kind": "keeper_take",
+      "pick_in_group": true,
+      "reason": "Complete to-camera pitch for Omni 1.1 relight and background change using self-shoot example.",
+      "t_end": 212.0,
+      "t_start": 129.0,
+      "topic": "Omni 1.1 AI editing tool"
+    },
+    {
+      "confidence": 0.85,
+      "group": "",
+      "kind": "keeper_take",
+      "pick_in_group": true,
+      "reason": "Continuous to-camera commentary on Gemini 4 hype, benchmarks, and AI model race.",
+      "t_end": 318.0,
+      "t_start": 212.0,
+      "topic": "Gemini 4 announcement"
+    },
+    {
+      "confidence": 0.85,
+      "group": "",
+      "kind": "keeper_take",
+      "pick_in_group": true,
+      "reason": "To-camera explainer of ChatGPT Image 2.5 API precise edits and Sony A7S III demo.",
+      "t_end": 378.0,
+      "t_start": 318.0,
+      "topic": "ChatGPT Image 2.5 edit"
+    },
+    {
+      "confidence": 0.9,
+      "group": "",
+      "kind": "aside_to_editor",
+      "pick_in_group": false,
+      "reason": "Instructing AI to take thumbnail and use still shots with Image 2.5 for B-roll.",
+      "t_end": 395.0,
+      "t_start": 378.0,
+      "topic": "Thumbnail still instruction"
+    },
+    {
+      "confidence": 0.9,
+      "group": "",
+      "kind": "dead_air_or_still",
+      "pick_in_group": false,
+      "reason": "Holds still silently for several seconds for thumbnail capture, nothing spoken.",
+      "t_end": 410.0,
+      "t_start": 395.0,
+      "topic": "Still pose hold"
+    },
+    {
+      "confidence": 0.9,
+      "group": "",
+      "kind": "aside_to_editor",
+      "pick_in_group": false,
+      "reason": "Handoff instruction about Daniel Sensual folder, Baton pass, and frame rate comment.",
+      "t_end": 435.0,
+      "t_start": 410.0,
+      "topic": "Daniel Sensual folder handoff"
+    },
+    {
+      "confidence": 0.8,
+      "group": "g1",
+      "kind": "keeper_take",
+      "pick_in_group": false,
+      "reason": "First full Bachata After Dark schedule update take, later replaced by cleaner retake.",
+      "t_end": 468.0,
+      "t_start": 435.0,
+      "topic": "Bachata After Dark update"
+    },
+    {
+      "confidence": 0.85,
+      "group": "g1",
+      "kind": "flub_or_false_start",
+      "pick_in_group": false,
+      "reason": "Aborted restart with 'No my bad. Cut that one' and self-correction, not usable.",
+      "t_end": 492.0,
+      "t_start": 468.0,
+      "topic": "Bachata After Dark update"
+    },
+    {
+      "confidence": 0.9,
+      "group": "g1",
+      "kind": "alternate_take",
+      "pick_in_group": true,
+      "reason": "Cleaner second take of same update, picked as best for story posting.",
+      "t_end": 515.0,
+      "t_start": 492.0,
+      "topic": "Bachata After Dark update"
+    },
+    {
+      "confidence": 0.85,
+      "group": "",
+      "kind": "aside_to_editor",
+      "pick_in_group": false,
+      "reason": "Introduces next YouTube Short idea for Daniel Sensual about music and Visto Azul.",
+      "t_end": 545.0,
+      "t_start": 515.0,
+      "topic": "Visto Azul short intro"
+    },
+    {
+      "confidence": 0.85,
+      "group": "",
+      "kind": "flub_or_false_start",
+      "pick_in_group": false,
+      "reason": "Spanish portion collapses with swearing and self-callout that Spanish sucks, take abandoned.",
+      "t_end": 600.0,
+      "t_start": 545.0,
+      "topic": "Visto Azul Spanish promo"
+    },
+    {
+      "confidence": 0.9,
+      "group": "",
+      "kind": "aside_to_editor",
+      "pick_in_group": false,
+      "reason": "Explains plan to do photo image and voice clone with HeyGen and ElevenLabs instead.",
+      "t_end": 660.0,
+      "t_start": 600.0,
+      "topic": "Voice clone HeyGen plan"
+    },
+    {
+      "confidence": 0.85,
+      "group": "",
+      "kind": "keeper_take",
+      "pick_in_group": true,
+      "reason": "Full publishable pitch for Ghost AI 24-48 hour websites with marketable sites line.",
+      "t_end": 735.0,
+      "t_start": 660.0,
+      "topic": "Ghost AI website service"
+    },
+    {
+      "confidence": 0.8,
+      "group": "",
+      "kind": "aside_to_editor",
+      "pick_in_group": false,
+      "reason": "Self-critique 'I didn't like that' and note that take could be HeyGenned.",
+      "t_end": 760.0,
+      "t_start": 735.0,
+      "topic": "HeyGen reshoot note"
+    },
+    {
+      "confidence": 0.9,
+      "group": "",
+      "kind": "aside_to_editor",
+      "pick_in_group": false,
+      "reason": "Directs editor on B-roll sources and sets up beginner dancer question story.",
+      "t_end": 810.0,
+      "t_start": 760.0,
+      "topic": "B-roll and story setup"
+    },
+    {
+      "confidence": 0.9,
+      "group": "",
+      "kind": "keeper_take",
+      "pick_in_group": true,
+      "reason": "Long continuous to-camera storytelling about dancing with best follow and 13-year learning advice.",
+      "t_end": 1020.0,
+      "t_start": 810.0,
+      "topic": "Beginner dancer advice"
+    },
+    {
+      "confidence": 0.88,
+      "group": "",
+      "kind": "keeper_take",
+      "pick_in_group": true,
+      "reason": "Clear to-camera answer on practicing 2-3 times a week for 30-45 minutes for improvement.",
+      "t_end": 1095.0,
+      "t_start": 1020.0,
+      "topic": "How often to practice Bachata"
+    },
+    {
+      "confidence": 0.9,
+      "group": "",
+      "kind": "setup_or_technical",
+      "pick_in_group": false,
+      "reason": "Troubleshooting receiver internal recording and charging on generator with A7S.",
+      "t_end": 1135.0,
+      "t_start": 1095.0,
+      "topic": "Receiver charging check"
+    },
+    {
+      "confidence": 0.85,
+      "group": "",
+      "kind": "setup_or_technical",
+      "pick_in_group": false,
+      "reason": "Commenting on possible bad cable causing weird behavior, gear check.",
+      "t_end": 1155.0,
+      "t_start": 1135.0,
+      "topic": "Cable issue check"
+    },
+    {
+      "confidence": 0.85,
+      "group": "",
+      "kind": "aside_to_editor",
+      "pick_in_group": false,
+      "reason": "Asking to try charging receiver, speculating drain through hook piece.",
+      "t_end": 1180.0,
+      "t_start": 1155.0,
+      "topic": "Receiver charge attempt"
+    },
+    {
+      "confidence": 0.85,
+      "group": "",
+      "kind": "dead_air_or_still",
+      "pick_in_group": false,
+      "reason": "Long silent period looking down at phone with no usable speech, ends recording.",
+      "t_end": 1330.0,
+      "t_start": 1180.0,
+      "topic": "Silent phone check"
+    }
+  ]
+}

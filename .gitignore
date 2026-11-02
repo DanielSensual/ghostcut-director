@@ -1,0 +1,31 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.DS_Store
+*.egg-info/
+
+# Local sample media (never commit footage)
+examples/
+
+# Local output artifacts
+out/
+tmp/
+*.log
+
+# GhostCut run outputs
+manifest/
+analysis/
+timeline/
+reports/
+proxies/
+audio/
+
+# Credentials (never commit)
+.env
+.env.*
+*.meta-api.env
+app/ui/demo/

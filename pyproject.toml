@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ghostcut-director"
+version = "0.1.0"
+description = "GhostCut Director: a Mac app and command line that cut multicam talking video with Meta's Muse models and SAM 3.1"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Daniel Castillo (Ghost AI Systems)" }]
+license = { text = "MIT" }
+# GhostCut as it stood before the Meta Global AI Hackathon, plus its in-event export fixes (be52bc8).
+dependencies = ["ghostcut @ git+https://github.com/DanielSensual/ghostcut@be52bc8"]
+
+[project.urls]
+Repository = "https://github.com/DanielSensual/ghostcut-director"
+
+[project.optional-dependencies]
+muse = ["guestlist @ git+https://github.com/DanielSensual/guestlist"]
+director = ["numpy>=1.26", "Pillow>=10"]
+
+[project.scripts]
+director = "director.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

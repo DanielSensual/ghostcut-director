@@ -1,0 +1,108 @@
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+from ghostcut.ffmpeg_tools import ToolingError, require_ffmpeg_binaries
+
+
+def command_grade(args: argparse.Namespace) -> dict:
+    from .grade import run as run_grade
+
+    if not bool(args.no_match) or bool(args.check):
+        require_ffmpeg_binaries()
+    payload = run_grade(
+        sync_path=Path(args.sync),
+        out_path=Path(args.out),
+        reference_label=args.reference,
+        lut_specs=list(args.lut or []),
+        no_match=bool(args.no_match),
+        check=bool(args.check),
+        model=args.model,
+    )
+    for camera in payload.get("cameras", []):
+        match = camera.get("match", {})
+        line = f"{camera['label']} {camera.get('gamma', '')} {camera['conversion']['kind']}"
+        if match.get("matched"):
+            gains = ",".join(str(value) for value in match["gain"])
+            offsets = ",".join(str(value) for value in match["offset"])
+            line += f" gain {gains} offset {offsets}"
+            if any(match["gain_clamped"]) or any(match["offset_clamped"]):
+                line += " clamped"
+        print(line)
+    for warning in payload.get("warnings", []):
+        print(f"! {warning}")
+    print(f"Wrote {args.out}")
+    return payload
+
+
+def command_angles(args: argparse.Namespace) -> dict:
+    from .angles import run as run_angles
+
+    if (not bool(getattr(args, "no_muse", False)) or getattr(args, "render", None)
+            or getattr(args, "grade", None)):
+        require_ffmpeg_binaries()
+    payload = run_angles(
+        sync_path=Path(args.sync),
+        words_path=Path(args.words),
+        out_path=Path(args.out),
+        audio_label=args.audio,
+        render_path=Path(args.render) if args.render else None,
+        min_shot_s=float(args.min_shot),
+        model=args.model,
+        no_muse=bool(args.no_muse),
+        grade_path=Path(args.grade) if getattr(args, "grade", None) else None,
+    )
+    for shot in payload.get("shots", []):
+        for overrule in shot.get("overrules", []):
+            print(f"  shot {shot['id']} {shot['camera']}: {overrule}")
+    n_lines, n_shots = len(payload.get("lines", [])), len(payload.get("shots", []))
+    print(f"{n_lines} lines → {n_shots} shots ({payload.get('method')}, ${payload.get('spend_usd', 0.0):.4f})")
+    return payload
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="GhostCut Director: multicam cutting on Meta's Muse models")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    angles_parser = sub.add_parser("angles", help="Pick the camera angle for each spoken line")
+    angles_parser.add_argument("--sync", required=True, help="sync.json from director sync")
+    angles_parser.add_argument("--words", required=True, help="Word-timed Whisper JSON for the audio clip")
+    angles_parser.add_argument("--out", required=True, help="Where to write angles.json")
+    angles_parser.add_argument("--audio", default=None, help="Audio clip label (default: the reference clip)")
+    angles_parser.add_argument("--render", default=None, help="Render the cut to this .mp4 path")
+    angles_parser.add_argument("--min-shot", type=float, default=2.0, help="Shorter shots merge into a neighbour")
+    angles_parser.add_argument("--model", default="muse-spark-1.3")
+    angles_parser.add_argument("--no-muse", action="store_true", help="Use the deterministic rule fallback")
+    angles_parser.add_argument("--grade", default=None, help="grade.json from director grade")
+    angles_parser.set_defaults(func=command_angles)
+
+    grade_parser = sub.add_parser("grade", help="Grade each camera to Rec.709 and match to a reference")
+    grade_parser.add_argument("--sync", required=True, help="sync.json from director sync")
+    grade_parser.add_argument("--out", required=True, help="Where to write grade.json")
+    grade_parser.add_argument("--reference", default=None, help="Reference camera label (default: the sync reference)")
+    grade_parser.add_argument("--lut", action="append", default=[],
+                              help="Supplied .cube as LABEL=PATH (repeatable)")
+    grade_parser.add_argument("--no-match", action="store_true", help="Write conversions only, skip matching")
+    grade_parser.add_argument("--check", action="store_true", help="Ask Muse Spark to check the match")
+    grade_parser.add_argument("--model", default="muse-spark-1.3")
+    grade_parser.set_defaults(func=command_grade)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        args.func(args)
+    except (FileNotFoundError, ValueError, RuntimeError, ToolingError) as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

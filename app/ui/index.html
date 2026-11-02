@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GhostCut Director</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <img src="../../docs/brand/ghostcut-icon-1024.png" alt="">
+    <span class="word">GHOST<b>CUT</b></span>
+  </div>
+  <div class="proj">
+    <div class="proj-title" id="projTitle">Untitled project</div>
+    <div class="proj-sub" id="projSub"></div>
+  </div>
+  <nav class="steps" id="steps">
+    <button data-view="import"><i>1</i>Import</button>
+    <button data-view="story"><i>2</i>Story</button>
+    <button data-view="edit" class="on"><i>3</i>Edit</button>
+    <button data-view="deliver"><i>4</i>Deliver</button>
+  </nav>
+  <div class="top-right">
+    <span class="engine-dot" id="engineDot"></span>
+    <button class="spend" id="spendBtn" title="Meta API spend on this project"></button>
+    <button class="primary" data-view="deliver">Export</button>
+  </div>
+  <div class="pop" id="spendPop" hidden></div>
+</header>
+
+<main class="view" id="view-edit">
+  <aside class="side">
+    <h4>Sections</h4>
+    <ul class="sections" id="sectionList"></ul>
+    <h4>Media</h4>
+    <ul class="bins" id="binList"></ul>
+  </aside>
+
+  <section class="center">
+    <div class="player">
+      <video id="video" preload="metadata" playsinline></video>
+      <div class="player-empty" id="noVideo" hidden>Demo footage not found.<br><code>python app/make_demo.py …</code></div>
+    </div>
+    <div class="transport">
+      <button class="icon" id="playBtn" title="Play (space)">▶</button>
+      <span class="tc"><b id="tcNow">00:00</b> / <span id="tcDur">00:00</span></span>
+      <span class="where" id="where"></span>
+      <span class="grow"></span>
+      <span class="pending" id="pending" hidden><i></i><b id="pendingN"></b> waiting to render
+        <button id="undoLast" data-busy="undo">Undo last</button></span>
+      <span class="ver" id="verChip" hidden></span>
+      <button class="renderbtn" id="renderBtn" disabled>Render</button>
+      <label class="zoom">Zoom <input type="range" id="zoom" min="1" max="12" step="0.5" value="1"></label>
+    </div>
+    <div class="renderbar" id="renderBar" hidden>
+      <div class="fill" id="renderFill"></div>
+      <span class="rtext" id="renderText"></span>
+      <span class="grow"></span>
+      <span class="reta" id="renderEta"></span>
+      <span class="racts" id="renderActs"></span>
+    </div>
+    <div class="timeline" id="timeline">
+      <div class="labels">
+        <div class="lab ruler-lab"></div>
+        <div class="lab">Sections</div>
+        <div class="lab">B-roll</div>
+        <div class="lab">Cards</div>
+        <div class="lab tall">Talk</div>
+        <div class="lab">Voice</div>
+        <div class="lab">Music</div>
+      </div>
+      <div class="tracks-scroll" id="tracksScroll">
+        <div class="tracks" id="tracks">
+          <div class="row ruler" id="ruler"></div>
+          <div class="row" id="trkSections"></div>
+          <div class="row" id="trkBroll"></div>
+          <div class="row" id="trkCards"></div>
+          <div class="row tall" id="trkTalk"></div>
+          <div class="row env"><canvas id="cvVoice"></canvas></div>
+          <div class="row env"><canvas id="cvMusic"></canvas></div>
+          <div class="playhead" id="playhead"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <aside class="panel">
+    <div class="tabs" id="panelTabs">
+      <button data-tab="muse" class="on">Muse</button>
+      <button data-tab="review">Review <em id="openCount"></em></button>
+      <button data-tab="words">Words</button>
+      <button data-tab="why">Why</button>
+    </div>
+    <div class="tab" id="tab-muse">
+      <div class="chat" id="chat"></div>
+      <div class="suggest" id="suggest"></div>
+      <form class="ask" id="askForm">
+        <textarea id="askInput" rows="2" placeholder="Ask Muse to change the edit…"></textarea>
+        <button class="primary" type="submit">Send</button>
+      </form>
+    </div>
+    <div class="tab" id="tab-review" hidden>
+      <div class="filters" id="filters">
+        <button data-f="all" class="on">All</button><button data-f="open">Open</button>
+        <button data-f="fixed">Fixed</button><button data-f="rejected">Rejected</button>
+      </div>
+      <div class="legend"><span class="b measured">Measured</span><span class="b spark">Spark</span><span class="b you">You</span><span class="b reshoot">Reshoot</span></div>
+      <ul class="findings" id="findings"></ul>
+    </div>
+    <div class="tab" id="tab-words" hidden>
+      <div class="wsearch"><input id="wordsSearch" type="search" placeholder="Find a word or phrase…"><small id="wordsCount"></small></div>
+      <div class="words" id="words"></div>
+    </div>
+    <div class="tab" id="tab-why" hidden>
+      <div class="why" id="why"><p class="muted">Click a clip on the timeline to see why it's there.</p></div>
+    </div>
+  </aside>
+</main>
+
+<main class="view page" id="view-story" hidden></main>
+<main class="view page" id="view-import" hidden></main>
+<main class="view page" id="view-deliver" hidden></main>
+
+<div class="modal" id="renderDlg" hidden>
+  <div class="dlg" role="dialog" aria-modal="true" aria-labelledby="renderDlgTitle">
+    <h3 id="renderDlgTitle">Render</h3>
+    <div id="renderDlgBody"></div>
+    <div class="dlg-acts"><button id="renderDlgClose">Close</button><button class="primary" id="renderStart" disabled>Start</button></div>
+  </div>
+</div>
+
+<script src="demo/project.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
