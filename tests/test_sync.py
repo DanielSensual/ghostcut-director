@@ -287,6 +287,24 @@ class WaveformTests(unittest.TestCase):
         drifted = plain.detail["drift_ppm"]
         self.assertTrue(drifted is None or abs(drifted) < 40.0)
 
+    def test_waveform_drift_at_large_offset_reports_start_offset(self) -> None:
+        assert np is not None
+        sr = sync.SAMPLE_RATE
+        true_offset, target_dur, ref_dur = 120.0, 75.0, 270.0
+        drift = 300e-6
+        content = _bursts(280.0, _positions_until(278.0), burst_s=1.5, seed=11)
+        anchor_s = content[:int(ref_dur * sr)].copy()
+        src_idx = true_offset * sr + np.arange(int(target_dur * sr)) * (1 + drift)
+        target_s = np.interp(src_idx, np.arange(len(content)),
+                             content).astype(np.float32)
+        env = _envelopes(**{"/c/A.mp4": anchor_s, "/c/B.mp4": target_s})
+        est = sync.waveform_estimate(_clip("B", None, duration=target_dur),
+                                     _clip("A", 0.0, duration=ref_dur), env)
+        assert est is not None
+        self.assertGreaterEqual(est.detail["drift_windows"], 3)
+        self.assertAlmostEqual(est.detail["drift_ppm"], drift * 1e6, delta=60.0)
+        self.assertAlmostEqual(est.offset_s, true_offset, delta=0.01)
+
 
 @unittest.skipUnless(HAS_NUMPY, "waveform sync needs numpy")
 class WaveformExactScoreTests(unittest.TestCase):

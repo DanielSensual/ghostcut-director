@@ -89,6 +89,7 @@ Muse Code token use: TBD (the owner fills them from the run log).
 - The waveform score was a whole-clip z-scored FFT dot product divided by the overlap count, not a Pearson correlation (identical audio scored r 1.003, an 11 s edge overlap 0.744 and won): the FFT pass now only proposes candidate lags spread across distinct peaks, and the reported r is the exact Pearson over each candidate's actual overlap (top 8 rescored, best wins).
 - `clear` and `margin` came from the ±15 ms 1 ms refinement, whose window holds no rival 1 s away (second_r always −1, every peak "clear"): they now come from the coarse global search (exact-r best minus best exact-r at least 1 s away, also rescored exactly), while the refinement only moves the offset to the 1 ms grid.
 - The guided re-search compared its FFT-approximate r against the global one: it now reports the same exact Pearson, so the "guided r ≥ global r − 0.02" comparison is like with like.
+- `measure_drift` searched each pre-aligned 20 s window around the absolute offset instead of the residual 0, so at a large offset (+178.75 s) every window missed and drift came back null: it now searches around 0, adds the residual back to the coarse offset per window, and reports the fitted intercept (the offset at the clip's first frame).
 
 # Build log: `director reframe` (2026-11-02)
 

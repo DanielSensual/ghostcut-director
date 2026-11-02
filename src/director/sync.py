@@ -639,10 +639,10 @@ def measure_drift(ref_env_1ms, tgt_env_1ms, coarse_offset_s: float,
         ref_seg = np.asarray(ref_env_1ms[max(0, ref_a):ref_b])
         tgt_seg = np.asarray(tgt_env_1ms[max(0, tgt_a):tgt_b])
         peak = find_peak(ref_seg, tgt_seg, REFINE_HOP_S,
-                         window_s=(coarse_offset_s, DRIFT_SEARCH_S))
+                         window_s=(0.0, DRIFT_SEARCH_S))
         if peak is not None and peak.r >= DRIFT_WINDOW_MIN_R:
             centres.append((start + end) / 2)
-            offsets.append(peak.offset_s)
+            offsets.append(coarse_offset_s + peak.offset_s)
         if end >= hi - 1e-9:
             break
         start = end
