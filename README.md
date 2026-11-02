@@ -61,7 +61,9 @@ From [docs/muse-code/BUILD-LOG.md](docs/muse-code/BUILD-LOG.md) and the git log,
 | The Director app, Render and the test-run scripts | Built by Claude Code with the owner (imported) |
 | The briefs | The owner with Claude Code |
 
-Muse Code spend, at list price with no cache discount: about $5.19 for sync ($2.11 + $2.07 + $0.67 + $0.34) and about $2.34 for reframe ($1.46 + $0.88); the angles and grade figures are at most about $6.20 and at most about $9.60.
+Sync and reframe were first built earlier in the event by Claude Code, inside GhostCut, where they are still public. The versions here are Muse Code's rewrites: it got only the briefs, never that code, and its run logs show no reads outside this repository and its installed packages. Both were checked against the same real recordings and cut ([BUILD-LOG](docs/muse-code/BUILD-LOG.md), Live test).
+
+Muse Code spend at list rates (cached input at the cached rate): about $5.19 for sync ($2.11 + $2.07 + $0.67 + $0.34) and about $2.34 for reframe ($1.46 + $0.88). Angles and grade cost at most about $6.20 and $9.60, counted with no cache discount.
 
 ## Context
 

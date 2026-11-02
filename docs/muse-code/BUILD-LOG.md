@@ -74,7 +74,7 @@ Who did what, so the credit is exact.
 
 Muse Code token use (from the run logs):
 
-| Run | Model | Calls | Input (cached) | Output | At list price |
+| Run | Model | Calls | Input (cached) | Output | List rates, cached input at the cached rate |
 |---|---|---|---|---|---|
 | Design | `muse-wonder-1.0` | 23 | 2.65M (2.43M) | 38k | $2.11 |
 | Build | `muse-spark-1.3` | 69 | 9.56M (9.35M) | 94k | $2.07 |
@@ -121,7 +121,7 @@ Who did what, so the credit is exact.
 
 Muse Code token use (from the run logs):
 
-| Run | Model | Calls | Input (cached) | Output | At list price |
+| Run | Model | Calls | Input (cached) | Output | List rates, cached input at the cached rate |
 |---|---|---|---|---|---|
 | Design | `muse-wonder-1.0` | 12 | 1.01M (0.86M) | 33k | $1.46 |
 | Build | `muse-spark-1.3` | 40 | 3.71M (3.57M) | 40k | $0.88 |
