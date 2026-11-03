@@ -42,7 +42,10 @@ from director.grade import (
     sample_command,
     shared_moments,
     shoulder,
+    skin_sample_command,
+    skin_stats,
     solve_match,
+    solve_skin_match,
     write_cube,
 )
 
@@ -740,3 +743,259 @@ class ReferenceChoiceTests(unittest.TestCase):
         self.assertEqual(choose_reference(clips, "A", None), "B")
         self.assertEqual(choose_reference(clips, "A", "C"), "C")
         self.assertEqual(choose_reference(clips[1:], "B", None), "B")
+
+
+def _solid_frame(width: int, height: int, rgb: tuple[int, int, int]) -> bytes:
+    return bytes(rgb * (width * height))
+
+
+class SkinStatsTests(unittest.TestCase):
+    def test_measures_the_inner_region_only(self) -> None:
+        # 10x10, box the whole frame: the central 60% is the middle 6x6
+        width, height = 10, 10
+        frame = bytearray(_solid_frame(width, height, (0, 0, 0)))
+        for r in range(2, 8):
+            for c in range(2, 8):
+                base = (r * width + c) * 3
+                frame[base:base + 3] = bytes((200, 100, 50))
+        stats = skin_stats(bytes(frame), width, height, (0.0, 0.0, 1.0, 1.0))
+        assert stats is not None
+        self.assertEqual(stats.moments, 1)
+        for got, want in zip(stats.mean, (200 / 255, 100 / 255, 50 / 255)):
+            self.assertAlmostEqual(got, want)
+        self.assertEqual(stats.std, (0.0, 0.0, 0.0))
+
+    def test_vision_box_y_grows_upwards(self) -> None:
+        # top half white, bottom half black: a Vision upper-half box reads white
+        width, height = 8, 8
+        frame = bytearray()
+        for r in range(height):
+            frame += bytes((255, 255, 255) * width) if r < 4 \
+                else bytes((0, 0, 0) * width)
+        top = skin_stats(bytes(frame), width, height, (0.0, 0.5, 1.0, 0.5),
+                         inset=0.0)
+        bottom = skin_stats(bytes(frame), width, height, (0.0, 0.0, 1.0, 0.5),
+                            inset=0.0)
+        assert top is not None and bottom is not None
+        self.assertEqual(top.mean, (1.0, 1.0, 1.0))
+        self.assertEqual(bottom.mean, (0.0, 0.0, 0.0))
+
+    def test_spread_over_a_split_region(self) -> None:
+        # left half of the inner region black, right half white
+        width, height = 10, 10
+        frame = bytearray(_solid_frame(width, height, (0, 0, 0)))
+        for r in range(2, 8):
+            for c in range(5, 8):
+                base = (r * width + c) * 3
+                frame[base:base + 3] = bytes((255, 255, 255))
+        stats = skin_stats(bytes(frame), width, height, (0.0, 0.0, 1.0, 1.0))
+        assert stats is not None
+        self.assertAlmostEqual(stats.mean[0], 0.5)
+        self.assertAlmostEqual(stats.std[0], 0.5)
+
+    def test_no_box_or_empty_region_gives_none(self) -> None:
+        frame = _solid_frame(10, 10, (9, 9, 9))
+        self.assertIsNone(skin_stats(frame, 10, 10, None))
+        self.assertIsNone(skin_stats(frame, 10, 10, (0.5, 0.5, 0.0, 0.0)))
+        self.assertIsNone(skin_stats(frame, 10, 10, (2.0, 2.0, 0.5, 0.5)))
+        with self.assertRaises(GradeError):
+            skin_stats(bytes(10), 10, 10, (0.0, 0.0, 1.0, 1.0))
+
+    def test_sample_command_shape(self) -> None:
+        clip = _grade_clip("B", 5.0, 100.0)
+        clip.colour = SourceColour(range="tv", space="bt709", primaries="bt709")
+        cmd = skin_sample_command(clip, 12.5, Path("/tmp/B-conv.cube"),
+                                  Path("/tmp/B_00_cam.jpg"))
+        self.assertLess(cmd.index("-ss"), cmd.index("-i"))
+        self.assertIn("pipe:1", cmd)
+        self.assertIn("/tmp/B_00_cam.jpg", cmd)
+        self.assertEqual(cmd.count("-map"), 2)
+        first_vf = cmd[cmd.index("-vf") + 1]
+        self.assertIn("lut3d=file='/tmp/B-conv.cube'", first_vf)
+        self.assertIn("scale=480:270", first_vf)
+        bare = skin_sample_command(clip, 12.5, None, Path("/tmp/x.jpg"))
+        self.assertNotIn("lut3d", " ".join(bare))
+
+
+class SkinSolveTests(unittest.TestCase):
+    def test_recovers_gain_and_contrast(self) -> None:
+        # neutral cast plus a flatter response: means and spreads both land
+        cam = ChannelStats(mean=(0.4, 0.4, 0.4), std=(0.09, 0.09, 0.09),
+                           moments=2)
+        ref = ChannelStats(mean=(0.5, 0.5, 0.5), std=(0.1, 0.1, 0.1),
+                           moments=2)
+        solved = solve_skin_match(cam, ref)
+        self.assertTrue(solved.matched)
+        for gain in solved.gain:
+            self.assertAlmostEqual(gain, 1.111111, places=5)
+        for offset in solved.offset:
+            self.assertAlmostEqual(offset, 0.0555556, places=5)
+        self.assertEqual(solved.gain_clamped, (False, False, False))
+        self.assertEqual(solved.offset_clamped, (False, False, False))
+        after = apply_stats(cam, solved.gain, solved.offset)
+        for got in after.mean:
+            self.assertAlmostEqual(got, 0.5)
+        for got in after.std:
+            self.assertAlmostEqual(got, 0.1)
+
+    def test_equal_spreads_are_gain_only(self) -> None:
+        ref = ChannelStats(mean=(0.4, 0.5, 0.45), std=(0.1, 0.12, 0.09),
+                           moments=3)
+        cam = ChannelStats(mean=(0.4 / 1.1, 0.5, 0.45 / 0.95),
+                           std=(0.1 / 1.1, 0.12, 0.09 / 0.95), moments=3)
+        solved = solve_skin_match(cam, ref)
+        plain = solve_match(cam, ref)
+        for got, want in zip(solved.gain, plain.gain):
+            self.assertAlmostEqual(got, want)
+        for got in solved.offset:
+            self.assertAlmostEqual(got, 0.0)
+        self.assertEqual(solved.gain_clamped, plain.gain_clamped)
+        self.assertEqual(solved.offset_clamped, (False, False, False))
+
+    def test_clamps_contrast_gain_and_lift(self) -> None:
+        cam = ChannelStats(mean=(0.4, 0.4, 0.4), std=(0.05, 0.05, 0.05),
+                           moments=2)
+        ref = ChannelStats(mean=(0.5, 0.5, 0.5), std=(0.1, 0.1, 0.1),
+                           moments=2)
+        solved = solve_skin_match(cam, ref)
+        # contrast 1.6x clamps to 1.25, the product to 1.4, the lift to -0.10
+        self.assertEqual(solved.gain, (1.4, 1.4, 1.4))
+        self.assertEqual(solved.offset, (-0.1, -0.1, -0.1))
+        self.assertEqual(solved.gain_clamped, (True, True, True))
+        self.assertEqual(solved.offset_clamped, (True, True, True))
+
+    def test_flat_spread_holds_contrast_at_one(self) -> None:
+        cam = ChannelStats(mean=(0.4, 0.4, 0.4), std=(0.0, 0.09, 0.09),
+                           moments=1)
+        ref = ChannelStats(mean=(0.5, 0.5, 0.5), std=(0.1, 0.1, 0.1),
+                           moments=1)
+        solved = solve_skin_match(cam, ref)
+        plain = solve_match(cam, ref)
+        self.assertAlmostEqual(solved.gain[0], plain.gain[0])
+        self.assertEqual(solved.offset[0], 0.0)
+
+    def test_black_channel_holds(self) -> None:
+        ref = ChannelStats(mean=(0.5, 0.5, 0.5), std=(0.1, 0.1, 0.1),
+                           moments=1)
+        cam = ChannelStats(mean=(0.4, 0.0, 0.4), std=(0.1, 0.1, 0.1),
+                           moments=1)
+        solved = solve_skin_match(cam, ref)
+        self.assertEqual(solved.gain, (1.0, 1.0, 1.0))
+        self.assertEqual(solved.offset, (0.0, 0.0, 0.0))
+
+
+class SkinFallbackTests(unittest.TestCase):
+    def test_run_falls_back_to_whole_frame_with_a_warning(self) -> None:
+        from director.grade import run
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            sync = _write_sync(base)
+            out = base / "grade.json"
+            ref = ChannelStats(mean=(0.5, 0.5, 0.5), std=(0.1, 0.1, 0.1),
+                               moments=1)
+            cam = ChannelStats(mean=(0.4, 0.4, 0.4), std=(0.09, 0.09, 0.09),
+                               moments=1)
+
+            def no_skin(*args, **kwargs):
+                note = args[-1]
+                note("B", "no_face:B")
+                return None
+
+            with mock.patch("director.grade._take_skin_pair",
+                            side_effect=no_skin), \
+                    mock.patch("director.grade._take_frames",
+                               side_effect=[[ref], [cam]]):
+                payload = run(sync_path=sync, out_path=out)
+            by_label = {c["label"]: c for c in payload["cameras"]}
+            match = by_label["B"]["match"]
+            self.assertTrue(match["matched"])
+            self.assertEqual(match["region"], "frame")
+            self.assertEqual(match["skin_moments"], [])
+            self.assertIn("no_face:B", payload["warnings"])
+            self.assertIn("no_face:B", by_label["B"]["warnings"])
+            # whole-frame numbers, solved gain-only
+            self.assertEqual(match["offset"], [0.0, 0.0, 0.0])
+            self.assertAlmostEqual(match["before"]["mean"][0], 0.4)
+
+    def test_run_matches_on_skin_when_faces_pair(self) -> None:
+        from director.grade import run
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            sync = _write_sync(base)
+            out = base / "grade.json"
+            ref = ChannelStats(mean=(0.5, 0.5, 0.5), std=(0.1, 0.1, 0.1),
+                               moments=2)
+            cam = ChannelStats(mean=(0.4, 0.4, 0.4), std=(0.09, 0.09, 0.09),
+                               moments=2)
+            moments = [14.5, 20.0]
+            with mock.patch("director.grade._take_skin_pair",
+                            return_value=(ref, cam, moments)):
+                payload = run(sync_path=sync, out_path=out)
+            by_label = {c["label"]: c for c in payload["cameras"]}
+            match = by_label["B"]["match"]
+            self.assertTrue(match["matched"])
+            self.assertEqual(match["region"], "skin")
+            self.assertEqual(match["moments"], moments)
+            self.assertEqual(match["skin_moments"], moments)
+            self.assertNotIn("no_face:B", payload["warnings"])
+            # the skin solve carries contrast in the offset
+            self.assertNotEqual(match["offset"], [0.0, 0.0, 0.0])
+            for got in match["after"]["mean"]:
+                self.assertAlmostEqual(got, 0.5)
+            for got in match["after"]["std"]:
+                self.assertAlmostEqual(got, 0.1)
+
+    def test_helper_unavailable_warns_once(self) -> None:
+        from director.grade import _take_skin_pair
+        seen: list[str] = []
+        cache: dict = {}
+        with mock.patch("director.grade._skin_helper_cached",
+                        return_value=None):
+            first = _take_skin_pair(_grade_clip("A", 0.0, 100.0),
+                                    _grade_clip("B", 5.0, 100.0), [50.0],
+                                    {}, Path("/tmp/nowhere"), cache,
+                                    lambda label, warning: seen.append(warning))
+            second = _take_skin_pair(_grade_clip("A", 0.0, 100.0),
+                                     _grade_clip("C", 5.0, 100.0), [50.0],
+                                     {}, Path("/tmp/nowhere"), cache,
+                                     lambda label, warning: seen.append(warning))
+        self.assertIsNone(first)
+        self.assertIsNone(second)
+        self.assertEqual(len(seen), 1)
+        self.assertTrue(seen[0].startswith("skin_helper_unavailable:"))
+
+    def test_pairing_needs_a_face_on_both_sides(self) -> None:
+        from director.grade import SKIN_H, SKIN_W, _take_skin_pair
+        from director.sync import LipsFrame
+        with tempfile.TemporaryDirectory() as tmp:
+            frames_dir = Path(tmp) / "skin-frames"
+            frames_dir.mkdir()
+            raw = _solid_frame(SKIN_W, SKIN_H, (128, 64, 32))
+            box = (0.25, 0.25, 0.5, 0.5)
+            # sorted names: B_00_cam, B_00_ref, B_01_cam, B_01_ref
+            found = [LipsFrame(0, None, box),
+                     LipsFrame(1, None, box),
+                     LipsFrame(2, None, box),
+                     LipsFrame(3, None, None)]
+            cache: dict = {"helper": Path("/fake/helper")}
+
+            def fake_decode(clip, at_local, lut, jpg_path, width=0, height=0):
+                Path(jpg_path).write_bytes(b"fake-jpeg")
+                return raw
+
+            with mock.patch("director.grade.decode_skin_frame",
+                            side_effect=fake_decode) as dec, \
+                    mock.patch("director.sync.run_lips_helper",
+                               return_value=found):
+                out = _take_skin_pair(
+                    _grade_clip("A", 0.0, 100.0), _grade_clip("B", 5.0, 100.0),
+                    [50.0, 60.0], {"A": None, "B": None}, frames_dir, cache,
+                    lambda label, warning: None)
+            self.assertEqual(dec.call_count, 4)
+            assert out is not None
+            ref_stats, cam_stats, paired = out
+            self.assertEqual(paired, [50.0])
+            for stats in (ref_stats, cam_stats):
+                self.assertEqual(stats.moments, 1)
+                for got, want in zip(stats.mean, (128 / 255, 64 / 255, 32 / 255)):
+                    self.assertAlmostEqual(got, want)

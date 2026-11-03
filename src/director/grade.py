@@ -4,9 +4,12 @@ Sony cameras record S-Log3 (flat log, wide gamut), the iPhone records HLG
 (BT.2020), and sometimes a camera already records Rec.709. Cutting between
 them ungraded jumps from grey log to bright phone, so each camera first gets
 a 33-point .cube converting it to Rec.709 (generated here in pure Python),
-then the cameras are matched to a reference camera with a per-channel gain
-and offset solved from small centre-frame measurements, baked into the same
-cube. `ghostcut angles --grade grade.json` applies each shot's cube.
+then the cameras are matched to a reference camera on the speaker's skin:
+statistics measured inside the face box at the shared moments, a per-channel
+gain as before plus contrast from the spreads, baked into the same cube.
+Without a usable face on both cameras the match falls back to whole-frame
+centre measurements with a warning. `ghostcut angles --grade grade.json`
+applies each shot's cube.
 """
 from __future__ import annotations
 
@@ -21,10 +24,13 @@ from ghostcut.ffmpeg_tools import ToolingError, run_command
 
 LUT_SIZE = 33
 MEASURE_W, MEASURE_H = 64, 36
+SKIN_W, SKIN_H = 480, 270
+SKIN_INSET = 0.2  # the match measures the central 60% of the face box
 MAX_MOMENTS = 8
 CHECK_MOMENTS = 3
 GAIN_MIN, GAIN_MAX, OFFSET_MAX = 0.7, 1.4, 0.10
 WB_MIN, WB_MAX = 0.8, 1.25
+CONTRAST_MIN, CONTRAST_MAX = 0.8, 1.25
 LUMA = (0.2126, 0.7152, 0.0722)  # BT.709 luma weights
 
 OUT_W, OUT_H = 1920, 1080
@@ -622,6 +628,42 @@ def decode_centre_frame(clip: GradeClip, at_local_s: float,
     return proc.stdout
 
 
+def skin_sample_command(clip: GradeClip, at_local_s: float,
+                        conversion_lut: Path | None, jpg_path: Path,
+                        width: int = SKIN_W, height: int = SKIN_H) -> list[str]:
+    """One converted full frame as raw RGB plus a helper JPEG for face boxes.
+
+    Both outputs go through the camera's conversion LUT and bilinearly
+    down to width x height; the raw pipe feeds skin_stats and the JPEG
+    feeds the Vision helper, whose boxes are normalised so one size
+    serves both. -ss sits before -i, as in angles.
+    """
+    vf = (f"{_input_scale(clip.colour)},format=rgb48le{_convert_lut3d(conversion_lut)},"
+          f"scale={width}:{height}:flags=bilinear,format=rgb24")
+    vf_jpg = (f"{_input_scale(clip.colour)},format=rgb48le{_convert_lut3d(conversion_lut)},"
+              f"scale={width}:{height}:flags=bilinear")
+    return ["ffmpeg", "-v", "error", "-y", "-ss", f"{at_local_s:.3f}", "-i", clip.path,
+            "-map", "0:v:0", "-frames:v", "1", "-vf", vf,
+            "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
+            "-map", "0:v:0", "-frames:v", "1", "-vf", vf_jpg,
+            "-q:v", "4", str(jpg_path)]
+
+
+def decode_skin_frame(clip: GradeClip, at_local_s: float,
+                      conversion_lut: Path | None, jpg_path: Path,
+                      width: int = SKIN_W, height: int = SKIN_H) -> bytes:
+    """Raw rgb24 bytes off the pipe; the helper JPEG lands at jpg_path."""
+    Path(jpg_path).parent.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.run(skin_sample_command(clip, at_local_s, conversion_lut,
+                                              jpg_path, width, height),
+                          capture_output=True, check=False)
+    want = width * height * 3
+    if proc.returncode != 0 or len(proc.stdout) != want:
+        tail = proc.stderr.decode("utf-8", errors="replace")[-300:]
+        raise GradeError(f"skin sample failed for {clip.label} at {at_local_s:.3f}s: {tail}")
+    return proc.stdout
+
+
 def centre_stats(raw: bytes) -> ChannelStats:
     """Mean and spread per channel over one 64x36 centre frame."""
     if len(raw) != MEASURE_W * MEASURE_H * 3:
@@ -638,6 +680,49 @@ def centre_stats(raw: bytes) -> ChannelStats:
         for c in range(3):
             diff = raw[i + c] / 255.0 - means[c]
             variances[c] += diff * diff
+    stds = [math.sqrt(v / n) for v in variances]
+    return ChannelStats(mean=(means[0], means[1], means[2]),
+                        std=(stds[0], stds[1], stds[2]), moments=1)
+
+
+def skin_stats(raw: bytes, width: int, height: int,
+               box: tuple[float, float, float, float] | None,
+               inset: float = SKIN_INSET) -> ChannelStats | None:
+    """Mean and spread per channel inside the face box's inner region.
+
+    The region is the central 1 - 2 * inset of the Vision box (normalised,
+    origin lower-left), so hair and background stay out; pixels come from
+    a full-frame decode `width` x `height` rgb24. None when there is no
+    box or the region is empty. Pure.
+    """
+    if box is None:
+        return None
+    if len(raw) != width * height * 3:
+        raise GradeError(f"want {width * height * 3} sample bytes, have {len(raw)}")
+    x, y, w, h = (float(v) for v in box)
+    c0 = max(0, min(width, math.floor((x + inset * w) * width)))
+    c1 = max(0, min(width, math.ceil((x + (1.0 - inset) * w) * width)))
+    # Vision's y grows upwards, pixel rows grow downwards
+    r0 = max(0, min(height, math.floor(height - (y + (1.0 - inset) * h) * height)))
+    r1 = max(0, min(height, math.ceil(height - (y + inset * h) * height)))
+    if c1 <= c0 or r1 <= r0:
+        return None
+    n = (c1 - c0) * (r1 - r0)
+    sums = [0.0, 0.0, 0.0]
+    for r in range(r0, r1):
+        base = (r * width + c0) * 3
+        for c in range(c1 - c0):
+            sums[0] += raw[base + 3 * c]
+            sums[1] += raw[base + 3 * c + 1]
+            sums[2] += raw[base + 3 * c + 2]
+    means = [s / (n * 255.0) for s in sums]
+    variances = [0.0, 0.0, 0.0]
+    for r in range(r0, r1):
+        base = (r * width + c0) * 3
+        for c in range(c1 - c0):
+            for ch in range(3):
+                diff = raw[base + 3 * c + ch] / 255.0 - means[ch]
+                variances[ch] += diff * diff
     stds = [math.sqrt(v / n) for v in variances]
     return ChannelStats(mean=(means[0], means[1], means[2]),
                         std=(stds[0], stds[1], stds[2]), moments=1)
@@ -717,6 +802,56 @@ def solve_match(cam: ChannelStats, ref: ChannelStats) -> MatchResult:
     return MatchResult(gain=(gain[0], gain[1], gain[2]), offset=(0.0, 0.0, 0.0),
                        gain_clamped=tuple(exposure_hit or wb_hit[c] for c in range(3)),  # type: ignore[arg-type]
                        offset_clamped=(False, False, False), matched=True)
+
+
+def solve_skin_match(cam: ChannelStats, ref: ChannelStats) -> MatchResult:
+    """Today's gain from the skin means, plus contrast from the skin spreads.
+
+    The base gain (exposure plus white balance) is solve_match on the skin
+    statistics, so skin brightness and warmth agree as a whole-frame match
+    would. Contrast then scales each channel about its matched mean:
+    k = ref_std / matched_std, clamped to CONTRAST_MIN..CONTRAST_MAX, so
+    skin contrast agrees without moving the means. The final per-channel
+    transform is gain k * base with a lift holding the matched mean; the
+    gain clamps to GAIN_MIN..GAIN_MAX and the lift to ±OFFSET_MAX, and any
+    bound hit on the path marks its channel.
+    """
+    base = solve_match(cam, ref)
+    gains: list[float] = []
+    offsets: list[float] = []
+    gain_hit: list[bool] = []
+    offset_hit: list[bool] = []
+    for c in range(3):
+        matched_std = base.gain[c] * cam.std[c]
+        if matched_std <= 1e-6 or ref.std[c] <= 1e-6:
+            k, contrast_hit = 1.0, False
+        else:
+            raw = ref.std[c] / matched_std
+            k = min(max(raw, CONTRAST_MIN), CONTRAST_MAX)
+            contrast_hit = raw < CONTRAST_MIN or raw > CONTRAST_MAX
+        gain = base.gain[c] * k
+        if gain < GAIN_MIN:
+            gain, final_hit = GAIN_MIN, True
+        elif gain > GAIN_MAX:
+            gain, final_hit = GAIN_MAX, True
+        else:
+            final_hit = False
+        lift = base.gain[c] * cam.mean[c] * (1.0 - k)
+        if lift < -OFFSET_MAX:
+            lift, lift_hit = -OFFSET_MAX, True
+        elif lift > OFFSET_MAX:
+            lift, lift_hit = OFFSET_MAX, True
+        else:
+            lift_hit = False
+        gains.append(gain)
+        offsets.append(lift)
+        gain_hit.append(base.gain_clamped[c] or contrast_hit or final_hit)
+        offset_hit.append(lift_hit)
+    return MatchResult(gain=(gains[0], gains[1], gains[2]),
+                       offset=(offsets[0], offsets[1], offsets[2]),
+                       gain_clamped=(gain_hit[0], gain_hit[1], gain_hit[2]),
+                       offset_clamped=(offset_hit[0], offset_hit[1], offset_hit[2]),
+                       matched=True)
 
 
 def apply_stats(stats: ChannelStats, gain: tuple[float, float, float],
@@ -852,6 +987,7 @@ def _stats_json(stats: ChannelStats | None) -> dict | None:
 
 def _unmatched(is_reference: bool) -> dict:
     return {"matched": False, "is_reference": is_reference, "moments": [],
+            "region": None, "skin_moments": [],
             "gain": [1, 1, 1], "offset": [0, 0, 0],
             "gain_clamped": [False, False, False], "offset_clamped": [False, False, False],
             "before": None, "reference": None, "after": None,
@@ -927,6 +1063,7 @@ def run(*, sync_path: Path, out_path: Path, reference_label: str | None = None,
     final: dict[str, Cube | None] = {reference.label: base[reference.label]}
     matches: dict[str, dict] = {reference.label: _unmatched(True)}
     ref_warnings: dict[str, list[str]] = {c.label: [] for c in clips}
+    skin_cache: dict = {}
 
     def note(cam_label: str, warning: str) -> None:
         ref_warnings[cam_label].append(warning)
@@ -942,28 +1079,42 @@ def run(*, sync_path: Path, out_path: Path, reference_label: str | None = None,
             matches[cam.label] = _unmatched(False)
             continue
         moments = pairwise_moments(reference, cam)
-        ref_local = [t - (reference.offset_s or 0.0) for t in moments]
-        cam_local = [t - (cam.offset_s or 0.0) for t in moments]
-        ref_frames = _take_frames(reference, ref_local,
-                                  conversion_paths[reference.label], note)
-        cam_frames = _take_frames(cam, cam_local, conversion_paths[cam.label], note)
-        if not ref_frames or not cam_frames:
-            final[cam.label] = base[cam.label]
-            matches[cam.label] = _unmatched(False)
-            note(cam.label, f"no_shared_moment:{cam.label}")
-            continue
-        ref_stats = _average_stats(ref_frames)
-        cam_stats = _average_stats(cam_frames)
+        skin: tuple[ChannelStats, ChannelStats, list[float]] | None = None
+        if moments and cam.width > 0 and reference.width > 0:
+            skin = _take_skin_pair(reference, cam, moments, conversion_paths,
+                                   out_dir / "skin-frames", skin_cache, note)
+        if skin is not None:
+            ref_stats, cam_stats, used = skin
+            region: str | None = "skin"
+            solve = solve_skin_match
+        else:
+            ref_local = [t - (reference.offset_s or 0.0) for t in moments]
+            cam_local = [t - (cam.offset_s or 0.0) for t in moments]
+            ref_frames = _take_frames(reference, ref_local,
+                                      conversion_paths[reference.label], note)
+            cam_frames = _take_frames(cam, cam_local, conversion_paths[cam.label], note)
+            if not ref_frames or not cam_frames:
+                final[cam.label] = base[cam.label]
+                matches[cam.label] = _unmatched(False)
+                note(cam.label, f"no_shared_moment:{cam.label}")
+                continue
+            ref_stats = _average_stats(ref_frames)
+            cam_stats = _average_stats(cam_frames)
+            used = moments
+            region = "frame"
+            solve = solve_match
         if any(s <= 1e-6 for s in cam_stats.std + ref_stats.std):
             note(cam.label, f"degenerate_spread:{cam.label}")
-        solved = solve_match(cam_stats, ref_stats)
+        solved = solve(cam_stats, ref_stats)
         after = apply_stats(cam_stats, solved.gain, solved.offset)
         final[cam.label] = compose_gain_offset(
             base[cam.label] if kind != "none_rec709" else identity_cube(),
             solved.gain, solved.offset)
         matches[cam.label] = {
             "matched": True, "is_reference": False,
-            "moments": [round(t, 3) for t in moments],
+            "moments": [round(t, 3) for t in used],
+            "region": region,
+            "skin_moments": [round(t, 3) for t in used] if region == "skin" else [],
             "gain": _round6(solved.gain), "offset": _round6(solved.offset),
             "gain_clamped": list(solved.gain_clamped),
             "offset_clamped": list(solved.offset_clamped),
@@ -1052,4 +1203,111 @@ def _take_frames(clip: GradeClip, local: list[float], conversion_lut: Path | Non
         except GradeError:
             note(clip.label, f"sample_failed:{clip.label}:{t:.3f}")
     return out
+
+
+def _skin_helper_cached(skin_cache: dict):
+    """The built Vision helper, building once; None with a cached reason when not."""
+    if "helper" not in skin_cache:
+        try:
+            from .sync import build_lips_helper
+        except ImportError:
+            skin_cache["helper"] = None
+            skin_cache["helper_reason"] = "sync unavailable"
+        else:
+            try:
+                helper, reason = build_lips_helper()
+            except Exception:
+                helper, reason = None, "the Vision helper could not be built"
+            skin_cache["helper"] = helper
+            skin_cache["helper_reason"] = reason
+    return skin_cache["helper"]
+
+
+def _take_skin_pair(reference: GradeClip, cam: GradeClip, moments: list[float],
+                    conversion_paths: dict[str, Path | None], frames_dir: Path,
+                    skin_cache: dict, note):
+    """Paired skin stats at the moments with a face on both cameras.
+
+    Each side decodes a skin frame (raw plus helper JPEG) per moment; one
+    helper run reads the pair's JPEGs and the moments with a face box on
+    both sides average into (reference, camera, paired moments). None
+    when no moment pairs — the caller falls back to whole-frame matching.
+    Skin decode failures drop that side's moment silently; the
+    whole-frame path reports its own failures.
+    """
+    if not moments:
+        return None
+    helper = _skin_helper_cached(skin_cache)
+    if helper is None:
+        if not skin_cache.get("helper_warned"):
+            skin_cache["helper_warned"] = True
+            reason = skin_cache.get("helper_reason") or "unavailable"
+            note(cam.label, f"skin_helper_unavailable:{reason}")
+        return None
+    try:
+        from .sync import run_lips_helper
+    except ImportError:
+        return None
+    ref_off = reference.offset_s or 0.0
+    cam_off = cam.offset_s or 0.0
+    raw: dict[tuple[str, int], bytes] = {}
+    names: dict[str, tuple[str, int]] = {}
+    for i, t in enumerate(moments):
+        for side, clip, off in (("ref", reference, ref_off),
+                                ("cam", cam, cam_off)):
+            jpg = Path(frames_dir) / f"{cam.label}_{i:02d}_{side}.jpg"
+            try:
+                raw[(side, i)] = decode_skin_frame(
+                    clip, t - off, conversion_paths.get(clip.label), jpg)
+            except (GradeError, OSError):
+                continue
+            names[jpg.name] = (side, i)
+    if not names:
+        note(cam.label, f"no_face:{cam.label}")
+        return None
+    try:
+        found = run_lips_helper(helper, Path(frames_dir))
+    except Exception:
+        found = None
+    if found is None:
+        note(cam.label, f"no_face:{cam.label}")
+        return None
+    try:
+        ordered = sorted(p.name for p in Path(frames_dir).iterdir()
+                         if not p.name.startswith(".")
+                         and p.suffix.lower() in (".jpg", ".jpeg"))
+    except OSError:
+        note(cam.label, f"no_face:{cam.label}")
+        return None
+    by_index = {frame.index: frame for frame in found}
+    boxes: dict[tuple[str, int], tuple[float, float, float, float] | None] = {}
+    for pos, name in enumerate(ordered):
+        if name not in names:
+            continue
+        frame = by_index.get(pos)
+        boxes[names[name]] = frame.box if frame is not None else None
+    ref_stats: list[ChannelStats] = []
+    cam_stats: list[ChannelStats] = []
+    paired: list[float] = []
+    for i, t in enumerate(moments):
+        if ("ref", i) not in raw or ("cam", i) not in raw:
+            continue
+        ref_box = boxes.get(("ref", i))
+        cam_box = boxes.get(("cam", i))
+        if ref_box is None or cam_box is None:
+            continue
+        try:
+            ref_skin = skin_stats(raw[("ref", i)], SKIN_W, SKIN_H, ref_box)
+            cam_skin = skin_stats(raw[("cam", i)], SKIN_W, SKIN_H, cam_box)
+        except GradeError:
+            continue
+        if ref_skin is None or cam_skin is None:
+            continue
+        ref_stats.append(ref_skin)
+        cam_stats.append(cam_skin)
+        paired.append(t)
+    if not paired:
+        note(cam.label, f"no_face:{cam.label}")
+        return None
+    return (_average_stats(ref_stats), _average_stats(cam_stats), paired)
 

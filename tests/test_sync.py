@@ -1057,6 +1057,20 @@ class LipsParserTests(unittest.TestCase):
         self.assertEqual(sync.parse_lips_output(""), [])
         self.assertEqual(sync.parse_lips_output("NOFACE\n"), [])
 
+    def test_parse_helper_output_with_pose(self) -> None:
+        text = ("0 0.023400 0.3100,0.2500,0.1800,0.3200 6.20,-3.10,1.50\n"
+                "1 NA 0.3000,0.2400,0.1900,0.3300 NA,NA,NA\n"
+                "2 0.010000 0.3100,0.2500,0.1800,0.3200\n"
+                "3 0.010000 0.3100,0.2500,0.1800,0.3200 bogus\n")
+        frames = sync.parse_lips_output(text)
+        self.assertEqual(frames, [
+            LipsFrame(0, 0.0234, (0.31, 0.25, 0.18, 0.32), 6.2, -3.1, 1.5),
+            LipsFrame(1, None, (0.3, 0.24, 0.19, 0.33), None, None, None),
+            LipsFrame(2, 0.01, (0.31, 0.25, 0.18, 0.32), None, None, None),
+            # a bad pose keeps the frame with an unknown pose
+            LipsFrame(3, 0.01, (0.31, 0.25, 0.18, 0.32), None, None, None),
+        ])
+
     def test_median_box(self) -> None:
         frames = [LipsFrame(0, 0.1, (0.3, 0.2, 0.2, 0.3)),
                   LipsFrame(1, None, None),

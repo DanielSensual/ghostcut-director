@@ -534,3 +534,53 @@ Live test: TBD (the owner fills this from the real-footage run).
 - By hand: `director demo --out-dir /tmp/director-demo-check` reports PASS (offsets +1.000/+4.000
   exact by waveform, the silent camera clearly unplaced, 6.2 s removed, all nine stages done,
   finish at −14.0 LUFS). Frames checked per camera: labels render, pictures differ.
+
+# Build log: gaze angle choice + skin match (`look`) (2026-11-03)
+
+| Step | By | What |
+|---|---|---|
+| Brief | Project owner, with Claude Code | `LOOK-BRIEF.md`: cut to the camera the speaker looks at, match skin not walls. Written after the owner watched the final take's cut (v2). |
+| Build | Meta **Muse Code** on **`muse-spark-1.3`** | The lips helper pose output, `src/director/gaze.py`, the `angles` gaze rule, prompt numbers and `angles.json` evidence, the `grade` face-region match (`solve_skin_match`, `skin_stats`, whole-frame fallback), `tests/test_gaze.py` (21 tests), new `test_grade.py`/`test_sync.py` tests. Built straight from the brief (no separate design). |
+| Code review and live test | Claude Code, piloted by the owner | Real footage, below. |
+
+Muse Code token use: TBD (the owner fills this from the run log).
+Live test: TBD (the owner fills this from the real-footage run).
+
+## Build notes (Muse Code)
+
+- The helper prints Vision yaw/pitch/roll in degrees after the face box
+  (`<index> <opening> <box> <yaw>,<pitch>,<roll>`, each `NA` when
+  unreported); `LipsFrame` carries the pose and the parser keeps old-format
+  lines working, dropping only the pose (never the frame) when the pose
+  token is malformed.
+- `gaze.py` samples 3 frames per line per covering camera through the
+  camera's LUT (one helper run per job) and calls a frame addressed at
+  |yaw| ≤ 18°. Exactly one majority-addressed camera wins the line
+  (`speaker addresses camera B: |yaw| 6° vs 41° on C`); anything else
+  leaves the line to Spark with the numbers in its prompt
+  (`[gaze: B |yaw| 6° (3/3 frontal); …]`). Gaze overrides run after picks
+  (Muse or rule) and before editor overrides and the checks, so coverage,
+  merging and cut points still decide; each `angles.json` line carries its
+  gaze evidence (`null` when the helper is unavailable, e.g. Linux).
+- `grade` measures skin inside the central 60% of the Vision box at the
+  shared moments (paired: both cameras need a face) through the conversion
+  cubes, and solves gain as before plus contrast about the matched mean
+  (k = ref_std / matched_std clamped to 0.8–1.25, lift holding the mean,
+  final gain to 0.7–1.4, lift to ±0.10). No paired face falls back to the
+  whole-frame match with a `no_face:<label>` warning (`region: frame` vs
+  `skin` in `grade.json`); a missing helper warns once per run.
+- Full suite: 689 tests, green except the same 11 pre-existing `ps`-sandbox
+  errors in `tests/test_engine_render.py` and `tests/test_render_runner.py`.
+- By hand on the owner's final-take cards (lav + front Sony + 45° drone,
+  read in place, all output under `/tmp/muse-look-test`, never `job/` or
+  `cards/`): `grade --reference C` with the DJI cube falls back cleanly
+  and reproduces the owner's gains exactly (1.111/1.252/1.071); `angles
+  --no-muse --tighten` samples all 30 lines (177 frames, one helper run)
+  and records no-face evidence without changing a pick. Vision itself was
+  sandbox-blocked here (ANE model fails to load, so no numeric yaw); the
+  18° threshold follows the brief's 15–20° range and the viewed geometry
+  (addressed ≈ frontal, other ≈ 40° turn). A hand-boxed 4-moment skin
+  probe through the real pipeline closes exactly (remeasured after-stats
+  match predicted to 0.001) and confirms the premise: frontal skin
+  already agrees (B 0.34 vs C 0.28) while the whole-frame gains overshoot
+  it to 0.38 (+0.10 on blue).

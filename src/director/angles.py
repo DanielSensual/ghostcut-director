@@ -3,10 +3,13 @@
 Words from the audio clip are split into lines (sentence breaks, pauses over
 0.6 s, 8 s cap at the longest pause). Each line is covered by the cameras
 whose clip spans the whole line; one frame per line x covering camera goes to
-Muse Spark, which picks the angle. Mechanical checks overrule Muse when its
-camera does not cover the line, merge same-camera lines, merge short shots,
-and pin cuts to inter-word gaps. Without guestlist (--no-muse) a deterministic
-rule opens on the reference camera and alternates.
+Muse Spark, which picks the angle. When exactly one camera sees the speaker
+addressing it for most of the line (near-frontal Vision yaw on sampled
+frames), a mechanical gaze rule picks it that Spark cannot overrule, and
+ambiguous lines carry the gaze numbers in Spark's prompt. Mechanical checks
+overrule Muse when its camera does not cover the line, merge same-camera
+lines, merge short shots, and pin cuts to inter-word gaps. Without guestlist
+(--no-muse) a deterministic rule opens on the reference camera and alternates.
 """
 from __future__ import annotations
 
@@ -18,6 +21,7 @@ from pathlib import Path
 from ghostcut.config import read_json, write_json
 from ghostcut.ffmpeg_tools import ToolingError, run_command, snap_frame_rate
 from . import cutlist
+from . import gaze as gaze_mod
 from .grade import GradeError, GradeShotInfo, SourceColour, lut_filter_chain
 
 PAUSE_S = 0.6
@@ -40,9 +44,11 @@ DEVELOPER = (
     "(who is framed, gaze, gesture, obstructions). Prefer the camera where the current "
     "speaker is clearly framed and looking toward lens; avoid frames where the speaker is "
     "turned away, blocked, mid-blink as the only flaw-free alternative exists, or where the "
-    "framing cuts off the subject. You may only choose among the camera letters listed for "
-    "that line. Return one entry for every line id given, in order. Never invent a camera, "
-    "a person, or an action you cannot see."
+    "framing cuts off the subject. Lines may carry measured gaze numbers per camera (median "
+    "|yaw| with the share of sampled frames facing that camera); a low |yaw| means the "
+    "speaker is addressing that camera — weigh it strongly. You may only choose among the "
+    "camera letters listed for that line. Return one entry for every line id given, in order. "
+    "Never invent a camera, a person, or an action you cannot see."
 )
 
 
@@ -355,17 +361,23 @@ def batch_schema(batch: list[Line], coverage: dict[int, list[str]]) -> dict:
     }
 
 
-def batch_prompt(batch: list[Line], coverage: dict[int, list[str]]) -> str:
+def batch_prompt(batch: list[Line], coverage: dict[int, list[str]],
+                 line_gaze: dict[int, gaze_mod.LineGaze] | None = None) -> str:
     out = ["Pick the angle for each line. Reply with one entry per line, in order."]
     for line in batch:
         letters = ", ".join(coverage[line.id])
-        out.append(f'L{line.id} ({line.end_s - line.start_s:.1f}s) cameras {letters}: "{line.text}"')
+        text = f'L{line.id} ({line.end_s - line.start_s:.1f}s) cameras {letters}: "{line.text}"'
+        if line_gaze is not None and line.id in line_gaze:
+            text += f" [gaze: {gaze_mod.format_gaze_note(line_gaze[line.id])}]"
+        out.append(text)
     return "\n".join(out)
 
 
 def pick_with_muse(lines: list[Line], clips: list[SyncClip],
                    frames: dict[tuple[int, str], Path], *,
-                   model: str, frames_dir: Path) -> tuple[list[Pick], float, list[str]]:
+                   model: str, frames_dir: Path,
+                   line_gaze: dict[int, gaze_mod.LineGaze] | None = None
+                   ) -> tuple[list[Pick], float, list[str]]:
     """Batched spark.image_json calls; per-batch failure falls back to the rule."""
     try:
         from guestlist.meta import cache, spark
@@ -387,7 +399,7 @@ def pick_with_muse(lines: list[Line], clips: list[SyncClip],
         images = [frames[k] for k in shown]
         schema = batch_schema(batch, coverage)
         # the images carry no labels of their own, so say which is which
-        prompt = batch_prompt(batch, coverage) + "\nImages, in order: " + ", ".join(
+        prompt = batch_prompt(batch, coverage, line_gaze) + "\nImages, in order: " + ", ".join(
             f"{n} = L{lid} camera {label}" for n, (lid, label) in enumerate(shown, 1))
         try:
             cache.guard(0.25)
@@ -478,6 +490,30 @@ def rule_picks(lines: list[Line], clips: list[SyncClip],
             cur, run_start, run_end = chosen, line.start_s, line.end_s
             cur = chosen
     return picks
+
+
+def apply_gaze_overrides(picks: list[Pick],
+                         line_gaze: dict[int, gaze_mod.LineGaze]) -> None:
+    """Addressed-camera picks from gaze: a mechanical rule Muse cannot overrule.
+
+    Runs after picks (Muse or rule) and before editor overrides and the
+    checks, which still decide coverage, merging and cut points. A gaze
+    pick keeps the pick's shot size and records its reason; overriding a
+    different pick is noted.
+    """
+    by_id = {p.line_id: p for p in picks}
+    for line_id, gaze in line_gaze.items():
+        if gaze.pick is None:
+            continue
+        pick = by_id.get(line_id)
+        if pick is None:
+            continue
+        if pick.camera != gaze.pick:
+            pick.overruled.append(
+                f"gaze_overrule:{pick.camera or 'none'}->{gaze.pick}")
+        pick.camera = gaze.pick
+        pick.method = "gaze"
+        pick.reason = gaze.reason
 
 
 # ---------------------------------------------------------------- checks (Muse is advisory; these decide)
@@ -1084,6 +1120,11 @@ def run(*, sync_path: Path, words_path: Path, out_path: Path, audio_label: str |
         lines = _tightened_lines(tighten, words)
     for line in lines:
         line.cameras = [c.label for c in covering(clips, line)]
+    line_gaze: dict[int, gaze_mod.LineGaze] = {}
+    if lines and any(line.cameras for line in lines):
+        luts = {label: info.lut for label, info in grade.items()} if grade else {}
+        line_gaze = gaze_mod.sample_line_gaze(
+            lines, by_label, luts, out_path.parent / "gaze-frames")
     warnings: list[str] = []
     frames_dir = out_path.parent / "angle-frames"
     reference_label = next((c.label for c in clips if c.path == reference), "A")
@@ -1096,6 +1137,8 @@ def run(*, sync_path: Path, words_path: Path, out_path: Path, audio_label: str |
     elif no_muse:
         picks = rule_picks(lines, clips, reference_label, min_shot_s)
         spend, method = 0.0, "rule"
+        if line_gaze:
+            apply_gaze_overrides(picks, line_gaze)
         if tighten is not None:
             _apply_angle_overrides(tighten, lines, picks)
         shots = apply_checks(picks, lines, clips, min_shot_s=min_shot_s)
@@ -1106,15 +1149,20 @@ def run(*, sync_path: Path, words_path: Path, out_path: Path, audio_label: str |
             warnings.append(f"muse unavailable: {error}")
             picks = rule_picks(lines, clips, reference_label, min_shot_s)
             spend, method = 0.0, "rule"
+            if line_gaze:
+                apply_gaze_overrides(picks, line_gaze)
             if tighten is not None:
                 _apply_angle_overrides(tighten, lines, picks)
             shots = apply_checks(picks, lines, clips, min_shot_s=min_shot_s)
         else:
             frames = grab_frames(lines, clips, frames_dir)
-            picks, spend, muse_warnings = pick_with_muse(lines, clips, frames,
-                                                         model=model, frames_dir=frames_dir)
+            picks, spend, muse_warnings = pick_with_muse(
+                lines, clips, frames, model=model, frames_dir=frames_dir,
+                line_gaze=line_gaze or None)
             warnings.extend(muse_warnings)
             method = "muse" if any(p.method == "muse" for p in picks) else "rule"
+            if line_gaze:
+                apply_gaze_overrides(picks, line_gaze)
             if tighten is not None:
                 _apply_angle_overrides(tighten, lines, picks)
             shots = apply_checks(picks, lines, clips, min_shot_s=min_shot_s)
@@ -1168,7 +1216,9 @@ def run(*, sync_path: Path, words_path: Path, out_path: Path, audio_label: str |
         "spend_usd": round(spend, 3),
         "warnings": warnings,
         "lines": [{"id": l.id, "start_s": round(l.start_s, 3), "end_s": round(l.end_s, 3),
-                   "text": l.text, "cameras": list(l.cameras)} for l in lines],
+                   "text": l.text, "cameras": list(l.cameras),
+                   "gaze": (gaze_mod.line_gaze_json(line_gaze[l.id])
+                            if l.id in line_gaze else None)} for l in lines],
         "shots": [shot_json(s) for s in shots],
     }
     if tighten is not None:

@@ -27,7 +27,7 @@ def command_grade(args: argparse.Namespace) -> dict:
         if match.get("matched"):
             gains = ",".join(str(value) for value in match["gain"])
             offsets = ",".join(str(value) for value in match["offset"])
-            line += f" gain {gains} offset {offsets}"
+            line += f" gain {gains} offset {offsets} on {match.get('region', 'frame')}"
             if any(match["gain_clamped"]) or any(match["offset_clamped"]):
                 line += " clamped"
         print(line)

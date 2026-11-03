@@ -190,6 +190,9 @@ class LipsFrame:
     index: int
     opening: float | None
     box: tuple[float, float, float, float] | None
+    yaw: float | None = None  # Vision face yaw in degrees (the gaze rule)
+    pitch: float | None = None  # Vision face pitch in degrees
+    roll: float | None = None  # Vision face roll in degrees
 
 
 @dataclass(slots=True)
@@ -1173,7 +1176,12 @@ def flash_estimate(target: ClipResult, anchor: ClipResult, flash_cache: dict, *,
 # ---------------------------------------------------------------- lips
 
 def parse_lips_output(text: str) -> list[LipsFrame]:
-    """Helper stdout to per-frame openings and face boxes. Pure; skips bad lines."""
+    """Helper stdout to per-frame openings, face boxes and pose. Pure; skips bad lines.
+
+    The pose token (`yaw,pitch,roll` in degrees, each `NA` when Vision did
+    not report it) is auxiliary: an unparseable one keeps the frame with an
+    unknown pose rather than dropping the opening and box with it.
+    """
     frames: list[LipsFrame] = []
     for raw in (text or "").splitlines():
         parts = raw.split()
@@ -1197,9 +1205,28 @@ def parse_lips_output(text: str) -> list[LipsFrame]:
             except ValueError:
                 continue
             box = (x, y, w, h)
-        frames.append(LipsFrame(index, opening, box))
+        yaw = pitch = roll = None
+        if len(parts) >= 4:
+            yaw, pitch, roll = _parse_pose(parts[3])
+        frames.append(LipsFrame(index, opening, box, yaw, pitch, roll))
     frames.sort(key=lambda f: f.index)
     return frames
+
+
+def _parse_pose(token: str) -> tuple[float | None, float | None, float | None]:
+    """A `yaw,pitch,roll` token to degrees; anything unparseable is unknown. Pure."""
+    pose: list[float | None] = []
+    for item in token.split(","):
+        if item.strip().upper() == "NA":
+            pose.append(None)
+        else:
+            try:
+                pose.append(float(item))
+            except ValueError:
+                return (None, None, None)
+    if len(pose) != 3:
+        return (None, None, None)
+    return (pose[0], pose[1], pose[2])
 
 
 def median_box(frames: list[LipsFrame]) -> tuple[float, float, float, float] | None:
