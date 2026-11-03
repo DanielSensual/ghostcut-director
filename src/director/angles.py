@@ -268,8 +268,13 @@ def load_grade(path: Path) -> dict[str, GradeShotInfo]:
 
 
 def covers(clip: SyncClip, line: Line) -> bool:
-    """The clip spans the whole line; unplaced clips never cover."""
+    """The clip spans the whole line with picture.
+
+    Unplaced clips never cover, and neither do audio-only ones (a lav
+    recorder spans every line but has no angle to cut to).
+    """
     return (clip.offset_s is not None
+            and clip.width > 0
             and clip.offset_s <= line.start_s + 1e-9
             and line.end_s <= clip.offset_s + clip.duration_s + 1e-9)
 
@@ -879,7 +884,7 @@ def audio_part_command(audio_path: str, audio_in_s: float,
             "-af", (f"afade=t=in:st=0:d={CROSSFADE_S},"
                     f"afade=t=out:st={fade_out_start:.6f}:d={CROSSFADE_S},"
                     f"aresample={AUDIO_SR}"),
-            "-c:a", "pcm_s16le", "-ac", "1", str(out)]
+            "-c:a", "pcm_s16le", str(out)]
 
 
 def _snapped_span_audio(shots: list[Shot], kept_spans: list[dict],

@@ -856,6 +856,25 @@ def command_voice(args: argparse.Namespace) -> dict:
     return payload
 
 
+def command_demo(args: argparse.Namespace) -> dict:
+    from .demo import run as run_demo
+
+    require_ffmpeg_binaries()
+    payload = run_demo(
+        out_dir=Path(args.out_dir),
+        muse_requested=bool(args.muse),
+        keep=bool(args.keep),
+    )
+    print(payload["report"])
+    failed = [check for check in payload.get("offsets", [])
+              if not check.get("passed")]
+    if not payload.get("passed"):
+        raise RuntimeError(f"demo: {len(failed)} offset check(s) failed "
+                           f"or the cut is incomplete "
+                           f"({args.out_dir}/demo.json)")
+    return payload
+
+
 def build_parser() -> argparse.ArgumentParser:
     from .sync import WHISPER_MODEL
 
@@ -1111,6 +1130,15 @@ def build_parser() -> argparse.ArgumentParser:
     captions_parser.add_argument("--no-muse", action="store_true",
                                  help="No title proposal (captions still burn)")
     captions_parser.set_defaults(func=command_captions)
+    demo_parser = sub.add_parser("demo", help="Try it in one command, no footage needed")
+    demo_parser.add_argument("--out-dir", default="director-demo",
+                             help="Demo directory; the shoot goes in shoot/, the job in job/")
+    demo_parser.add_argument("--muse", action="store_true",
+                             help="Use Muse models and SAM when MODEL_API_KEY is set "
+                             "(else offline, like the default)")
+    demo_parser.add_argument("--keep", action="store_true",
+                             help="Reuse the shoot media already in the output folder")
+    demo_parser.set_defaults(func=command_demo)
 
     return parser
 

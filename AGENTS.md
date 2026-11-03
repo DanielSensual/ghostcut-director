@@ -33,6 +33,7 @@ skips is normal.
   - `reframe.py`: finished 16:9 cut → shot cuts (angles.json or scene detection) → SAM 3.1 person tracks
     (guestlist, optional) → smoothed per-shot crop path → 9:16 `reframe.json` + optional render.
   - `cut.py`: one command from files or a folder to the whole job (`sync` → words → `grade` → `angles` → timeline export → `reframe` → whole-cut QC) in one output directory, resumable via `cut.json` fingerprints. The words stage enriches with Voice Transcribe when available.
+- `demo.py`: `director demo` — a tiny synthetic shoot (lav + three cameras, `say`/espeak/tone voice) through the real `cut` pipeline with known-answer checks and a friendly report.
 - `transcribe.py`: the production-audio clip → Voice Transcribe turns (16 kHz WAV, silence chunks, speakers reconciled) aligned onto Whisper word times → enriched `words.json` + `transcript.json` (`director transcribe`, the words stage of `director cut`).
 - `captions.py`: heard words on the output timeline → short karaoke lines → `captions.srt` + house-style `captions.ass` (burned into `vertical.mp4`, `*.clean.mp4` kept) and a serif title PNG for the first 3.5 s, explicit or one checked Muse Spark proposal (`director captions`, the `captions` stage of `director cut`).
 - `voice.py`: a spoken note → Meta transcription (local Whisper fallback) → notes anchored by playhead, spoken timecode or quoted words → Muse Spark resolves each to checked `cutlist` operations → `voice.json`, applied with `--apply` (`director voice`, the app's mic and memo drop).

@@ -844,6 +844,8 @@ class AnglesIntegrationTests(unittest.TestCase):
                           str(raised.exception))
 
     def test_audio_part_command(self) -> None:
+        # Parts stay PCM: per-span AAC would stack ~21 ms of encoder
+        # priming at every join; the final join encodes AAC once.
         self.assertEqual(
             angles_mod.audio_part_command("/a.wav", 12.5, 3.0,
                                           Path("/o.wav")),
@@ -852,9 +854,9 @@ class AnglesIntegrationTests(unittest.TestCase):
              "-i", "/a.wav", "-map", "0:a:0",
              "-af", ("afade=t=in:st=0:d=0.008,"
                      "afade=t=out:st=2.992000:d=0.008,aresample=48000"),
-             "-c:a", "pcm_s16le", "-ac", "1", "/o.wav"])
+             "-c:a", "pcm_s16le", "/o.wav"])
         short = angles_mod.audio_part_command("/a.wav", 0.0, 0.005,
-                                              Path("/o.m4a"))
+                                              Path("/o.wav"))
         self.assertIn("afade=t=out:st=0.000000:d=0.008", " ".join(short))
 
 
@@ -920,6 +922,17 @@ class SyntheticRenderTests(unittest.TestCase):
             self.assertIn("audio", durations)
             self.assertLess(abs(durations["video"] - durations["audio"]),
                             0.05)
+            # The decoded audio is the kept spans' sound, not the kept
+            # spans plus one AAC priming per part: per-span AAC parts
+            # inflated the decode past finish's mux check.
+            decoded = subprocess.run(
+                ["ffmpeg", "-v", "error", "-i", str(tmp_path / "cut.mp4"),
+                 "-map", "0:a:0", "-ac", "1", "-ar", "48000",
+                 "-f", "s16le", "-"],
+                capture_output=True)
+            self.assertEqual(decoded.returncode, 0)
+            decoded_s = len(decoded.stdout) / 2 / 48000
+            self.assertLess(abs(decoded_s - kept_s), 0.05)
             removed_mid = (2.0 + 2.4) / 2
             self.assertIsNone(
                 cutlist.source_to_output(tighten, removed_mid))
