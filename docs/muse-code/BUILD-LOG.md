@@ -108,6 +108,12 @@ Three real recording pairs with known answers, plus one synthetic pair:
 - The guided re-search compared its FFT-approximate r against the global one: it now reports the same exact Pearson, so the "guided r ≥ global r − 0.02" comparison is like with like.
 - `measure_drift` searched each pre-aligned 20 s window around the absolute offset instead of the residual 0, so at a large offset (+178.75 s) every window missed and drift came back null: it now searches around 0, adds the residual back to the coarse offset per window, and reports the fitted intercept (the offset at the clip's first frame).
 
+## Flash method (Muse Code on `muse-spark-1.3`)
+
+Built by Muse Code on `muse-spark-1.3` from `docs/muse-code/FLASH-BRIEF.md`: the fifth sync method, `flash`, for cameras with no audio. Mean luma per frame over the first 120 s from a tiny grey ffmpeg proxy with real per-frame timestamps, robust-z light-switch edges (signed), same-sign same-gap sequence matching with the clock estimate preferred, one-frame-of-the-slower-clip precision, resolution after Whisper and before timecode, and plain-English warnings. Touched `src/director/sync.py`, `tests/test_sync.py`, this section and one README line.
+
+Muse Code token use: TBD (the owner fills this from the run log).
+
 # Build log: `director reframe` (2026-11-02)
 
 Who did what, so the credit is exact.

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import io
 import json
+import shutil
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -13,6 +15,7 @@ from director.sync import (
     CameraInfo,
     ClipResult,
     Estimate,
+    FlashEdge,
     SonySidecar,
     TranscriptWord,
     build_payload,
@@ -645,6 +648,205 @@ class SelectionTests(unittest.TestCase):
                          ["Could not be placed on the timeline."])
 
 
+class FlashEdgeTests(unittest.TestCase):
+    def _luma_drop(self, fps: float = 30.0, n_pre: int = 60,
+                   n_dark: int = 30, n_post: int = 60,
+                   bright: float = 150.0, dark: float = 30.0
+                   ) -> tuple[list[float], list[float]]:
+        n = n_pre + n_dark + n_post
+        times = [i / fps for i in range(n)]
+        luma = ([bright] * n_pre + [dark] * n_dark + [bright] * n_post)
+        return times, luma
+
+    def test_find_flash_edges_down_then_up(self) -> None:
+        times, luma = self._luma_drop()
+        edges = sync.find_flash_edges(times, luma)
+        self.assertEqual(len(edges), 2)
+        self.assertEqual([e.sign for e in edges], [-1, 1])
+        self.assertAlmostEqual(edges[0].time_s, 60 / 30, places=6)
+        self.assertAlmostEqual(edges[1].time_s, 90 / 30, places=6)
+        self.assertAlmostEqual(edges[0].magnitude, 120.0)
+        self.assertAlmostEqual(edges[1].magnitude, 120.0)
+
+    def test_find_flash_edges_ignores_noise(self) -> None:
+        times = [i / 30.0 for i in range(300)]
+        luma = [100.0 + (1.0 if i % 2 else -1.0) for i in range(300)]
+        self.assertEqual(sync.find_flash_edges(times, luma), [])
+        self.assertEqual(sync.find_flash_edges([], []), [])
+        self.assertEqual(sync.find_flash_edges([0.0], [100.0]), [])
+
+    def test_find_flash_edges_merges_close_steps(self) -> None:
+        times = [i / 30.0 for i in range(90)]
+        luma = [150.0] * 30 + [100.0, 30.0] + [30.0] * 28 + [150.0] * 30
+        edges = sync.find_flash_edges(times, luma)
+        self.assertEqual(len(edges), 2)
+        self.assertEqual(edges[0].sign, -1)
+        self.assertAlmostEqual(edges[0].time_s, 30 / 30, places=6)
+        self.assertAlmostEqual(edges[0].magnitude, 120.0)
+
+    def test_flash_confidence_and_precision(self) -> None:
+        self.assertAlmostEqual(sync.flash_confidence(1), 0.35)
+        self.assertAlmostEqual(sync.flash_confidence(2), 0.75)
+        self.assertGreater(sync.flash_confidence(3), sync.flash_confidence(2))
+        self.assertGreaterEqual(sync.flash_confidence(5), 0.9)
+        target = _clip("B", None, fps=30.0)
+        anchor = _clip("A", 0.0, fps=60.0)
+        self.assertAlmostEqual(sync.flash_precision_s(target, anchor), 1 / 30)
+        slow = _clip("C", None, fps=24.0)
+        self.assertAlmostEqual(sync.flash_precision_s(slow, anchor), 1 / 24)
+
+
+class FlashMatchTests(unittest.TestCase):
+    def test_match_two_edges_median_offset(self) -> None:
+        target = [FlashEdge(5.0, -1, 100.0), FlashEdge(6.0, 1, 100.0)]
+        anchor = [FlashEdge(10.0, -1, 90.0), FlashEdge(11.0, 1, 90.0)]
+        matched = sync.match_flash_edges(target, anchor, 1 / 30 + 0.05)
+        assert matched is not None
+        median, pairs = matched
+        self.assertAlmostEqual(median, 5.0)
+        self.assertEqual(pairs, [(0, 0), (1, 1)])
+
+    def test_match_rejects_wrong_signs_and_gaps(self) -> None:
+        target = [FlashEdge(5.0, -1, 100.0), FlashEdge(6.0, 1, 100.0)]
+        opposite = [FlashEdge(10.0, 1, 90.0)]
+        lone_down = [FlashEdge(5.0, -1, 100.0)]
+        self.assertIsNone(sync.match_flash_edges(lone_down, opposite, 0.08))
+        stretched = [FlashEdge(10.0, -1, 90.0), FlashEdge(12.0, 1, 90.0)]
+        matched = sync.match_flash_edges(target, stretched, 0.08)
+        assert matched is not None
+        self.assertEqual(len(matched[1]), 1)
+        self.assertIsNone(sync.match_flash_edges([], opposite, 0.08))
+        self.assertIsNone(sync.match_flash_edges(target, [], 0.08))
+
+    def test_match_prefers_clock_consistent_single_edge(self) -> None:
+        target = [FlashEdge(5.0, -1, 100.0)]
+        anchor = [FlashEdge(10.0, -1, 90.0), FlashEdge(60.0, -1, 90.0)]
+        plain = sync.match_flash_edges(target, anchor, 0.08)
+        assert plain is not None
+        self.assertAlmostEqual(plain[0], 5.0)
+        guided = sync.match_flash_edges(target, anchor, 0.08, clock_relative_s=55.0)
+        assert guided is not None
+        self.assertAlmostEqual(guided[0], 55.0)
+        self.assertEqual(guided[1], [(0, 1)])
+
+
+class FlashResolutionTests(unittest.TestCase):
+    def _target(self) -> ClipResult:
+        return _clip("B", None, duration=60.0)
+
+    def test_audio_wins_over_flash_flash_beats_timecode_clock(self) -> None:
+        wave = _estimate("waveform", 6.0, "A", 0.9, 0.002,
+                         r=0.9, second_r=0.5, margin=0.4, clear=True)
+        flash = _estimate("flash", 6.0, "A", 0.75, 1 / 30, matched_edges=2)
+        checks = sync.build_checks([wave, flash], 1 / 30)
+        self.assertEqual(sync.choose_pick([wave, flash], checks), (6.0, "waveform"))
+        said = _estimate("whisper", 6.5, "A", 2 / 3, 0.15, moments=2,
+                         votes=2, cluster_votes=2)
+        flash_far = _estimate("flash", 6.0, "A", 0.75, 1 / 30, matched_edges=2)
+        checks = sync.build_checks([said, flash_far], 1 / 30)
+        self.assertEqual(sync.choose_pick([said, flash_far], checks),
+                         (6.5, "whisper"))
+        stamped = _estimate("timecode", 7.25, "A", 0.5, 0.0)
+        checks = sync.build_checks([flash_far, stamped], 1 / 30)
+        self.assertEqual(sync.choose_pick([flash_far, stamped], checks),
+                         (6.0, "flash"))
+        tick = _estimate("clock", 6.2, "A", 0.2, 2.0)
+        checks = sync.build_checks([flash_far, tick], 1 / 30)
+        self.assertEqual(sync.choose_pick([flash_far, tick], checks),
+                         (6.0, "flash"))
+
+    def test_shaky_waveform_backed_by_flash(self) -> None:
+        shaky = _estimate("waveform", 6.0, "A", 0.5, 0.002,
+                          r=0.5, second_r=0.48, margin=0.02, clear=False)
+        flash = _estimate("flash", 6.01, "A", 0.75, 1 / 30, matched_edges=2)
+        checks = sync.build_checks([shaky, flash], 1 / 30)
+        self.assertTrue(checks[0].agree)
+        self.assertEqual(sync.choose_pick([shaky, flash], checks),
+                         (6.0, "waveform"))
+
+    def test_flash_disagreement_and_single_edge_warnings(self) -> None:
+        target = self._target()
+        wave = _estimate("waveform", 6.0, "A", 0.9, 0.002,
+                         r=0.9, second_r=0.5, margin=0.4, clear=True)
+        flash_far = _estimate("flash", 6.5, "A", 0.75, 1 / 30, matched_edges=2)
+        checks = sync.build_checks([wave, flash_far], 1 / 30)
+        warnings = sync.attempt_warnings(target, [wave, flash_far], checks,
+                                         "waveform", 6.0)
+        self.assertIn("Flash disagrees with the chosen offset by 0.500 s.",
+                      warnings)
+        lone = _estimate("flash", 6.0, "A", 0.35, 1 / 30, matched_edges=1)
+        checks = sync.build_checks([lone], 1 / 30)
+        warnings = sync.attempt_warnings(target, [lone], checks, "flash", 6.0)
+        self.assertIn("Placed by a single light flash: check by eye.", warnings)
+
+    def test_no_audio_no_flash_clock_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name in ("A.mp4", "B.mp4"):
+                (root / name).write_bytes(b"")
+            probes = {
+                str(root / "A.mp4"): _probe_dict(60.0, audio=False),
+                str(root / "B.mp4"): _probe_dict(60.0, audio=False),
+            }
+            with mock.patch("director.sync.probe_clip",
+                             side_effect=lambda p: probes[str(p)]), \
+                    mock.patch("director.sync.decode_flash_luma",
+                               side_effect=lambda p, window_s=120.0: None):
+                cams = [sync.camera_from_probe("", str(root / n),
+                                               probes[str(root / n)],
+                                               SonySidecar())
+                        for n in ("A.mp4", "B.mp4")]
+                cams[0].captured_at = "2026-11-02T14:03:11+00:00"
+                cams[1].captured_at = "2026-11-02T14:03:16+00:00"
+                ref = ClipResult("A", cams[0], 0.0, "reference")
+                tgt = ClipResult("B", cams[1], None, None)
+                ests = sync._attempt_estimates(tgt, ref, ["clock", "flash"],
+                                               {}, {}, None, root, {})
+                self.assertEqual([e.method for e in ests], ["clock"])
+                checks = sync.build_checks(ests, 1 / 30)
+                offset, method = sync.choose_pick(ests, checks)
+                self.assertEqual((offset, method), (5.0, "clock"))
+
+
+@unittest.skipUnless(HAS_NUMPY and shutil.which("ffmpeg"), "flash sync needs numpy and ffmpeg")
+class FlashFfmpegTests(unittest.TestCase):
+    def _make_clip(self, path: Path, drop: tuple[float, float],
+                   with_audio: bool) -> None:
+        start, end = drop
+        video = (f"color=c=white:s=128x128:r=30:d=10,"
+                 f"eq=brightness=-0.6:enable='between(t,{start},{end})'")
+        cmd = ["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", video]
+        if with_audio:
+            cmd += ["-f", "lavfi", "-i",
+                    "sine=frequency=440:sample_rate=44100:duration=10",
+                    "-map", "0:v:0", "-map", "1:a:0", "-shortest"]
+        else:
+            cmd += ["-map", "0:v:0", "-an"]
+        cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", str(path)]
+        subprocess.run(cmd, capture_output=True, timeout=120, check=True)
+
+    def test_flash_places_silent_clip_within_a_frame(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            anchor_path = root / "A.mp4"
+            target_path = root / "B.mp4"
+            self._make_clip(anchor_path, (2.0, 3.0), with_audio=True)
+            self._make_clip(target_path, (5.0, 6.0), with_audio=False)
+            payload = sync.run(
+                clip_paths=[anchor_path, target_path],
+                reference_path=anchor_path, methods=["flash"],
+                transcripts_dir=None, out_path=root / "sync.json")
+            by_label = {c["label"]: c for c in payload["clips"]}
+            placed = by_label["B"]
+            self.assertEqual(placed["method"], "flash")
+            self.assertAlmostEqual(placed["offset_s"], -3.0, delta=1 / 30 + 0.005)
+            flash = next(e for e in placed["estimates"] if e["method"] == "flash")
+            self.assertEqual(flash["against"], "A")
+            self.assertEqual(flash["detail"]["matched_edges"], 2)
+            self.assertAlmostEqual(flash["precision_s"], 1 / 30, places=3)
+
+
 @unittest.skipUnless(HAS_NUMPY, "waveform sync needs numpy")
 class NonReferenceAnchorTests(unittest.TestCase):
     def _content(self):
@@ -756,9 +958,14 @@ class PayloadTests(unittest.TestCase):
             self.assertEqual(gammas, {"A": "s-log3-cine", "B": "hlg", "C": ""})
 
     def test_parse_methods(self) -> None:
-        self.assertEqual(parse_methods(None), ["timecode", "clock", "waveform", "whisper"])
+        self.assertEqual(parse_methods(None),
+                         ["timecode", "clock", "waveform", "flash", "whisper"])
         self.assertEqual(parse_methods("whisper,timecode,whisper"),
                          ["timecode", "whisper"])
+        self.assertEqual(parse_methods("flash"),
+                         ["flash"])
+        self.assertEqual(parse_methods("whisper,flash,waveform"),
+                         ["waveform", "flash", "whisper"])
         with self.assertRaises(ValueError):
             parse_methods("bogus")
         with self.assertRaises(ValueError):
