@@ -156,6 +156,7 @@ From [docs/muse-code/BUILD-LOG.md](docs/muse-code/BUILD-LOG.md) and the git log,
 | Finishing (`director finish`, the `finish` stage of `director cut`) | Designed by Muse Code on muse-wonder-1.0, built by Muse Code on muse-spark-1.3 |
 | Burned-in captions and the cinematic title (`director captions`, the `captions` stage of `director cut`) | Built by Muse Code on muse-spark-1.3 straight from the brief (no separate design) |
 | Try it with no footage (`director demo`) | Built by Muse Code on muse-spark-1.3 from DEMO-BRIEF.md |
+| Mic-air de-plosive + peak limiter (the `finish` de-plosive, `--no-deplosive`) | Built by Muse Code on muse-spark-1.3 from AIR-BRIEF.md |
 
 Sync and reframe were first built earlier in the event by Claude Code, inside GhostCut, where they are still public. The versions here are Muse Code's rewrites: it got only the briefs, never that code, and its run logs show no reads outside this repository and its installed packages. Both were checked against the same real recordings and cut ([BUILD-LOG](docs/muse-code/BUILD-LOG.md), Live test).
 
