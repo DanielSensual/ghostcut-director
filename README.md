@@ -19,6 +19,8 @@ director cut /path/to/card-dump --out-dir job1 --no-tighten   # keep the whole r
 
 `--target` shortens the kept cut to a length by dropping whole beats only, never mid-sentence; `--pause-limit` shortens pauses inside kept takes to 0.35 s.
 
+Cameras Director can't read (DJI D-Log, Apple Log, a custom profile) take a supplied `.cube` by file name: `--lut 'DJI_*=dlog.cube'`. The grade and the lip-reading sync both use it.
+
 Director transcribes the production audio with Muse Voice Transcribe when a Meta key is available: every repetition and filler is kept verbatim, the main speaker is labelled `talent` (everyone else `other-1`, `other-2`, …), and the turns land in `transcript.json` next to `words.json` — take picking then drops crew talk and prefers the cleaner take. When it cannot (no key, over budget, a refused request), it falls back to Whisper alone and names why in `cut.json`. `--no-transcribe` keeps Whisper words only; `director transcribe --sync sync.json --words whisper.json --out words.json` runs the same transcription by hand on one recording (clip-local Whisper times in, timeline words out).
 
 Two things to know before finishing in an NLE: the timelines reference the camera originals, so they open showing log/HLG picture — the per-camera `.cube` files `grade` wrote sit beside them in the job directory (`cut.json` names which cube belongs to which camera). And each timeline clip carries its own camera's audio; the rendered `cut.mp4`/`vertical.mp4` remain the masters with the production audio laid under them, so an editor rebuilding the mix re-lays the audio clip at the offset recorded in `angles.json`/`cut.json` (`audio.offset_s`).

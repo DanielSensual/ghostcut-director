@@ -2171,7 +2171,11 @@ def run(*, clip_paths: list[Path], reference_path: Path | None,
     words: dict[str, list[TranscriptWord]] = {}
     flash_cache: dict = {}
     lips_cache: dict = {}
-    lips_cube_map = _lips_cube_map(lips_grade, lips_cubes)
+    # Supplied cubes may name a clip by its file path (callers don't know the labels yet).
+    path_to_label = {str(Path(p).resolve()): labels[i] for i, p in enumerate(paths)}
+    cubes_by_label = {path_to_label.get(str(Path(key).resolve()), key): cube
+                      for key, cube in (lips_cubes or {}).items()}
+    lips_cube_map = _lips_cube_map(lips_grade, cubes_by_label)
     lips_crosscheck_done = False
     out_path = Path(out_path)
     cache_dir = out_path.parent / "sync-transcripts"

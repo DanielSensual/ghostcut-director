@@ -16,6 +16,7 @@ muse-spark-1.3 from docs/muse-code/OPEN-DESIGN.md.
 """
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 import math
@@ -142,6 +143,9 @@ class JobOptions:
     finish_isolate: bool = False
     finish_loudness: float | None = None
     max_provider_usd: float = 2.00
+    # --lut PATTERN=CUBE entries: a supplied .cube for every clip whose file name (or path)
+    # matches PATTERN, for cameras Director can't read (DJI D-Log, Apple Log, ...).
+    lut_patterns: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -208,6 +212,30 @@ def discover_clips(inputs: list[Path], out_dir: Path) -> list[Path]:
 
 
 # -------------------------------------------------------------- words bridge
+
+
+def match_luts(patterns: list[str], clips: list[Path]) -> dict[str, Path]:
+    """--lut PATTERN=CUBE entries to {clip path: cube}; later entries win.
+
+    PATTERN is a shell glob matched case-insensitively against each clip's file name and
+    full path, so `DJI_*=dlog.cube` or the exact file name both work.
+    """
+    out: dict[str, Path] = {}
+    for item in patterns:
+        pattern, sep, cube = item.partition("=")
+        if not sep or not pattern or not cube:
+            raise CutError(f"--lut {item!r}: want PATTERN=CUBE, e.g. 'DJI_*=dlog.cube'")
+        cube_path = Path(cube).expanduser()
+        if not cube_path.is_file():
+            raise CutError(f"--lut {item!r}: no such .cube file: {cube_path}")
+        hits = [clip for clip in clips
+                if fnmatch.fnmatch(clip.name.lower(), pattern.lower())
+                or fnmatch.fnmatch(str(clip).lower(), pattern.lower())]
+        if not hits:
+            raise CutError(f"--lut {item!r}: no input clip matches {pattern!r}")
+        for clip in hits:
+            out[str(clip)] = cube_path.resolve()
+    return out
 
 
 def resolve_audio(sync_payload: dict, audio_path: Path | None) -> tuple[str, dict]:
@@ -732,7 +760,8 @@ def run(*, clips: list[Path], out_dir: Path,
         whisper_model: str = sync_mod.WHISPER_MODEL,
         no_finish: bool = True, finish_sound: bool = False,
         finish_isolate: bool = False, finish_loudness: float | None = None,
-        max_provider_usd: float = 2.00) -> dict:
+        max_provider_usd: float = 2.00,
+        lut_patterns: list[str] | None = None) -> dict:
     """One job: discover → sync → words → tighten → grade → angles → … → qc.
 
     The tighten stage runs unless no_tighten (the CLI enables it unless
@@ -763,7 +792,8 @@ def run(*, clips: list[Path], out_dir: Path,
         target_s=target_s, no_transcribe=no_transcribe,
         whisper_model=whisper_model, no_finish=no_finish,
         finish_sound=finish_sound, finish_isolate=finish_isolate,
-        finish_loudness=finish_loudness, max_provider_usd=max_provider_usd)
+        finish_loudness=finish_loudness, max_provider_usd=max_provider_usd,
+        lut_patterns=list(lut_patterns or []))
     graded = not no_grade
     tightened = not no_tighten
 
@@ -856,6 +886,19 @@ def run(*, clips: list[Path], out_dir: Path,
             raise exc
         raise CutError(f"{stage}: {exc}") from exc
 
+    luts = match_luts(list(options.lut_patterns), list(options.clips))
+
+    def _grade_lut_specs() -> tuple[str, ...]:
+        """Supplied cubes as grade's LABEL=PATH, once sync has named the clips."""
+        if not luts or sync_payload is None:
+            return ()
+        specs = []
+        for clip in sync_payload.get("clips", []):
+            path = str((clip.get("camera") or {}).get("path") or "")
+            if path in luts:
+                specs.append(f"{clip.get('label')}={luts[path]}")
+        return tuple(specs)
+
     def _fingerprint(stage: str) -> str:
         if stage == "sync":
             return stage_fingerprint(
@@ -863,8 +906,9 @@ def run(*, clips: list[Path], out_dir: Path,
                 {"methods": options.methods,
                  "reference": str(options.reference_path)
                  if options.reference_path is not None else None,
-                 "whisper_model": options.whisper_model},
-                list(options.clips))
+                 "whisper_model": options.whisper_model,
+                 "luts": sorted(options.lut_patterns)},
+                list(options.clips) + sorted(set(luts.values())))
         if stage == "words":
             assert sync_payload is not None
             label, clip = resolve_audio(sync_payload, options.audio_path)
@@ -895,8 +939,9 @@ def run(*, clips: list[Path], out_dir: Path,
                 "grade",
                 {"reference_label": None,
                  "check": bool(options.grade_check and not options.no_muse),
-                 "model": options.model, "no_match": False},
-                [out_dir / "sync.json"])
+                 "model": options.model, "no_match": False,
+                 "luts": sorted(options.lut_patterns)},
+                [out_dir / "sync.json"] + sorted(set(luts.values())))
         if stage == "angles":
             assert audio_section is not None and words_file_current is not None
             files = [words_file_current, out_dir / "sync.json"]
@@ -1046,11 +1091,14 @@ def run(*, clips: list[Path], out_dir: Path,
         nonlocal qc_section, final_checks, spent_usd, tighten_section
         nonlocal finish_payload, finish_provider_spend, provider_spent_usd
         if stage == "sync":
+            sync_kwargs: dict = {}
+            if luts:
+                sync_kwargs["lips_cubes"] = {path: str(cube) for path, cube in luts.items()}
             payload = sync_mod.run(
                 clip_paths=list(options.clips), reference_path=options.reference_path,
                 methods=list(options.methods), transcripts_dir=options.transcripts_dir,
                 out_path=out_dir / "sync.json",
-                whisper_model=options.whisper_model)
+                whisper_model=options.whisper_model, **sync_kwargs)
             sync_payload = payload
             stage_warnings = [f"{clip.get('label')}: {note}"
                               for clip in payload.get("clips", [])
@@ -1179,7 +1227,7 @@ def run(*, clips: list[Path], out_dir: Path,
                 _trailing_gate("grade")
             payload = grade_mod.run(
                 sync_path=out_dir / "sync.json", out_path=out_dir / "grade.json",
-                reference_label=None, lut_specs=(), no_match=False,
+                reference_label=None, lut_specs=_grade_lut_specs(), no_match=False,
                 check=do_check, model=options.model)
             grade_payload = payload
             spend = _spend_of(payload)

@@ -1126,3 +1126,21 @@ class SyntheticEndToEndTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MatchLutsTests(unittest.TestCase):
+    def test_patterns_match_file_names_case_insensitively(self) -> None:
+        from director.cut import CutError, match_luts
+        with tempfile.TemporaryDirectory() as tmp:
+            cube = Path(tmp) / "dlog.cube"
+            cube.write_text("LUT_3D_SIZE 2\n", encoding="utf-8")
+            drone = Path(tmp) / "DJI_0354.MOV"
+            sony = Path(tmp) / "C2935.MP4"
+            got = match_luts([f"dji_*={cube}"], [drone, sony])
+            self.assertEqual(got, {str(drone): cube.resolve()})
+            with self.assertRaisesRegex(CutError, "no input clip matches"):
+                match_luts([f"GX*={cube}"], [drone, sony])
+            with self.assertRaisesRegex(CutError, "no such .cube"):
+                match_luts([f"DJI_*={Path(tmp) / 'missing.cube'}"], [drone])
+            with self.assertRaisesRegex(CutError, "want PATTERN=CUBE"):
+                match_luts(["DJI_*"], [drone])
