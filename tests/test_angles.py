@@ -356,3 +356,21 @@ class FakeMuseTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TightenedLinesTests(unittest.TestCase):
+    def test_an_utterance_split_by_a_trimmed_pause_builds_no_overlapping_lines(self) -> None:
+        # Live 2026-11-03: one utterance listed by two kept spans (a pause trimmed between
+        # them) produced two overlapping lines and the shot for one of them was lost.
+        from director.angles import TimedWord, _tightened_lines
+        words = [TimedWord("captions", 182.12, 182.58), TimedWord("and", 182.86, 182.92),
+                 TimedWord("about", 184.48, 184.76), TimedWord("90", 184.76, 185.2),
+                 TimedWord("completed", 186.06, 186.62), TimedWord("client.", 188.02, 188.46)]
+        tighten = {"utterances": [{"id": 7, "word_start": 0, "word_end": 6}],
+                   "kept_spans": [{"start_s": 169.27, "end_s": 185.38, "utterance_ids": [7]},
+                                  {"start_s": 185.89, "end_s": 188.58, "utterance_ids": [7]}]}
+        lines = _tightened_lines(tighten, words)
+        for a, b in zip(lines, lines[1:]):
+            self.assertLessEqual(a.end_s, b.start_s)
+        self.assertEqual(sum(l.word_end - l.word_start for l in lines), len(words))
+        self.assertTrue(all(l.end_s <= 185.38 or l.start_s >= 185.89 for l in lines))

@@ -763,7 +763,18 @@ def _tightened_lines(tighten: dict, words: list[TimedWord]) -> list[Line]:
             except (TypeError, ValueError):
                 continue
             indices.extend(range(start, end))
-        indices = sorted({i for i in indices if 0 <= i < len(words)})
+        # A trimmed pause splits one utterance across two kept spans, and both
+        # list it: keep only this span's own words, or the two spans build
+        # overlapping lines and a shot is lost (the final take showed the wrong
+        # camera for 2.7 s that way).
+        try:
+            span_start = float(span.get("start_s"))
+            span_end = float(span.get("end_s"))
+        except (TypeError, ValueError):
+            span_start, span_end = float("-inf"), float("inf")
+        indices = sorted({
+            i for i in indices if 0 <= i < len(words)
+            and span_start <= (words[i].start_s + words[i].end_s) / 2 <= span_end})
         if not indices:
             continue
         for line in split_lines([words[i] for i in indices]):
