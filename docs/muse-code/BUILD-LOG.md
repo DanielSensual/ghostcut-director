@@ -227,3 +227,49 @@ Live test: TBD (the owner fills this from the real-footage run).
   as the specified safety net and is covered directly.
 - Full suite: 407 tests, green except the same 11 pre-existing `ps`-sandbox
   errors in `tests/test_engine_render.py` and `tests/test_render_runner.py`.
+
+# Build log: Voice Transcribe transcript (`transcribe`) (2026-11-03)
+
+| Step | By | What |
+|---|---|---|
+| Brief | Project owner, with Claude Code | `TRANSCRIBE-BRIEF.md`: Voice Transcribe as the transcript of record. |
+| Design | Meta **Muse Code** on **`muse-wonder-1.0`** | `TRANSCRIBE-DESIGN.md`: chunking, speaker reconciliation, Whisper↔Muse alignment, cut/tighten integration. |
+| Build | Meta **Muse Code** on **`muse-spark-1.3`** | `src/director/transcribe.py`, the `angles`/`cut`/`tighten`/`cutlist` changes, `tests/test_transcribe.py`. |
+| Code review and live test | Claude Code, piloted by the owner | Real footage, below. |
+
+Muse Code token use: TBD (the owner fills this from the run log).
+Live test: TBD (the owner fills this from the real-footage run).
+
+## Build notes (Muse Code)
+
+- The `--whisper-model` option the design assumes Claude Code added arrived
+  only half built (`WHISPER_MODEL` + `metal_visible` in `sync.py`), so this
+  build finished it: `--whisper-model` on `director sync` and `director cut`
+  (default `sync.WHISPER_MODEL`), threaded into `sync.get_transcript_words`
+  and `cut.mlx_whisper_command` (as `--model`), the `cut` local Whisper run
+  skipped with `words_no_gpu_visible` when `metal_visible()` is false, and
+  the `cut` error now says "mlx_whisper failed" / "no GPU visible" when the
+  binary is installed instead of "not on PATH". `tests/test_cut.py` carries
+  the updated expectations; both stages fingerprint the model.
+- `Chunk` carries a `spend_usd` field (default 0.0): `transcript.json`
+  needs each chunk's actual spend (0.0 on a cache hit) and the result is
+  the only channel from `diarize_chunk` to `build_transcript_payload`.
+- §7.7 example 1's gloss ("difflib anchors the first the") mis-predicts
+  `difflib`: the longest match is `[the, problem, is, timecode]`, so the
+  paired `the` is Muse's second one and the muse-only `the` interpolates
+  into the gap before it (10.22–10.24 in the example becomes 10.12–10.14,
+  and the disfluency flag lands on the paired word per the §7.5 repeat
+  rule). The §7.3 opcode walk is normative and decides; item 10 asserts
+  what it emits.
+- Item 17 uses a 400 s clip, not the designed 200 s: 200 s plans as one
+  chunk and the item needs the swapped-label second chunk.
+- `apply_transcript_evidence` step 1 warns `tighten_beat_other_speaker`
+  only when it removes the beat's pick and nothing usable remains; a beat
+  that already had no pick is left alone without the warning (otherwise
+  every pre-existing flub-only beat would be mislabelled other-speaker).
+  Step 2's swap sets the new pick to verdict `pick` / kind `keeper` and
+  the old pick to `alternate` / `alternate`, keeping the file's invariant
+  (the design's "kind stays keeper" for an `alternate`-kind attempt reads
+  as a slip).
+- Full suite: 437 tests, green except the same 11 pre-existing `ps`-sandbox
+  errors in `tests/test_engine_render.py` and `tests/test_render_runner.py`.

@@ -318,11 +318,18 @@ class ResolveWordsTests(unittest.TestCase):
             self.assertIn("words_empty_candidate:lav.json", warnings)
 
     def test_resolve_words_mlx_whisper(self) -> None:
+        from director.sync import WHISPER_MODEL
+
         self.assertEqual(
             mlx_whisper_command(Path("/media/a.mp4"), Path("/out")),
-            ["mlx_whisper", "/media/a.mp4", "--output-format", "json",
+            ["mlx_whisper", "/media/a.mp4", "--model", WHISPER_MODEL,
+             "--output-format", "json",
              "--output-dir", "/out", "--word-timestamps", "True",
              "--verbose", "False"])
+        self.assertIn("--model", mlx_whisper_command(
+            Path("/media/a.mp4"), Path("/out"), "custom-model"))
+        self.assertIn("custom-model", mlx_whisper_command(
+            Path("/media/a.mp4"), Path("/out"), "custom-model"))
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             out_dir = tmp_path / "out"
@@ -336,6 +343,8 @@ class ResolveWordsTests(unittest.TestCase):
                 return subprocess.CompletedProcess(command, 0, "", "")
 
             with mock.patch("shutil.which", return_value="/bin/mlx_whisper"), \
+                    mock.patch.object(cut_mod.sync_mod, "metal_visible",
+                                      return_value=True), \
                     mock.patch.object(cut_mod.subprocess, "run",
                                       side_effect=_succeed):
                 found, source, _ = resolve_words(
@@ -349,15 +358,42 @@ class ResolveWordsTests(unittest.TestCase):
                 return subprocess.CompletedProcess(command, 1, "", "boom")
 
             with mock.patch("shutil.which", return_value="/bin/mlx_whisper"), \
+                    mock.patch.object(cut_mod.sync_mod, "metal_visible",
+                                      return_value=True), \
                     mock.patch.object(cut_mod.subprocess, "run", side_effect=_fail):
                 with self.assertRaises(CutError) as raised:
                     resolve_words(audio_label="C", audio_clip=audio,
                                   options=_options(out_dir / "second"))
             message = str(raised.exception)
-            self.assertIn("mlx_whisper is not on PATH", message)
-            self.assertIn("install mlx-whisper", message)
+            self.assertIn("mlx_whisper failed", message)
             self.assertIn("--words WORDS.json", message)
             self.assertIn("--transcripts DIR", message)
+
+            with mock.patch("shutil.which", return_value=None):
+                with self.assertRaises(CutError) as raised:
+                    resolve_words(audio_label="C", audio_clip=audio,
+                                  options=_options(out_dir / "third"))
+            message = str(raised.exception)
+            self.assertIn("mlx_whisper is not on PATH", message)
+            self.assertIn("install mlx-whisper", message)
+
+    def test_resolve_words_skips_whisper_without_gpu(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            out_dir = tmp_path / "out"
+            out_dir.mkdir()
+            audio = self._audio(tmp_path)
+            with mock.patch("shutil.which", return_value="/bin/mlx_whisper"), \
+                    mock.patch.object(cut_mod.sync_mod, "metal_visible",
+                                      return_value=False), \
+                    mock.patch.object(cut_mod.subprocess, "run") as run_mock:
+                with self.assertRaises(CutError) as raised:
+                    resolve_words(audio_label="C", audio_clip=audio,
+                                  options=_options(out_dir))
+            run_mock.assert_not_called()
+            self.assertIn("no GPU visible", str(raised.exception))
+            self.assertIn("words_no_gpu_visible:lav.wav",
+                          raised.exception.stage_warnings)
 
 
 class StageFakes:
@@ -373,7 +409,7 @@ class StageFakes:
         self.reframe_max_usd: list[float] = []
 
     def sync_run(self, *, clip_paths, reference_path, methods,
-                 transcripts_dir, out_path):
+                 transcripts_dir, out_path, whisper_model=None):
         self.calls["sync"] += 1
         payload = _sync_payload(
             [_sync_clip("A", str(clip_paths[0]), 0.0),

@@ -19,6 +19,8 @@ director cut /path/to/card-dump --out-dir job1 --no-tighten   # keep the whole r
 
 `--target` shortens the kept cut to a length by dropping whole beats only, never mid-sentence; `--pause-limit` shortens pauses inside kept takes to 0.35 s.
 
+Director transcribes the production audio with Muse Voice Transcribe when a Meta key is available: every repetition and filler is kept verbatim, the main speaker is labelled `talent` (everyone else `other-1`, `other-2`, …), and the turns land in `transcript.json` next to `words.json` — take picking then drops crew talk and prefers the cleaner take. When it cannot (no key, over budget, a refused request), it falls back to Whisper alone and names why in `cut.json`. `--no-transcribe` keeps Whisper words only; `director transcribe --sync sync.json --words whisper.json --out words.json` runs the same transcription by hand on one recording (clip-local Whisper times in, timeline words out).
+
 Two things to know before finishing in an NLE: the timelines reference the camera originals, so they open showing log/HLG picture — the per-camera `.cube` files `grade` wrote sit beside them in the job directory (`cut.json` names which cube belongs to which camera). And each timeline clip carries its own camera's audio; the rendered `cut.mp4`/`vertical.mp4` remain the masters with the production audio laid under them, so an editor rebuilding the mix re-lays the audio clip at the offset recorded in `angles.json`/`cut.json` (`audio.offset_s`).
 
 ## Running the stages by hand
@@ -87,6 +89,7 @@ From [docs/muse-code/BUILD-LOG.md](docs/muse-code/BUILD-LOG.md) and the git log,
 | The briefs | The owner with Claude Code |
 | One-step multicam cut (`director cut`) | Designed by Muse Code on muse-wonder-1.0, built by Muse Code on muse-spark-1.3 |
 | Take picking (`director tighten`, the `tighten` stage of `director cut`) | Designed by Muse Code on muse-wonder-1.0, built by Muse Code on muse-spark-1.3 |
+| Voice Transcribe transcript (`director transcribe`, the transcribe step of `director cut`) | Designed by Muse Code on muse-wonder-1.0, built by Muse Code on muse-spark-1.3 |
 
 Sync and reframe were first built earlier in the event by Claude Code, inside GhostCut, where they are still public. The versions here are Muse Code's rewrites: it got only the briefs, never that code, and its run logs show no reads outside this repository and its installed packages. Both were checked against the same real recordings and cut ([BUILD-LOG](docs/muse-code/BUILD-LOG.md), Live test).
 

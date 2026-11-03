@@ -790,7 +790,9 @@ def metal_visible() -> bool:
 
 
 def get_transcript_words(clip: CameraInfo, transcripts_dir: Path | None,
-                         cache_dir: Path) -> list[TranscriptWord]:
+                         cache_dir: Path,
+                         whisper_model: str = WHISPER_MODEL
+                         ) -> list[TranscriptWord]:
     """Words for one clip: `--transcripts`, the run cache, or local mlx_whisper."""
     stem = Path(clip.path).stem
     if transcripts_dir is not None:
@@ -807,7 +809,7 @@ def get_transcript_words(clip: CameraInfo, transcripts_dir: Path | None,
     cache_dir.mkdir(parents=True, exist_ok=True)
     try:
         done = subprocess.run(
-            ["mlx_whisper", clip.path, "--model", WHISPER_MODEL, "--output-format", "json",
+            ["mlx_whisper", clip.path, "--model", whisper_model, "--output-format", "json",
              "--output-dir", str(cache_dir), "--word-timestamps", "True",
              "--verbose", "False"],
             capture_output=True, timeout=3600)
@@ -1109,7 +1111,8 @@ def build_payload(results: list[ClipResult], reference_path: str,
 
 def _attempt_estimates(target: ClipResult, anchor: ClipResult, methods: list[str],
                        envelopes: dict, words: dict[str, list[TranscriptWord]],
-                       transcripts_dir: Path | None, cache_dir: Path) -> list[Estimate]:
+                       transcripts_dir: Path | None, cache_dir: Path,
+                       whisper_model: str) -> list[Estimate]:
     """One anchor's estimates in canonical method order."""
     estimates: list[Estimate] = []
     if "timecode" in methods:
@@ -1127,10 +1130,10 @@ def _attempt_estimates(target: ClipResult, anchor: ClipResult, methods: list[str
     if "whisper" in methods:
         if target.camera.path not in words:
             words[target.camera.path] = get_transcript_words(
-                target.camera, transcripts_dir, cache_dir)
+                target.camera, transcripts_dir, cache_dir, whisper_model)
         if anchor.camera.path not in words:
             words[anchor.camera.path] = get_transcript_words(
-                anchor.camera, transcripts_dir, cache_dir)
+                anchor.camera, transcripts_dir, cache_dir, whisper_model)
         est = whisper_estimate(target, anchor, words[target.camera.path],
                                words[anchor.camera.path])
         if est is not None:
@@ -1139,7 +1142,8 @@ def _attempt_estimates(target: ClipResult, anchor: ClipResult, methods: list[str
 
 
 def run(*, clip_paths: list[Path], reference_path: Path | None,
-        methods: list[str], transcripts_dir: Path | None, out_path: Path) -> dict:
+        methods: list[str], transcripts_dir: Path | None, out_path: Path,
+        whisper_model: str = WHISPER_MODEL) -> dict:
     """Place every clip on the reference's timeline; write sync.json."""
     paths = [Path(p) for p in clip_paths]
     if len(paths) < 2:
@@ -1189,7 +1193,8 @@ def run(*, clip_paths: list[Path], reference_path: Path | None,
         halved_notes: list[str] = []
         for anchor in anchors:
             estimates = _attempt_estimates(target, anchor, methods, envelopes,
-                                           words, transcripts_dir, cache_dir)
+                                           words, transcripts_dir, cache_dir,
+                                           whisper_model)
             frame_s = frame_duration_s(target, anchor)
             global_wave = next((e for e in estimates if e.method == "waveform"), None)
             whispers = [e for e in estimates if e.method == "whisper"]

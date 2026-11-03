@@ -55,6 +55,9 @@ class TimedWord:
     text: str
     start_s: float
     end_s: float
+    speaker: str = ""
+    heard_by: str = "whisper"
+    disfluency: bool = False
 
 
 @dataclass(slots=True)
@@ -132,7 +135,10 @@ def load_timed_words(path: Path) -> list[TimedWord]:
             continue
         end = w.get("end")
         parsed.append(TimedWord(text.strip(), float(start),
-                                float(end) if end is not None else -1.0))
+                                float(end) if end is not None else -1.0,
+                                str(w.get("speaker") or ""),
+                                str(w.get("heard_by") or "whisper"),
+                                bool(w.get("disfluency"))))
     parsed.sort(key=lambda t: t.start_s)
     out: list[TimedWord] = []
     for i, t in enumerate(parsed):
@@ -142,7 +148,8 @@ def load_timed_words(path: Path) -> list[TimedWord]:
                 end = parsed[i + 1].start_s
             else:
                 end = t.start_s + 0.30
-        out.append(TimedWord(t.text, t.start_s, max(end, t.start_s)))
+        out.append(TimedWord(t.text, t.start_s, max(end, t.start_s),
+                             t.speaker, t.heard_by, t.disfluency))
     return out
 
 

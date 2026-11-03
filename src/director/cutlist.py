@@ -187,6 +187,10 @@ def recompute_spans(payload: dict, words: Sequence[WordLike], *,
     it. Returns the mutated payload.
     """
     words = list(words)
+
+    def _is_anchor(i: int) -> bool:
+        return getattr(words[i], "heard_by", "whisper") != "muse"
+
     utterance_by_id: dict[int, dict] = {}
     for entry in payload.get("utterances", []) or []:
         if isinstance(entry, dict):
@@ -238,26 +242,30 @@ def recompute_spans(payload: dict, words: Sequence[WordLike], *,
             except (TypeError, ValueError):
                 continue
             indices.extend(range(start, end))
-        indices = sorted({i for i in indices if 0 <= i < len(words)})
+        indices = sorted({i for i in indices
+                          if 0 <= i < len(words) and _is_anchor(i)})
         if not indices:
             continue
         # Split the pick's kept words into runs at trimmed pauses and at
-        # excluded (unclassified) utterances.
+        # excluded (unclassified) utterances. Anchor gaps only: Muse-only
+        # words between two anchors ride along inside the run.
         runs: list[list[int]] = [[indices[0]]]
         bounds: list[tuple[float, float, str, str, list[int]]] = []
         for prev_i, i in zip(indices, indices[1:]):
             prev_w, word = words[prev_i], words[i]
             gap = word.start_s - prev_w.end_s
-            if i == prev_i + 1 and gap <= pause_limit_s:
+            continuous = all(not _is_anchor(j)
+                             for j in range(prev_i + 1, i))
+            if continuous and gap <= pause_limit_s:
                 runs[-1].append(i)
                 continue
-            if i == prev_i + 1 and gap <= PAUSE_KEEP_S:
+            if continuous and gap <= PAUSE_KEEP_S:
                 # Shorter than what a trim retains: keep whole. (Only
                 # reachable with --pause-limit under 0.35 s.)
                 runs[-1].append(i)
                 continue
             runs.append([i])
-            if i == prev_i + 1:
+            if continuous:
                 close, open_ = prev_w.end_s + 0.18, word.start_s - 0.17
                 bounds.append((close, open_, "pause_trim",
                                f"pause {gap:.2f}s shortened to 0.35s", []))
@@ -277,18 +285,22 @@ def recompute_spans(payload: dict, words: Sequence[WordLike], *,
             end: float | None = None
             if number > 0:
                 start = bounds[number - 1][1]
-            elif run[0] > 0:
-                prev_w = words[run[0] - 1]
-                start = (prev_w.end_s + first.start_s) / 2
             else:
-                start = max(0.0, first.start_s - HEAD_PAD_S)
+                prev_a = next((j for j in range(run[0] - 1, -1, -1)
+                               if _is_anchor(j)), None)
+                if prev_a is None:
+                    start = max(0.0, first.start_s - HEAD_PAD_S)
+                else:
+                    start = (words[prev_a].end_s + first.start_s) / 2
             if number < len(runs) - 1:
                 end = bounds[number][0]
-            elif run[-1] + 1 < len(words):
-                next_w = words[run[-1] + 1]
-                end = (last.end_s + next_w.start_s) / 2
             else:
-                end = last.end_s + TAIL_PAD_S
+                next_a = next((j for j in range(run[-1] + 1, len(words))
+                               if _is_anchor(j)), None)
+                if next_a is None:
+                    end = last.end_s + TAIL_PAD_S
+                else:
+                    end = (last.end_s + words[next_a].start_s) / 2
             assert start is not None and end is not None
             run_utts = sorted({word_to_utt[i] for i in run
                                if i in word_to_utt})

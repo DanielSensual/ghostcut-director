@@ -45,6 +45,8 @@ TOKEN_RATES_USD_PER_1M = {
 DEFAULT_PAUSE_LIMIT_S = 0.8
 BEAT_SIM_MIN = 0.45
 WINDOW_RULE_FALLBACK_SHARE = 0.25
+DISFLUENCY_SWAP_MIN = 2
+SPEAKER_TALENT_MIN_SHARE = 0.50
 
 FILLERS = frozenset({"um", "uh", "erm"})
 RESTART_MARKERS = ("again", "one more time", "let me redo", "start again",
@@ -74,7 +76,11 @@ DEVELOPER = (
     "lens, a clean start and a finished ending. Prefer a complete attempt "
     "over a slightly livelier incomplete one. Never invent words, people "
     "or events you cannot hear or see, and never leave an utterance out: "
-    "every numbered utterance in the window belongs to exactly one attempt."
+    "every numbered utterance in the window belongs to exactly one attempt. "
+    "Utterances may carry a speaker tag and a disfluency count from "
+    "the verbatim transcript: a speaker other than talent, and "
+    "repeated or filler words, count against an attempt, but what "
+    "you can hear in the delivery still matters more than the tag."
 )
 
 
@@ -101,6 +107,9 @@ class Utterance:
     text: str
     word_start: int
     word_end: int
+    speaker: str = ""
+    disfluency_count: int = 0
+    muse_only_count: int = 0
 
 
 @dataclass(slots=True)
@@ -122,9 +131,22 @@ def build_utterances(words: list[angles_mod.TimedWord]) -> list[Utterance]:
     out: list[Utterance] = []
 
     def emit(part: list[angles_mod.TimedWord], start_idx: int) -> None:
-        out.append(Utterance(len(out), part[0].start_s, part[-1].end_s,
-                             " ".join(w.text for w in part),
-                             start_idx, start_idx + len(part)))
+        totals: dict[str, float] = {}
+        for word in part:
+            if word.speaker:
+                totals[word.speaker] = totals.get(word.speaker, 0.0) + max(
+                    0.0, word.end_s - word.start_s)
+        speaker = ""
+        if totals:
+            best = max(totals.values())
+            speaker = next(word.speaker for word in part
+                           if word.speaker and totals[word.speaker] == best)
+        out.append(Utterance(
+            len(out), part[0].start_s, part[-1].end_s,
+            " ".join(w.text for w in part),
+            start_idx, start_idx + len(part), speaker,
+            sum(1 for w in part if w.disfluency),
+            sum(1 for w in part if w.heard_by == "muse")))
 
     cur: list[angles_mod.TimedWord] = []
     cur_idx = 0
@@ -245,7 +267,9 @@ def rule_beats(utterances: list[Utterance]) -> list[cutlist.Beat]:
             complete.append(
                 bool(tokens) and angles_mod._sentence_end(tokens[-1])
                 or pos == len(group) - 1)
-        pick = max(i for i, done in enumerate(complete) if done)
+        pick = max((i for i, done in enumerate(complete) if done),
+                   key=lambda i: (1 if group[i].speaker == "talent" else 0,
+                                  -group[i].disfluency_count, i))
         attempts: list[cutlist.Attempt] = []
         for pos, utterance in enumerate(group):
             if pos == pick:
@@ -269,6 +293,110 @@ def rule_beats(utterances: list[Utterance]) -> list[cutlist.Beat]:
         beats.append(cutlist.Beat(number, topic, attempts, pick, "kept",
                                   priority, "rule: last complete pass"))
     return beats
+
+
+# ------------------------------------------------- transcript evidence (§9)
+
+
+def attempt_transcript_stats(attempt: cutlist.Attempt,
+                             utterances_by_id: dict[int, Utterance],
+                             words: list[angles_mod.TimedWord]
+                             ) -> tuple[float, str, int]:
+    """(talent share, dominant speaker, disfluency count) for one attempt.
+
+    Shares are by word duration over speaker-tagged words; unknown is not
+    talent. Pure.
+    """
+    totals: dict[str, float] = {}
+    tagged = 0.0
+    disfluencies = 0
+    for uid in attempt.utterance_ids:
+        utterance = utterances_by_id.get(uid)
+        if utterance is None:
+            continue
+        disfluencies += utterance.disfluency_count
+        for word in words[utterance.word_start:utterance.word_end]:
+            if not word.speaker:
+                continue
+            duration = max(0.0, word.end_s - word.start_s)
+            totals[word.speaker] = totals.get(word.speaker, 0.0) + duration
+            tagged += duration
+    if not totals:
+        return 0.0, "", disfluencies
+    dominant = max(totals, key=lambda speaker: totals[speaker])
+    return totals.get("talent", 0.0) / tagged, dominant, disfluencies
+
+
+def apply_transcript_evidence(beats: list[cutlist.Beat],
+                              utterances: list[Utterance],
+                              words: list[angles_mod.TimedWord]
+                              ) -> tuple[list[cutlist.Beat], list[str]]:
+    """The mechanical gate over assembled beats: speaker removal, then the
+    disfluency preference. Only ever moves a beat away from a pick the
+    transcript contradicts. Pure; returns (beats, warnings)."""
+    warnings: list[str] = []
+    by_id = {utterance.id: utterance for utterance in utterances}
+    for beat in beats:
+        stats = {index: attempt_transcript_stats(attempt, by_id, words)
+                 for index, attempt in enumerate(beat.attempts)}
+        removed_dominant: dict[int, str] = {}
+        for index, attempt in enumerate(beat.attempts):
+            talent_share, dominant, _ = stats[index]
+            if (dominant and dominant != "talent"
+                    and talent_share < SPEAKER_TALENT_MIN_SHARE):
+                attempt.verdict = "remove"
+                attempt.kind = "crew_talk"
+                attempt.reason = f"speaker {dominant} is not talent"
+                removed_dominant[index] = dominant
+        pick_index = beat.pick_attempt
+        pick_valid = (isinstance(pick_index, int)
+                      and 0 <= pick_index < len(beat.attempts))
+        pick_removed = pick_valid and pick_index in removed_dominant
+        if pick_removed or not pick_valid:
+            usable = [i for i, attempt in enumerate(beat.attempts)
+                      if attempt.verdict in ("pick", "alternate")
+                      and attempt.kind in ("keeper", "alternate")]
+            if usable:
+                best = max(usable, key=lambda i: (
+                    beat.attempts[i].confidence,
+                    beat.attempts[i].end_s - beat.attempts[i].start_s))
+                beat.pick_attempt = best
+                beat.status = "kept"
+                if pick_removed:
+                    beat.attempts[best].reason += (
+                        " (promoted: previous pick was "
+                        f"{removed_dominant[pick_index]} speech)")
+            elif pick_removed:
+                beat.pick_attempt = -1
+                beat.status = "no_usable_attempt"
+                warnings.append(f"tighten_beat_other_speaker:B{beat.id}")
+        pick_index = beat.pick_attempt
+        if (isinstance(pick_index, int)
+                and 0 <= pick_index < len(beat.attempts)):
+            pick = beat.attempts[pick_index]
+            alternates = [i for i, attempt in enumerate(beat.attempts)
+                          if attempt.verdict == "alternate" and i != pick_index]
+            found = stats[pick_index][2]
+            if alternates:
+                best_alt = min(alternates, key=lambda i: (
+                    stats[i][2], -beat.attempts[i].confidence,
+                    -(beat.attempts[i].end_s - beat.attempts[i].start_s)))
+                clean = stats[best_alt][2]
+                if found - clean >= DISFLUENCY_SWAP_MIN:
+                    beat.attempts[best_alt].verdict = "pick"
+                    beat.attempts[best_alt].kind = "keeper"
+                    beat.attempts[best_alt].reason += (
+                        f" (cleaner take: {clean} vs {found} disfluencies)")
+                    pick.verdict = "alternate"
+                    pick.kind = "alternate"
+                    beat.pick_attempt = best_alt
+                else:
+                    pick.confidence = max(
+                        0.0, min(1.0, pick.confidence - min(0.20, 0.05 * found)))
+            else:
+                pick.confidence = max(
+                    0.0, min(1.0, pick.confidence - min(0.20, 0.05 * found)))
+    return beats, warnings
 
 
 # ------------------------------------------------- verification (§7.4)
@@ -542,8 +670,16 @@ def window_prompt(window: Window, utterances: list[Utterance],
     for entry in taste or []:
         lines.append(f"Editor preference: {entry}")
     for utterance in core:
-        lines.append(f"U{utterance.id} [{utterance.start_s:.1f}-"
-                     f"{utterance.end_s:.1f}] {utterance.text}")
+        line = (f"U{utterance.id} [{utterance.start_s:.1f}-"
+                f"{utterance.end_s:.1f}] {utterance.text}")
+        if utterance.speaker or utterance.disfluency_count > 0:
+            note = f"speaker {utterance.speaker or 'unknown'}"
+            if utterance.disfluency_count > 0:
+                noun = ("disfluency" if utterance.disfluency_count == 1
+                        else "disfluencies")
+                note += f", {utterance.disfluency_count} {noun}"
+            line += f" ({note})"
+        lines.append(line)
     lines.append(f"The video starts 1.0s before U{core[0].id}; utterance "
                  f"times are on the recording's timeline, not the video's.")
     return "\n".join(lines)
@@ -894,6 +1030,9 @@ def run(*, sync_path: Path, words_path: Path, out_path: Path,
             beats_all[0].keep_priority = 5
         if len(beats_all) - 1 in rule_positions:
             beats_all[-1].keep_priority = 5
+    beats_all, transcript_warnings = apply_transcript_evidence(
+        beats_all, utterances, words)
+    warnings.extend(transcript_warnings)
     if any_muse and not any_rule:
         method = "muse"
     elif any_rule and not any_muse:
@@ -909,6 +1048,29 @@ def run(*, sync_path: Path, words_path: Path, out_path: Path,
             return path.name
         return str(path)
 
+    def _speaker_key(label: str) -> tuple[int, int, str]:
+        if label == "talent":
+            return (0, 0, "")
+        if label.startswith("other-") and label.rsplit("-", 1)[1].isdigit():
+            return (1, int(label.rsplit("-", 1)[1]), "")
+        return (2, 0, label)
+
+    transcript_speakers = sorted({word.speaker for word in words
+                                  if word.speaker}, key=_speaker_key)
+
+    def _utterance_entry(utterance: Utterance) -> dict:
+        entry: dict = {"id": utterance.id, "start_s": utterance.start_s,
+                       "end_s": utterance.end_s, "text": utterance.text,
+                       "word_start": utterance.word_start,
+                       "word_end": utterance.word_end}
+        if utterance.speaker:
+            entry["speaker"] = utterance.speaker
+        if utterance.disfluency_count:
+            entry["disfluency_count"] = utterance.disfluency_count
+        if utterance.muse_only_count:
+            entry["muse_only_count"] = utterance.muse_only_count
+        return entry
+
     payload: dict = {
         "version": 1,
         "sync": _display(sync_path),
@@ -923,9 +1085,8 @@ def run(*, sync_path: Path, words_path: Path, out_path: Path,
         "warnings": warnings,
         "duration_in_s": round(words[-1].end_s - words[0].start_s, 3),
         "duration_out_s": 0.0,
-        "utterances": [{"id": u.id, "start_s": u.start_s, "end_s": u.end_s,
-                        "text": u.text, "word_start": u.word_start,
-                        "word_end": u.word_end} for u in utterances],
+        "utterances": [_utterance_entry(u) for u in utterances],
+        "transcript_speakers": transcript_speakers,
         "beats": [_beat_to_dict(beat) for beat in beats_all],
         "kept_spans": [],
         "removed_spans": [],

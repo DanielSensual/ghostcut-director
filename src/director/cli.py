@@ -137,6 +137,7 @@ def command_sync(args: argparse.Namespace) -> dict:
         methods=sync_mod.parse_methods(args.methods),
         transcripts_dir=Path(args.transcripts) if args.transcripts else None,
         out_path=Path(args.out),
+        whisper_model=args.whisper_model,
     )
     for item in payload.get("clips", []):
         cam = item.get("camera", {})
@@ -207,6 +208,13 @@ def _cut_stage_line(name: str, record: dict, payload: dict) -> str:
             extra = ""
             if audio.get("words_shifted_s"):
                 extra = f", shifted {float(audio['words_shifted_s']):+.3f}s"
+            transcribe = audio.get("transcribe") or {}
+            if transcribe.get("method") == "muse":
+                share = transcribe.get("matched_share")
+                share_text = (f"{float(share) * 100:.1f}%"
+                              if share is not None else "?")
+                extra += (f", muse {share_text} matched, "
+                          f"${float(transcribe.get('spend_usd') or 0.0):.4f}")
             line += (f" ({audio.get('words', 0)} words, "
                      f"{audio.get('words_source')}{extra})")
     elif name == "tighten":
@@ -329,6 +337,8 @@ def command_cut(args: argparse.Namespace) -> dict:
             no_tighten=bool(args.no_tighten),
             pause_limit_s=float(args.pause_limit),
             target_s=parse_target(args.target) if args.target else None,
+            no_transcribe=bool(args.no_transcribe),
+            whisper_model=args.whisper_model,
         )
     except Exception:
         # The stage lines are the progress log: on failure, show the stages
@@ -349,7 +359,44 @@ def command_cut(args: argparse.Namespace) -> dict:
     return payload
 
 
+def command_transcribe(args: argparse.Namespace) -> dict:
+    from .transcribe import run as run_transcribe
+
+    require_ffmpeg_binaries()
+    out = Path(args.out)
+    transcript = (Path(args.transcript) if args.transcript
+                  else out.parent / "transcript.json")
+    payload = run_transcribe(
+        sync_path=Path(args.sync),
+        words_path=Path(args.words),
+        out_path=out,
+        transcript_path=transcript,
+        audio_label=args.audio,
+        max_usd=float(args.max_usd),
+        no_muse=bool(args.no_muse),
+    )
+    if payload.get("method") == "muse":
+        for speaker in payload.get("speakers", []):
+            print(f"{speaker['id']}: {float(speaker['duration_s']):.1f}s, "
+                  f"{speaker['turns']} turns")
+        alignment = payload.get("alignment") or {}
+        share = float(alignment.get("matched_share") or 0.0)
+        print(f"aligned {alignment.get('matched', 0)}/"
+              f"{alignment.get('whisper_words', 0)} words "
+              f"({share * 100:.1f}%), {alignment.get('muse_only', 0)} "
+              f"muse-only, {alignment.get('whisper_only', 0)} whisper-only, "
+              f"${float(payload.get('spend_usd') or 0.0):.4f}")
+    for warning in payload.get("warnings", []):
+        print(f"! {warning}")
+    print(f"Wrote {args.out}")
+    if payload.get("method") == "muse":
+        print(f"Wrote {transcript}")
+    return payload
+
+
 def build_parser() -> argparse.ArgumentParser:
+    from .sync import WHISPER_MODEL
+
     parser = argparse.ArgumentParser(description="GhostCut Director: multicam cutting on Meta's Muse models")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -400,6 +447,8 @@ def build_parser() -> argparse.ArgumentParser:
                              help="Subset of timecode,clock,waveform,whisper")
     sync_parser.add_argument("--transcripts", default=None,
                              help="Directory of word-timed Whisper JSON transcripts")
+    sync_parser.add_argument("--whisper-model", default=WHISPER_MODEL,
+                             help="Local Whisper model for word timings (mlx_whisper --model)")
     sync_parser.add_argument("--out", default="sync.json", help="Where to write sync.json")
     sync_parser.set_defaults(func=command_sync)
 
@@ -423,17 +472,22 @@ def build_parser() -> argparse.ArgumentParser:
     cut_parser.add_argument("--audio", default=None,
                             help="Production-audio clip file (default: the reference clip)")
     cut_parser.add_argument("--words", default=None,
-                            help="Word-timed Whisper JSON in timeline times")
+                            help="Word-timed Whisper JSON in timeline times "
+                            "(used in place, never transcribed)")
     cut_parser.add_argument("--transcripts", default=None,
                             help="Directory of per-clip word-timed Whisper JSON transcripts")
     cut_parser.add_argument("--methods", default=None,
                             help="Subset of timecode,clock,waveform,whisper")
+    cut_parser.add_argument("--whisper-model", default=WHISPER_MODEL,
+                            help="Local Whisper model for word timings (mlx_whisper --model)")
     cut_parser.add_argument("--no-grade", action="store_true",
                             help="Skip grading; render cameras as recorded")
     cut_parser.add_argument("--grade-check", action="store_true",
                             help="Ask Muse Spark to check the grade match")
     cut_parser.add_argument("--no-muse", action="store_true",
                             help="No Meta model calls for picks or checks (SAM still runs; see --no-sam)")
+    cut_parser.add_argument("--no-transcribe", action="store_true",
+                            help="Skip Muse Voice Transcribe; keep Whisper words only")
     cut_parser.add_argument("--model", default="muse-spark-1.3")
     cut_parser.add_argument("--min-shot", type=float, default=2.0,
                             help="Shorter shots merge into a neighbour")
@@ -456,6 +510,24 @@ def build_parser() -> argparse.ArgumentParser:
     cut_parser.add_argument("--name", default="Director cut",
                             help="Project name written into both timelines")
     cut_parser.set_defaults(func=command_cut)
+
+    transcribe_parser = sub.add_parser("transcribe", help="Transcribe one recording with Muse Voice Transcribe")
+    transcribe_parser.add_argument("--sync", required=True, help="sync.json from director sync")
+    transcribe_parser.add_argument("--words", required=True,
+                                   help="Word-timed Whisper JSON for the audio clip, "
+                                   "in clip-local times (not timeline times)")
+    transcribe_parser.add_argument("--out", default="words.json",
+                                   help="Where to write the timeline words")
+    transcribe_parser.add_argument("--transcript", default=None,
+                                   help="Where to write transcript.json "
+                                   "(default: transcript.json beside --out)")
+    transcribe_parser.add_argument("--audio", default=None,
+                                   help="Audio clip label (default: the reference clip)")
+    transcribe_parser.add_argument("--no-muse", action="store_true",
+                                   help="Shift the Whisper words only, no transcription")
+    transcribe_parser.add_argument("--max-usd", type=float, default=2.0,
+                                   help="Refuse above this estimated transcribe spend")
+    transcribe_parser.set_defaults(func=command_transcribe)
 
     return parser
 

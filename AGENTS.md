@@ -32,7 +32,8 @@ skips is normal.
     one shared timeline in `sync.json`.
   - `reframe.py`: finished 16:9 cut → shot cuts (angles.json or scene detection) → SAM 3.1 person tracks
     (guestlist, optional) → smoothed per-shot crop path → 9:16 `reframe.json` + optional render.
-  - `cut.py`: one command from files or a folder to the whole job (`sync` → words → `grade` → `angles` → timeline export → `reframe` → whole-cut QC) in one output directory, resumable via `cut.json` fingerprints.
+  - `cut.py`: one command from files or a folder to the whole job (`sync` → words → `grade` → `angles` → timeline export → `reframe` → whole-cut QC) in one output directory, resumable via `cut.json` fingerprints. The words stage enriches with Voice Transcribe when available.
+- `transcribe.py`: the production-audio clip → Voice Transcribe turns (16 kHz WAV, silence chunks, speakers reconciled) aligned onto Whisper word times → enriched `words.json` + `transcript.json` (`director transcribe`, the words stage of `director cut`).
   - `export.py`: `angles.json` shots → FCPXML and OTIO timelines through the installed `ghostcut` exporters.
 - `app/` — the Director Mac app: `main.py` (pywebview window), `engine.py` (local server), `muse.py` (Muse edits),
   `render*.py` (re-render accepted edits, verify, promote, revert), `make_demo.py` (timeline from a cut).

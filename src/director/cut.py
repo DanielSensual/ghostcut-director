@@ -22,7 +22,7 @@ import math
 import shutil
 import subprocess
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from ghostcut.config import read_json, write_json
@@ -38,6 +38,7 @@ from . import grade as grade_mod
 from . import reframe as reframe_mod
 from . import sync as sync_mod
 from . import tighten as tighten_mod
+from . import transcribe as transcribe_mod
 from .export import ExportError, export_timelines
 
 MEDIA_EXTENSIONS = {".mov", ".mp4", ".m4v", ".mp3", ".wav", ".m4a"}
@@ -127,6 +128,11 @@ class JobOptions:
     no_tighten: bool = True
     pause_limit_s: float = 0.8
     target_s: float | None = None
+    # Voice Transcribe enrichment of the words stage (TRANSCRIBE-DESIGN.md
+    # §8). no_transcribe defaults False so `director cut` transcribes when
+    # it can; existing callers keep working through the default.
+    no_transcribe: bool = False
+    whisper_model: str = sync_mod.WHISPER_MODEL
 
 
 @dataclass(slots=True)
@@ -227,17 +233,37 @@ def shift_words(words: list[angles_mod.TimedWord],
                 offset_s: float) -> list[angles_mod.TimedWord]:
     """Clip-local to timeline: start and end both move by offset_s. Pure."""
     return [angles_mod.TimedWord(word.text, word.start_s + offset_s,
-                                 word.end_s + offset_s) for word in words]
+                                 word.end_s + offset_s, word.speaker,
+                                 word.heard_by, word.disfluency)
+            for word in words]
 
 
 def words_file_payload(words: list[angles_mod.TimedWord]) -> dict:
-    """{"words": [{"word": text, "start": …, "end": …}, …]} at 3 decimals."""
-    return {"words": [{"word": word.text, "start": round(word.start_s, 3),
-                       "end": round(word.end_s, 3)} for word in words]}
+    """{"words": [{"word": text, "start": …, "end": …}, …]} at 3 decimals.
+
+    Words carrying transcript enrichment gain the optional speaker,
+    heard_by and disfluency keys; plain Whisper words keep the
+    pre-feature shape byte-for-byte.
+    """
+    entries = []
+    for word in words:
+        entry: dict = {"word": word.text, "start": round(word.start_s, 3),
+                       "end": round(word.end_s, 3)}
+        if word.speaker:
+            entry["speaker"] = word.speaker
+        if word.speaker or word.heard_by != "whisper":
+            entry["heard_by"] = word.heard_by
+        if word.disfluency:
+            entry["disfluency"] = True
+        entries.append(entry)
+    return {"words": entries}
 
 
-def mlx_whisper_command(clip_path: Path, out_dir: Path) -> list[str]:
-    return ["mlx_whisper", str(clip_path), "--output-format", "json",
+def mlx_whisper_command(clip_path: Path, out_dir: Path,
+                        whisper_model: str = sync_mod.WHISPER_MODEL
+                        ) -> list[str]:
+    return ["mlx_whisper", str(clip_path), "--model", whisper_model,
+            "--output-format", "json",
             "--output-dir", str(out_dir), "--word-timestamps", "True",
             "--verbose", "False"]
 
@@ -295,13 +321,17 @@ def resolve_words(*, audio_label: str, audio_clip: dict,
         if words:
             return _shift_and_write(words), "sync_cache", warnings
         warnings.append(f"words_empty_candidate:{cached.name}")
-    if shutil.which("mlx_whisper") is not None:
+    whisper_on_path = shutil.which("mlx_whisper") is not None
+    no_gpu = whisper_on_path and not sync_mod.metal_visible()
+    if whisper_on_path and not no_gpu:
         dest_dir = out_dir / "transcripts"
         dest_dir.mkdir(parents=True, exist_ok=True)
         target = dest_dir / f"{stem}.json"
         try:
-            done = subprocess.run(mlx_whisper_command(clip_path, dest_dir),
-                                  capture_output=True, timeout=WHISPER_TIMEOUT_S)
+            done = subprocess.run(
+                mlx_whisper_command(clip_path, dest_dir,
+                                    options.whisper_model),
+                capture_output=True, timeout=WHISPER_TIMEOUT_S)
             produced = done.returncode == 0
         except (subprocess.SubprocessError, OSError):
             produced = False
@@ -315,9 +345,18 @@ def resolve_words(*, audio_label: str, audio_clip: dict,
             if words:
                 return _shift_and_write(words), "mlx_whisper", warnings
         warnings.append(f"words_mlx_whisper_failed:{clip_path.name}")
+    elif no_gpu:
+        # MLX aborts the process without a visible GPU; never run it blind.
+        warnings.append(f"words_no_gpu_visible:{clip_path.name}")
+    if no_gpu:
+        reason = "no GPU visible for mlx_whisper"
+    elif whisper_on_path:
+        reason = f"mlx_whisper failed for {clip_path.name}"
+    else:
+        reason = "mlx_whisper is not on PATH; install mlx-whisper"
     raise CutError(
         f"words: no word-timed transcript for clip {audio_label} "
-        f"({clip_path.name}) and mlx_whisper is not on PATH; install mlx-whisper, "
+        f"({clip_path.name}) and {reason}, "
         "or pass --words WORDS.json, or --transcripts DIR",
         stage_warnings=warnings)
 
@@ -679,7 +718,9 @@ def run(*, clips: list[Path], out_dir: Path,
         no_qc: bool, max_usd: float, force: bool,
         project_name: str, no_tighten: bool = True,
         pause_limit_s: float = 0.8,
-        target_s: float | None = None) -> dict:
+        target_s: float | None = None,
+        no_transcribe: bool = False,
+        whisper_model: str = sync_mod.WHISPER_MODEL) -> dict:
     """One job: discover → sync → words → tighten → grade → angles → … → qc.
 
     The tighten stage runs unless no_tighten (the CLI enables it unless
@@ -703,7 +744,8 @@ def run(*, clips: list[Path], out_dir: Path,
         no_vertical=no_vertical, no_sam=no_sam, no_export=no_export,
         no_qc=no_qc, max_usd=max_usd, force=force, project_name=project_name,
         no_tighten=no_tighten, pause_limit_s=pause_limit_s,
-        target_s=target_s)
+        target_s=target_s, no_transcribe=no_transcribe,
+        whisper_model=whisper_model)
     graded = not no_grade
     tightened = not no_tighten
 
@@ -793,7 +835,8 @@ def run(*, clips: list[Path], out_dir: Path,
                 "sync",
                 {"methods": options.methods,
                  "reference": str(options.reference_path)
-                 if options.reference_path is not None else None},
+                 if options.reference_path is not None else None,
+                 "whisper_model": options.whisper_model},
                 list(options.clips))
         if stage == "words":
             assert sync_payload is not None
@@ -805,7 +848,12 @@ def run(*, clips: list[Path], out_dir: Path,
             elif options.transcripts_dir is not None:
                 stem = Path(str(cam.get("path") or "")).stem
                 files.append(Path(options.transcripts_dir) / f"{stem}.json")
-            return stage_fingerprint("words", {"audio": label}, files)
+            return stage_fingerprint(
+                "words",
+                {"audio": label, "no_transcribe": options.no_transcribe,
+                 "no_muse": options.no_muse,
+                 "whisper_model": options.whisper_model},
+                files)
         if stage == "tighten":
             assert audio_section is not None and words_file_current is not None
             return stage_fingerprint(
@@ -873,6 +921,13 @@ def run(*, clips: list[Path], out_dir: Path,
             recount = angles_mod.load_timed_words(words_file)
             audio_section = dict(previous_audio)
             audio_section["words"] = len(recount)
+            if not isinstance(audio_section.get("transcribe"), dict):
+                audio_section["transcribe"] = {
+                    "method": "whisper",
+                    "model": transcribe_mod.TRANSCRIBE_MODEL,
+                    "spend_usd": 0.0, "transcript_file": None,
+                    "speakers": [], "chunks": 0, "matched_share": None,
+                    "muse_only": 0, "whisper_only": 0}
             words_file_current = words_file
         elif stage == "tighten":
             loaded = read_json(out_dir / "tighten.json")
@@ -928,7 +983,8 @@ def run(*, clips: list[Path], out_dir: Path,
             payload = sync_mod.run(
                 clip_paths=list(options.clips), reference_path=options.reference_path,
                 methods=list(options.methods), transcripts_dir=options.transcripts_dir,
-                out_path=out_dir / "sync.json")
+                out_path=out_dir / "sync.json",
+                whisper_model=options.whisper_model)
             sync_payload = payload
             stage_warnings = [f"{clip.get('label')}: {note}"
                               for clip in payload.get("clips", [])
@@ -944,19 +1000,89 @@ def run(*, clips: list[Path], out_dir: Path,
             assert validated, "words: resolved words file has no words"
             offset = float(clip.get("offset_s") or 0.0)
             shift = 0.0 if source == "explicit" else offset
+            cam = clip.get("camera") or {}
+            clip_path = str(cam.get("path") or "")
+            duration = float(cam.get("duration_s") or 0.0)
+            outputs = [] if source == "explicit" else ["words.json"]
+            words_spend = 0.0
+            eligible = (source != "explicit" and not options.no_muse
+                        and not options.no_transcribe
+                        and bool(cam.get("has_audio")))
+            if not eligible:
+                transcribe_record: dict = {
+                    "method": "skipped", "model": None, "spend_usd": 0.0,
+                    "transcript_file": None, "speakers": [], "chunks": 0,
+                    "matched_share": None, "muse_only": 0, "whisper_only": 0}
+                (out_dir / "transcript.json").unlink(missing_ok=True)
+            else:
+                remaining = max(0.0, options.max_usd - spent_usd)
+                clip_local = shift_words(validated, -offset)
+                try:
+                    transcribed = transcribe_mod.transcribe_audio_clip(
+                        clip_path=Path(clip_path),
+                        whisper_words=clip_local,
+                        duration_s=duration,
+                        work_dir=out_dir / "transcribe",
+                        max_usd=remaining)
+                except transcribe_mod.TranscribeError as exc:
+                    transcribed = transcribe_mod.TranscribeResult(
+                        method="whisper", words=clip_local, turns=[],
+                        speakers=[], chunks=[], stats=None, spend_usd=0.0,
+                        warnings=[f"transcribe_failed:TranscribeError: {exc}"])
+                if transcribed.method == "muse":
+                    shifted = shift_words(transcribed.words, offset)
+                    write_json(out_dir / "words.json",
+                               words_file_payload(shifted))
+                    shifted_result = replace(
+                        transcribed, words=shifted,
+                        turns=[replace(turn, start_s=turn.start_s + offset,
+                                       end_s=turn.end_s + offset)
+                               for turn in transcribed.turns])
+                    write_json(out_dir / "transcript.json",
+                               transcribe_mod.build_transcript_payload(
+                                   audio_label=label, clip_path=clip_path,
+                                   offset_s=offset, duration_s=duration,
+                                   result=shifted_result))
+                    outputs = ["words.json", "transcript.json"]
+                    words_spend = transcribed.spend_usd
+                    validated = shifted
+                    stats = transcribed.stats
+                    transcribe_record = {
+                        "method": "muse",
+                        "model": transcribe_mod.TRANSCRIBE_MODEL,
+                        "spend_usd": round(words_spend, 4),
+                        "transcript_file": "transcript.json",
+                        "speakers": [entry["id"]
+                                     for entry in transcribed.speakers],
+                        "chunks": len(transcribed.chunks),
+                        "matched_share": (round(stats.matched_share, 4)
+                                          if stats is not None else None),
+                        "muse_only": stats.muse_only if stats is not None else 0,
+                        "whisper_only": (stats.whisper_only
+                                         if stats is not None else 0)}
+                else:
+                    (out_dir / "transcript.json").unlink(missing_ok=True)
+                    transcribe_record = {
+                        "method": "whisper",
+                        "model": transcribe_mod.TRANSCRIBE_MODEL,
+                        "spend_usd": 0.0, "transcript_file": None,
+                        "speakers": [], "chunks": 0, "matched_share": None,
+                        "muse_only": 0, "whisper_only": 0}
+                stage_warnings.extend(transcribed.warnings)
+            spent_usd += words_spend
             audio_section = {
                 "label": label,
-                "clip_path": str((clip.get("camera") or {}).get("path") or ""),
+                "clip_path": clip_path,
                 "offset_s": round(offset, 3),
                 "words_source": source,
                 "words_file": str(words_file) if source == "explicit" else "words.json",
                 "words": len(validated),
                 "words_shifted_s": round(shift, 3),
+                "transcribe": transcribe_record,
             }
             words_file_current = words_file
-            outputs = [] if source == "explicit" else ["words.json"]
             records["words"] = StageRecord("words", "done", fingerprint, outputs,
-                                           0.0, stage_warnings, None)
+                                           words_spend, stage_warnings, None)
         elif stage == "tighten":
             assert audio_section is not None and words_file_current is not None
             try:
