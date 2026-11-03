@@ -55,6 +55,11 @@ GUIDE_EXTRA_S = 0.5
 GUIDE_R_TOLERANCE = 0.02
 # mlx_whisper's own default is whisper-tiny, too loose for word edges that place cuts.
 WHISPER_MODEL = os.environ.get("DIRECTOR_WHISPER_MODEL", "mlx-community/whisper-large-v3-turbo")
+# On long recordings with silent stretches (a recorder rolling before the cameras) Whisper invents
+# "Thank you." in the silence and then loops on its own text. Measured 2026-11-03 on a 28-minute lav
+# file with a 15-minute silent lead-in: 70 segments, 45 invented; with these, 2,361 real words.
+WHISPER_GUARD_ARGS = ("--condition-on-previous-text", "False",
+                      "--hallucination-silence-threshold", "2")
 WHISPER_PHRASE_WORDS = 3
 WHISPER_CLUSTER_S = 0.3
 WHISPER_MIN_MOMENTS = 2
@@ -826,7 +831,7 @@ def get_transcript_words(clip: CameraInfo, transcripts_dir: Path | None,
         done = subprocess.run(
             ["mlx_whisper", clip.path, "--model", whisper_model, "--output-format", "json",
              "--output-dir", str(cache_dir), "--word-timestamps", "True",
-             "--verbose", "False"],
+             *WHISPER_GUARD_ARGS, "--verbose", "False"],
             capture_output=True, timeout=3600)
     except Exception:
         return []

@@ -325,7 +325,8 @@ class ResolveWordsTests(unittest.TestCase):
             ["mlx_whisper", "/media/a.mp4", "--model", WHISPER_MODEL,
              "--output-format", "json",
              "--output-dir", "/out", "--word-timestamps", "True",
-             "--verbose", "False"])
+             "--condition-on-previous-text", "False",
+             "--hallucination-silence-threshold", "2", "--verbose", "False"])
         self.assertIn("--model", mlx_whisper_command(
             Path("/media/a.mp4"), Path("/out"), "custom-model"))
         self.assertIn("custom-model", mlx_whisper_command(

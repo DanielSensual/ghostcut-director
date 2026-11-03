@@ -265,7 +265,7 @@ def mlx_whisper_command(clip_path: Path, out_dir: Path,
     return ["mlx_whisper", str(clip_path), "--model", whisper_model,
             "--output-format", "json",
             "--output-dir", str(out_dir), "--word-timestamps", "True",
-            "--verbose", "False"]
+            *sync_mod.WHISPER_GUARD_ARGS, "--verbose", "False"]
 
 
 def _tolerant_word_load(path: Path) -> list[angles_mod.TimedWord]:
