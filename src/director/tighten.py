@@ -17,7 +17,7 @@ from __future__ import annotations
 import difflib
 import math
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from ghostcut.config import read_json
@@ -942,10 +942,18 @@ def run(*, sync_path: Path, words_path: Path, out_path: Path,
                     range(len(beats_all), len(beats_all) + len(beats)))
                 beats_all.extend(beats)
 
-            covered = (video is not None and video.offset_s is not None
-                       and video.offset_s <= window.start_s + 1e-9
-                       and window.end_s
-                       <= video.offset_s + video.duration_s + 1e-9)
+            # Coverage is judged on the words in the window, not its 1 s pads: speech
+            # that runs to the end of a clip would otherwise never reach Spark. The
+            # window is then clipped to the video so picture and sound start together.
+            covered = False
+            if (video is not None and video.offset_s is not None and owned):
+                video_end = video.offset_s + video.duration_s
+                covered = (video.offset_s <= owned[0].start_s + 1e-9
+                           and max(u.end_s for u in owned) <= video_end + 1e-9)
+                if covered:
+                    window = replace(window,
+                                     start_s=max(window.start_s, video.offset_s),
+                                     end_s=min(window.end_s, video_end))
             if muse_dead or video is None or not covered:
                 _use_rule()
                 any_rule = True

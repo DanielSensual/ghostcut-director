@@ -305,6 +305,33 @@ class VerifyTests(unittest.TestCase):
         self.assertEqual(payload["method"], "rule")
         self.assertEqual(payload["spend_usd"], 0.5)
 
+    def test_speech_to_the_clip_end_still_reaches_spark(self) -> None:
+        # Live test 2026-11-03: talk ran to the end of a 180 s clip, the window's
+        # 1 s tail pad overran the video, and every window fell back to the rule.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            sync = _write_sync(
+                tmp_path / "sync.json",
+                [_sync_clip("A", str(tmp_path / "a.mp4"), 0.0, duration=2.3)],
+                str(tmp_path / "a.mp4"))
+            words = _write_words(
+                tmp_path / "words.json",
+                [_w("hello", 1.0, 1.4), _w("there.", 1.5, 2.0)])
+            commands: list[list[str]] = []
+            reply = types.SimpleNamespace(data="garbage", usd=0.0, cached=False)
+            with _fake_guestlist(reply) as calls, \
+                    mock.patch.object(tighten_mod, "make_window_proxy",
+                                      commands.append):
+                payload = tighten_mod.run(
+                    sync_path=sync, words_path=words,
+                    out_path=tmp_path / "tighten.json",
+                    audio_label="A", pause_limit_s=0.8, target_s=None,
+                    model="muse-spark-1.3", no_muse=False, max_usd=5.0)
+        self.assertNotIn("tighten_window_no_video:0", payload["warnings"])
+        self.assertTrue(any(call[0] == "video_json" for call in calls))
+        duration = float(commands[0][commands[0].index("-t") + 1])
+        self.assertLessEqual(duration, 2.3 + 1e-6)
+
 
 class RuleTests(unittest.TestCase):
     def test_rule_beats_keeps_last_full_pass(self) -> None:
