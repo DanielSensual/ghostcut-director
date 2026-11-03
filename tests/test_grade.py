@@ -164,6 +164,12 @@ class CubeTests(unittest.TestCase):
                 f"DOMAIN_MIN 0.000000 0.000000 0.000000\n"
                 f"DOMAIN_MAX {domain_max:.6f} {domain_max:.6f} {domain_max:.6f}\n{rows}\n")
 
+    def test_parse_accepts_tab_separated_keywords(self) -> None:
+        # DJI's D-Log cube (made in Resolve): "# comments", a blank line, then "LUT_3D_SIZE\t33".
+        rows = "\n".join("0.0066 0.0071 0.0066" for _ in range(8))
+        cube = parse_cube(f"# DaVinci Resolve Cube (3D LUT).\n#\n\nLUT_3D_SIZE\t2\n\n{rows}\n", source="dji")
+        self.assertEqual(cube.size, 2)
+
     def test_parse_rejections(self) -> None:
         tiny = self._small()
         with self.assertRaises(ValueError):

@@ -332,7 +332,8 @@ def parse_cube(text: str, source: str = "<cube>") -> Cube:
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        head, _, rest = line.partition(" ")
+        # Any whitespace separates a keyword from its value: Resolve-made cubes (DJI's) use a tab.
+        head, _, rest = line.replace("\t", " ").partition(" ")
         key = head.strip().upper()
         if key == "TITLE":
             if rows:
