@@ -498,6 +498,9 @@ def _compute_covers(sync: dict, words: list,
             label=str(item.get("label") or ""),
             path=str(cam.get("path") or ""),
             offset_s=None if offset is None else float(offset),
+            fps=float(cam.get("fps") or 0.0),
+            width=int(cam.get("width") or 0),
+            height=int(cam.get("height") or 0),
             duration_s=float(cam.get("duration_s") or 0.0)))
     placed = sorted({c.label for c in clips
                      if c.label and c.offset_s is not None})

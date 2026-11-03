@@ -436,3 +436,49 @@ Live test: TBD (the owner fills this from the real-footage run).
   master, -14.0 LUFS (target -14), 0 assets, $0.00 provider`; an
   independent loudnorm re-measure of the remuxed `cut.mp4` read
   −14.02 LUFS integrated, −12.92 dBTP, picture untouched.
+
+# Build log: `director demo` (2026-11-03)
+
+| Step | By | What |
+|---|---|---|
+| Brief | Project owner, with Claude Code | `DEMO-BRIEF.md`: try it in one command, no footage needed. |
+| Build | Meta **Muse Code** on **`muse-spark-1.3`** | `src/director/demo.py`, the `demo` command in `cli.py`, `tests/test_demo.py` (25 tests), the CI step, plus the two pipeline fixes below. Built straight from the brief (no separate design step). |
+| Code review and live test | Claude Code, piloted by the owner | Real footage, below. |
+
+Muse Code token use: TBD (the owner fills this from the run log).
+Live test: TBD (the owner fills this from the real-footage run).
+
+## Build notes (Muse Code)
+
+- Layout: `<out-dir>/shoot/` holds the four clips plus `demo-words.json`, `script.txt` and
+  `demo-shoot.json`; `<out-dir>/job/` holds the real `director cut` job (the shoot cannot live
+  inside the job directory: `cut` drops anything under its own output from discovery).
+  `demo.json` at the root records the checks beside the printed report.
+- The 58-word script is eight utterances, all under the 6 s utterance split, with the restart as
+  utterance 2 carrying no terminal period; the rule fallback removes exactly it (5.2 s of words,
+  ~6.2 s out with the half-pauses), verified in `test_demo.py` against `rule_beats` directly.
+- `say`/espeak voices are fitted to the planned grid proportionally per run (real word times come
+  from local Whisper when it can run); the tone stand-in is sample-exact. A backend that errors or
+  renders under 5 s of audio is skipped with a printed note — a sandboxed `say` exits 0 with an
+  empty file — and `--keep` probes one spoken word first so it reuses a tone shoot instead of
+  rebuilding one every run.
+- Words pass to `cut` as explicit `--words` (timeline times; the lav is the reference at 0) only
+  when local Whisper cannot run; when it can, the pipeline transcribes, retrying with the script
+  timings if the words stage fails. The removal check is gated only on the deterministic path
+  (script words, offline); with live Whisper words or `--muse` the take choice is reported, not
+  gated.
+- Two pipeline defects the demo exposed, fixed in this build:
+  - `angles.covers` counted audio-only clips as covering cameras, so any job with a lav reference
+    opened on the lav and the render failed ("Stream map '' matches no streams"). Covering now
+    needs picture (`width > 0`), matching `tighten`'s own convention; `voice._compute_covers`
+    passes widths through (its two failures caught this).
+  - Tightened audio rendered one AAC part per kept span and stream-copy joined them, stacking
+    ~21 ms of encoder priming per span: the decoded cut ran ~0.2 s long on the demo and `finish`
+    failed its mux check on any cut with more than a few spans. Parts are PCM now and the final
+    join encodes AAC once, like the un-tightened path; `test_audio_part_command` pins the
+    corrected command and the synthetic render test asserts decoded length.
+- Full suite: 608 tests, green except the same 11 pre-existing `ps`-sandbox errors in
+  `tests/test_engine_render.py` and `tests/test_render_runner.py`.
+- By hand: `director demo --out-dir /tmp/director-demo-check` reports PASS (offsets +1.000/+4.000
+  exact by waveform, the silent camera clearly unplaced, 6.2 s removed, all nine stages done,
+  finish at −14.0 LUFS). Frames checked per camera: labels render, pictures differ.

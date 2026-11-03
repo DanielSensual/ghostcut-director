@@ -91,6 +91,17 @@ class CoverageTests(unittest.TestCase):
         self.assertTrue(covers(_clip("C", 10.0, 2.0), line))
         self.assertTrue(covers(_clip("D", 0.0, 12.0), line))
 
+    def test_audio_only_clip_never_covers(self) -> None:
+        line = _line(0, 10.0, 12.0, [])
+        lav = SyncClip(label="A", path="/media/lav.wav", offset_s=0.0,
+                       fps=0.0, width=0, height=0, duration_s=100.0)
+        self.assertFalse(covers(lav, line))
+        self.assertEqual(
+            [c.label for c in covering([lav, _clip("B", 0.0, 100.0)], line)],
+            ["B"])
+        self.assertEqual(rule_pick_for(line, [lav, _clip("B", 0.0, 100.0)],
+                                       "A"), "B")
+
     def test_cut_points_sit_between_words(self) -> None:
         words = [_word("hello", 0.0, 0.4), _word("world.", 0.5, 0.9),
                  _word("next", 1.5, 1.8), _word("line", 1.9, 2.2)]
