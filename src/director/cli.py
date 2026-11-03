@@ -665,6 +665,7 @@ def command_cut(args: argparse.Namespace) -> dict:
             no_transcribe=bool(args.no_transcribe),
             whisper_model=args.whisper_model,
             lut_patterns=list(args.lut or []),
+            grade_reference=args.grade_reference,
             no_finish=bool(args.no_finish),
             finish_sound=bool(args.finish_sound),
             finish_isolate=bool(args.finish_isolate),
@@ -959,6 +960,9 @@ def build_parser() -> argparse.ArgumentParser:
                             help="Directory of per-clip word-timed Whisper JSON transcripts")
     cut_parser.add_argument("--methods", default=None,
                             help="Subset of timecode,clock,waveform,flash,whisper")
+    cut_parser.add_argument("--grade-reference", default=None, metavar="PATTERN",
+                            help="Match every camera's colour to this one (file name glob), "
+                                 "e.g. 'DJI_*' (default: the first camera)")
     cut_parser.add_argument("--lut", action="append", default=[], metavar="PATTERN=CUBE",
                             help="Supplied .cube for clips whose file name matches PATTERN "
                                  "(repeatable), e.g. 'DJI_*=dlog.cube' for DJI D-Log footage")

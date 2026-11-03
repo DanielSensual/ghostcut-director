@@ -146,6 +146,8 @@ class JobOptions:
     # --lut PATTERN=CUBE entries: a supplied .cube for every clip whose file name (or path)
     # matches PATTERN, for cameras Director can't read (DJI D-Log, Apple Log, ...).
     lut_patterns: list[str] = field(default_factory=list)
+    # --grade-reference PATTERN: the camera (by file name) every other camera is matched to.
+    grade_reference: str | None = None
     # Burned-in captions (CAPTIONS-BRIEF.md). no_captions defaults True so
     # existing programmatic callers keep their old job; the CLI passes
     # False unless --no-captions, so `director cut` captions by default.
@@ -868,6 +870,7 @@ def run(*, clips: list[Path], out_dir: Path,
         finish_isolate: bool = False, finish_loudness: float | None = None,
         max_provider_usd: float = 2.00,
         lut_patterns: list[str] | None = None,
+        grade_reference: str | None = None,
         no_captions: bool = True, captions_preset: str = "house",
         captions_horizontal: bool = False, title: str | None = None,
         no_title: bool = False, fonts_dir: str | None = None) -> dict:
@@ -903,6 +906,7 @@ def run(*, clips: list[Path], out_dir: Path,
         finish_sound=finish_sound, finish_isolate=finish_isolate,
         finish_loudness=finish_loudness, max_provider_usd=max_provider_usd,
         lut_patterns=list(lut_patterns or []),
+        grade_reference=grade_reference,
         no_captions=no_captions, captions_preset=captions_preset,
         captions_horizontal=captions_horizontal, title=title,
         no_title=no_title, fonts_dir=fonts_dir)
@@ -1004,6 +1008,20 @@ def run(*, clips: list[Path], out_dir: Path,
 
     luts = match_luts(list(options.lut_patterns), list(options.clips))
 
+    def _grade_reference_label() -> str | None:
+        """--grade-reference PATTERN as the sync label of the one camera it names."""
+        if not options.grade_reference or sync_payload is None:
+            return None
+        pattern = options.grade_reference.lower()
+        hits = [clip.get("label") for clip in sync_payload.get("clips", [])
+                if fnmatch.fnmatch(Path(str((clip.get("camera") or {}).get("path") or ""))
+                                   .name.lower(), pattern)
+                and float((clip.get("camera") or {}).get("width") or 0) > 0]
+        if len(hits) != 1:
+            raise CutError(f"--grade-reference {options.grade_reference!r} must name exactly "
+                           f"one camera; it matched {len(hits)}")
+        return str(hits[0])
+
     def _grade_lut_specs() -> tuple[str, ...]:
         """Supplied cubes as grade's LABEL=PATH, once sync has named the clips."""
         if not luts or sync_payload is None:
@@ -1056,7 +1074,8 @@ def run(*, clips: list[Path], out_dir: Path,
                 {"reference_label": None,
                  "check": bool(options.grade_check and not options.no_muse),
                  "model": options.model, "no_match": False,
-                 "luts": sorted(options.lut_patterns)},
+                 "luts": sorted(options.lut_patterns),
+                 "grade_reference": options.grade_reference},
                 [out_dir / "sync.json"] + sorted(set(luts.values())))
         if stage == "angles":
             assert audio_section is not None and words_file_current is not None
@@ -1376,7 +1395,8 @@ def run(*, clips: list[Path], out_dir: Path,
                 _trailing_gate("grade")
             payload = grade_mod.run(
                 sync_path=out_dir / "sync.json", out_path=out_dir / "grade.json",
-                reference_label=None, lut_specs=_grade_lut_specs(), no_match=False,
+                reference_label=_grade_reference_label(), lut_specs=_grade_lut_specs(),
+                no_match=False,
                 check=do_check, model=options.model)
             grade_payload = payload
             spend = _spend_of(payload)
