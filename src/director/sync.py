@@ -11,11 +11,13 @@ first sample sits on the timeline, so clip time `t` is timeline time
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import re
 import shutil
 import subprocess
+import sys
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -762,6 +764,31 @@ def load_transcript_words(path: Path) -> list[TranscriptWord]:
     return out
 
 
+def metal_visible() -> bool:
+    """Whether this process can see a Metal GPU, asked the way MLX asks (MTLCopyAllDevices).
+
+    Inside a sandbox that hides the GPU the list is empty, and MLX indexes it anyway and aborts:
+    mlx_whisper dies and macOS shows a crash dialog. This check cannot crash.
+    """
+    if sys.platform != "darwin":
+        return False
+    try:
+        metal = ctypes.CDLL("/System/Library/Frameworks/Metal.framework/Metal")
+        cf = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+        metal.MTLCopyAllDevices.restype = ctypes.c_void_p
+        cf.CFArrayGetCount.argtypes = [ctypes.c_void_p]
+        cf.CFArrayGetCount.restype = ctypes.c_long
+        cf.CFRelease.argtypes = [ctypes.c_void_p]
+        devices = metal.MTLCopyAllDevices()
+        if not devices:
+            return False
+        count = cf.CFArrayGetCount(devices)
+        cf.CFRelease(devices)
+        return count > 0
+    except (OSError, AttributeError):
+        return False
+
+
 def get_transcript_words(clip: CameraInfo, transcripts_dir: Path | None,
                          cache_dir: Path) -> list[TranscriptWord]:
     """Words for one clip: `--transcripts`, the run cache, or local mlx_whisper."""
@@ -775,7 +802,7 @@ def get_transcript_words(clip: CameraInfo, transcripts_dir: Path | None,
             return load_transcript_words(cached)
     except OSError:
         pass
-    if shutil.which("mlx_whisper") is None:
+    if shutil.which("mlx_whisper") is None or not metal_visible():
         return []
     cache_dir.mkdir(parents=True, exist_ok=True)
     try:
