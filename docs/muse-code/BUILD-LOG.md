@@ -130,7 +130,21 @@ waveform → whisper → lips → flash → timecode → clock, and a lips place
 warnings (which is also how it reaches `cut.json`). Touched `src/director/sync.py`, the new
 `src/director/lips_helper.swift`, `tests/test_sync.py`, this section and one README line.
 
-Muse Code token use: TBD (the owner fills this from the run log).
+Muse Code token use: 65 calls; 9.07M input (8.84M cached) + 80k output on muse-spark-1.3.
+
+### Live test (2026-11-03, Claude Code, the owner's shoot)
+
+A lav recorder (28:35, reference A), the A7S III facing the speaker (B), and a Mavic 3 at 45° with no audio, in
+D-Log with the DJI cube supplied (C). The drone's clock disagreed with the camera's by 476 s.
+
+- B by waveform at +899.146 s (r 0.979). Its lips-vs-audio cross-check read +899.215 s (ratio 1.17): mouths move
+  ~70 ms before the sound, a steady bias, which is why lips-vs-audio only cross-checks.
+- **C placed by lips-vs-lips against B at +895.408 s, ratio 5.86** (r 0.926 over 104 s). Its lips-vs-audio estimates
+  read +895.475 to +895.478 s (ratios 1.15–1.28); minus the 69 ms bias measured on B they land at +895.409 s, 1 ms from
+  the lips-vs-lips placement.
+- 21.6 minutes of wall time for the two cameras (300 s each, full-resolution crops of 5.1K HEVC).
+- Fixed by Claude Code after the run: supplied cubes were keyed by label only; `sync.run` now also accepts clip
+  paths, and `director cut --lut PATTERN=CUBE` feeds them.
 
 # Build log: `director reframe` (2026-11-02)
 
