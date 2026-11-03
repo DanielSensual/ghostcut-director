@@ -69,7 +69,7 @@ TITLE_GRADIENT_ALPHA = 150
 TITLE_WINDOW_S = 60.0
 TITLE_MIN_WORDS = 5
 TITLE_MAX_WORDS = 8
-TITLE_MAX_OUTPUT_TOKENS = 300
+TITLE_MAX_OUTPUT_TOKENS = 4000  # Spark reasons before it answers: 300 ran out at 298 reasoning tokens
 SPARK_TOKEN_RATES_USD_PER_1M = {
     "muse-spark-1.3": (1.25, 4.25),
     "muse-wonder-1.0": (4.00, 20.00),

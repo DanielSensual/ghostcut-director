@@ -338,6 +338,10 @@ def parse_sony_sidecar(path: Path | None) -> SonySidecar:
             elif name == "CaptureGammaEquation" and not out.gamma:
                 raw = elem.get("value") or (elem.text or "")
                 out.gamma = map_gamma(raw)
+            elif (name == "Item" and elem.get("name") == "CaptureGammaEquation"
+                  and not out.gamma):
+                # Real Sony cards: <Item name="CaptureGammaEquation" value="s-log3-cine"/>
+                out.gamma = map_gamma(elem.get("value") or "")
         for table in root.iter():
             if _local(table.tag) != "LtcChangeTable":
                 continue

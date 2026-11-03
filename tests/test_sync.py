@@ -108,6 +108,16 @@ class LtcTests(unittest.TestCase):
             bad = Path(tmp) / "C0002M01.XML"
             bad.write_text("<Sony><unclosed>", encoding="utf-8")
             self.assertEqual(sync.parse_sony_sidecar(bad), SonySidecar())
+            # The shape a real A7S III card writes (C2942M01.XML, 2026-11-03).
+            real = Path(tmp) / "C0003M01.XML"
+            real.write_text(
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                '<NonRealTimeMeta xmlns="urn:schemas-professionalDisc:nonRealTimeMeta:ver.2.20">'
+                '<AcquisitionRecord><Group name="CameraUnitMetadataSet">'
+                '<Item name="CaptureGammaEquation" value="s-log3-cine"/>'
+                '<Item name="CaptureColorPrimaries" value="S-Gamut3.Cine"/>'
+                "</Group></AcquisitionRecord></NonRealTimeMeta>", encoding="utf-8")
+            self.assertEqual(sync.parse_sony_sidecar(real).gamma, "s-log3-cine")
 
 
 class TimecodeTests(unittest.TestCase):
