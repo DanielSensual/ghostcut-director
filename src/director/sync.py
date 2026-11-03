@@ -2,11 +2,11 @@
 
 Each clip started at a different moment, so `director sync` finds where every
 clip sits on one timeline and writes `sync.json`. Several methods each estimate
-a clip's offset (timecode, capture clock, waveform cross-correlation, Whisper
-word matches), then they are checked against each other, because any single
-method can be confidently wrong. Convention: a clip's `offset_s` is where its
-first sample sits on the timeline, so clip time `t` is timeline time
-`t + offset_s`; the reference clip sits at 0.
+a clip's offset (timecode, capture clock, waveform cross-correlation,
+light-flash edges, Whisper word matches), then they are checked against each
+other, because any single method can be confidently wrong. Convention: a clip's
+`offset_s` is where its first sample sits on the timeline, so clip time `t` is
+timeline time `t + offset_s`; the reference clip sits at 0.
 """
 
 from __future__ import annotations
@@ -37,8 +37,9 @@ try:
 except ImportError:  # the director extra is optional
     np = None  # type: ignore[assignment]
 
-METHODS = ("timecode", "clock", "waveform", "whisper")
-PRECISION_S = {"timecode": 0.0, "clock": 2.0, "waveform": 0.002, "whisper": 0.15}
+METHODS = ("timecode", "clock", "waveform", "flash", "whisper")
+PRECISION_S = {"timecode": 0.0, "clock": 2.0, "waveform": 0.002,
+               "flash": 1.0 / 30, "whisper": 0.15}
 CONFIDENCE = {"timecode": 0.5, "clock": 0.2}
 
 SAMPLE_RATE = 8000
@@ -63,6 +64,13 @@ DRIFT_MIN_WINDOWS = 3
 DRIFT_WINDOW_MIN_R = 0.30
 DRIFT_SEARCH_S = 0.25
 DAY_S = 86400.0
+FLASH_WINDOW_S = 120.0
+FLASH_WIDTH = 64
+FLASH_HEIGHT = 64
+FLASH_MIN_Z = 8.0
+FLASH_MIN_STEP = 10.0
+FLASH_MIN_GAP_S = 0.25
+FLASH_GAP_MARGIN_S = 0.05
 
 
 class SyncError(RuntimeError):
@@ -143,6 +151,13 @@ class WaveformPeak:
     margin: float
     overlap_s: float
     clear: bool
+
+
+@dataclass(slots=True)
+class FlashEdge:
+    time_s: float
+    sign: int
+    magnitude: float
 
 
 def _label_for_index(i: int) -> str:
@@ -877,9 +892,234 @@ def whisper_estimate(target: ClipResult, anchor: ClipResult,
     )
 
 
+# ---------------------------------------------------------------- flash
+
+_PTS_TIME_RE = re.compile(r"pts_time:(-?[0-9]+(?:\.[0-9]+)?)")
+
+
+def flash_decode_command(path: Path, window_s: float = FLASH_WINDOW_S) -> list[str]:
+    """Tiny grey proxy on stdout as rawvideo, per-frame times via showinfo."""
+    filt = f"scale={FLASH_WIDTH}:{FLASH_HEIGHT},format=gray,showinfo"
+    return ["ffmpeg", "-v", "info", "-i", str(path), "-t", str(window_s),
+            "-map", "0:v:0", "-vf", filt, "-f", "rawvideo", "pipe:1"]
+
+
+def decode_flash_luma(path: Path,
+                      window_s: float = FLASH_WINDOW_S
+                      ) -> tuple[list[float], list[float]] | None:
+    """Mean luma per frame with real timestamps, or None when unavailable."""
+    if np is None:
+        return None
+    try:
+        done = subprocess.run(flash_decode_command(Path(path), window_s),
+                              capture_output=True, timeout=600)
+    except Exception:
+        return None
+    if done.returncode != 0 or not done.stdout:
+        return None
+    frame_bytes = FLASH_WIDTH * FLASH_HEIGHT
+    n_frames = len(done.stdout) // frame_bytes
+    if n_frames < 2:
+        return None
+    try:
+        stderr = done.stderr.decode("utf-8", errors="replace")
+    except Exception:
+        stderr = ""
+    pts = [float(m) for m in _PTS_TIME_RE.findall(stderr)]
+    if len(pts) == n_frames:
+        t0 = pts[0]
+        times = [p - t0 for p in pts]
+    else:
+        # showinfo parsing failed; fall back to a 30 fps grid so CFR test
+        # clips still work (VFR timing needs the real timestamps above).
+        times = [i / 30.0 for i in range(n_frames)]
+    buf = np.frombuffer(done.stdout[:n_frames * frame_bytes], dtype=np.uint8)
+    try:
+        means = buf.reshape(n_frames, frame_bytes).mean(axis=1)
+    except ValueError:
+        return None
+    return times, [float(v) for v in means]
+
+
+def _median(values: list[float]) -> float:
+    ordered = sorted(values)
+    n = len(ordered)
+    if n == 0:
+        return 0.0
+    mid = n // 2
+    if n % 2:
+        return float(ordered[mid])
+    return (float(ordered[mid - 1]) + float(ordered[mid])) / 2
+
+
+def find_flash_edges(times: list[float], luma: list[float]) -> list[FlashEdge]:
+    """Light-switch steps: large frame-to-frame moves, signed. Pure.
+
+    A step counts when it beats both the clip's own frame-to-frame noise
+    (a robust z-score from the median absolute deviation) and an absolute
+    floor, so clean synthetic clips and noisy rooms both work. Same-sign
+    steps within FLASH_MIN_GAP_S merge into one (the total move, timed at
+    its onset). The edge time is the first frame after the step.
+    """
+    n = min(len(times), len(luma))
+    if n < 2:
+        return []
+    diffs = [float(luma[i + 1]) - float(luma[i]) for i in range(n - 1)]
+    edge_times = [float(times[i + 1]) for i in range(n - 1)]
+    mad = _median([abs(d - _median(diffs)) for d in diffs])
+    sigma = 1.4826 * mad
+    threshold = max(FLASH_MIN_Z * sigma, FLASH_MIN_STEP)
+    candidates: list[FlashEdge] = []
+    for t, d in zip(edge_times, diffs):
+        if abs(d) >= threshold:
+            candidates.append(FlashEdge(t, 1 if d > 0 else -1, abs(d)))
+    merged: list[FlashEdge] = []
+    for edge in candidates:
+        if (merged and edge.sign == merged[-1].sign
+                and edge.time_s - merged[-1].time_s <= FLASH_MIN_GAP_S + 1e-9):
+            merged[-1] = FlashEdge(merged[-1].time_s, merged[-1].sign,
+                                   merged[-1].magnitude + edge.magnitude)
+        else:
+            merged.append(edge)
+    return merged
+
+
+def flash_confidence(n_matched: int) -> float:
+    """More matched edges is more proof; one edge is a hint. Pure."""
+    if n_matched >= 4:
+        return 0.9
+    if n_matched == 3:
+        return 0.85
+    if n_matched == 2:
+        return 0.75
+    return 0.35
+
+
+def match_flash_edges(target_edges: list[FlashEdge], anchor_edges: list[FlashEdge],
+                      tolerance_s: float,
+                      clock_relative_s: float | None = None
+                      ) -> tuple[float, list[tuple[int, int]]] | None:
+    """Best same-sign, same-gap alignment of two edge sequences. Pure.
+
+    Every same-sign pair proposes a candidate offset; the candidate's
+    support is the greedy in-order match within tolerance. Most matched
+    edges wins, then closest to the clock hint, then tightest gaps. Returns
+    the median anchor-minus-target difference and the matched index pairs.
+    """
+    if not target_edges or not anchor_edges:
+        return None
+    seen: set[frozenset[tuple[int, int]]] = set()
+    scored: list[tuple[int, float, float, float,
+                       list[tuple[int, int]]]] = []
+    for t0 in target_edges:
+        for a0 in anchor_edges:
+            if t0.sign != a0.sign:
+                continue
+            candidate = a0.time_s - t0.time_s
+            used: set[int] = set()
+            pairs: list[tuple[int, int]] = []
+            for k, te in enumerate(target_edges):
+                best_j: int | None = None
+                for j, ae in enumerate(anchor_edges):
+                    if j in used or ae.sign != te.sign:
+                        continue
+                    if abs((ae.time_s - te.time_s) - candidate) <= tolerance_s + 1e-9:
+                        best_j = j
+                        break
+                if best_j is not None:
+                    used.add(best_j)
+                    pairs.append((k, best_j))
+            if not pairs:
+                continue
+            key = frozenset(pairs)
+            if key in seen:
+                continue
+            seen.add(key)
+            diffs = sorted(anchor_edges[j].time_s - target_edges[k].time_s
+                           for k, j in pairs)
+            mid = len(diffs) // 2
+            median = diffs[mid] if len(diffs) % 2 else (diffs[mid - 1] + diffs[mid]) / 2
+            gap_err = sum(abs(d - median) for d in diffs) / len(diffs)
+            if clock_relative_s is None:
+                clock_dist = 0.0
+            else:
+                clock_dist = abs(median - clock_relative_s)
+            scored.append((-len(pairs), clock_dist, gap_err, median, pairs))
+    if not scored:
+        return None
+    scored.sort(key=lambda s: (s[0], s[1], s[2]))
+    _neg, _clock, _gap, median, pairs = scored[0]
+    pairs.sort(key=lambda p: p[0])
+    return median, pairs
+
+
+def flash_precision_s(target: ClipResult, anchor: ClipResult) -> float:
+    """One frame of the slower clip, else 1/30. Pure."""
+    frames: list[float] = []
+    for cam in (target.camera, anchor.camera):
+        frames.append(1.0 / cam.fps if cam.fps > 0 else 1.0 / 30)
+    return max(frames)
+
+
+def _get_flash_edges(camera: CameraInfo, flash_cache: dict) -> list[FlashEdge] | None:
+    """Cached edges for one clip; None means no video or undecodable."""
+    key = (camera.path, "flash_edges")
+    if key in flash_cache:
+        return flash_cache[key]
+    if camera.width <= 0 or camera.height <= 0:
+        flash_cache[key] = None
+        return None
+    decoded = decode_flash_luma(Path(camera.path))
+    if decoded is None:
+        flash_cache[key] = None
+        return None
+    times, luma = decoded
+    edges = find_flash_edges(times, luma)
+    flash_cache[key] = edges
+    return edges
+
+
+def flash_estimate(target: ClipResult, anchor: ClipResult, flash_cache: dict, *,
+                   clock_offset_s: float | None = None) -> Estimate | None:
+    """Offset from matched light-switch edges, clock-preferred. Pure apart from decode."""
+    if np is None or anchor.offset_s is None:
+        return None
+    target_edges = _get_flash_edges(target.camera, flash_cache)
+    anchor_edges = _get_flash_edges(anchor.camera, flash_cache)
+    if not target_edges or not anchor_edges:
+        return None
+    precision = flash_precision_s(target, anchor)
+    tolerance = precision + FLASH_GAP_MARGIN_S
+    clock_relative: float | None = None
+    if clock_offset_s is not None:
+        clock_relative = clock_offset_s - anchor.offset_s
+    matched = match_flash_edges(target_edges, anchor_edges, tolerance, clock_relative)
+    if matched is None:
+        return None
+    median, pairs = matched
+    gaps_target = [target_edges[pairs[i + 1][0]].time_s - target_edges[pairs[i][0]].time_s
+                   for i in range(len(pairs) - 1)]
+    gaps_anchor = [anchor_edges[pairs[i + 1][1]].time_s - anchor_edges[pairs[i][1]].time_s
+                   for i in range(len(pairs) - 1)]
+    return Estimate(
+        method="flash", offset_s=anchor.offset_s + median,
+        confidence=flash_confidence(len(pairs)), precision_s=precision,
+        against=anchor.label,
+        detail={"matched_edges": len(pairs),
+                "target_edge_s": [round(target_edges[k].time_s, 3) for k, _j in pairs],
+                "anchor_edge_s": [round(anchor_edges[j].time_s, 3) for _k, j in pairs],
+                "signs": [target_edges[k].sign for k, _j in pairs],
+                "gap_target_s": [round(g, 3) for g in gaps_target],
+                "gap_anchor_s": [round(g, 3) for g in gaps_anchor],
+                "tolerance_s": round(tolerance, 3),
+                "clock_relative_s": (None if clock_relative is None
+                                     else round(clock_relative, 3))},
+    )
+
+
 # ---------------------------------------------------------------- combining
 
-_BACKING_METHODS = ("whisper", "timecode")
+_BACKING_METHODS = ("whisper", "timecode", "flash")
 
 
 def frame_duration_s(target: ClipResult, anchor: ClipResult) -> float:
@@ -959,7 +1199,7 @@ def _waveform_trusted(estimates: list[Estimate],
 
 def choose_pick(estimates: list[Estimate],
                 checks: list[EstimateCheck]) -> tuple[float | None, str | None]:
-    """Waveform, Whisper, timecode, clock, else unplaced. Pure; order is trust."""
+    """Waveform, Whisper, flash, timecode, clock, else unplaced. Pure; order is trust."""
     trusted = _waveform_trusted(estimates, checks)
     if trusted is not None:
         return trusted.offset_s, "waveform"
@@ -967,6 +1207,9 @@ def choose_pick(estimates: list[Estimate],
         if (est.method == "whisper" and est.detail.get("moments", 0) >= WHISPER_MIN_MOMENTS
                 and est.confidence >= WHISPER_MIN_CONFIDENCE):
             return est.offset_s, "whisper"
+    for est in estimates:
+        if est.method == "flash":
+            return est.offset_s, "flash"
     for est in estimates:
         if est.method == "timecode":
             return est.offset_s, "timecode"
@@ -990,9 +1233,12 @@ def attempt_warnings(target: ClipResult, estimates: list[Estimate],
         return warnings
     picked = next((e for e in estimates
                    if e.method == pick_method and e.offset_s == pick_offset), None)
+    if (pick_method == "flash" and picked is not None
+            and picked.detail.get("matched_edges", 0) <= 1):
+        warnings.append("Placed by a single light flash: check by eye.")
     seen: set[tuple[str, str]] = set()
     for est in estimates:
-        if est.method not in ("timecode", "whisper"):
+        if est.method not in ("timecode", "whisper", "flash"):
             continue
         if (est.method, est.against) in seen:
             continue
@@ -1041,6 +1287,7 @@ def attempt_warnings(target: ClipResult, estimates: list[Estimate],
 # ---------------------------------------------------------------- orchestration
 
 WAVEFORM_NO_NUMPY = "Waveform sync unavailable: numpy is not installed."
+FLASH_NO_NUMPY = "Flash sync unavailable: numpy is not installed."
 
 
 def parse_methods(text: str | None) -> list[str]:
@@ -1112,7 +1359,8 @@ def build_payload(results: list[ClipResult], reference_path: str,
 def _attempt_estimates(target: ClipResult, anchor: ClipResult, methods: list[str],
                        envelopes: dict, words: dict[str, list[TranscriptWord]],
                        transcripts_dir: Path | None, cache_dir: Path,
-                       whisper_model: str) -> list[Estimate]:
+                       whisper_model: str = WHISPER_MODEL,
+                       flash_cache: dict | None = None) -> list[Estimate]:
     """One anchor's estimates in canonical method order."""
     estimates: list[Estimate] = []
     if "timecode" in methods:
@@ -1125,6 +1373,12 @@ def _attempt_estimates(target: ClipResult, anchor: ClipResult, methods: list[str
             estimates.append(est)
     if "waveform" in methods and np is not None:
         est = waveform_estimate(target, anchor, envelopes)
+        if est is not None:
+            estimates.append(est)
+    if "flash" in methods and np is not None:
+        cache = flash_cache if flash_cache is not None else {}
+        clock_hint = next((e.offset_s for e in estimates if e.method == "clock"), None)
+        est = flash_estimate(target, anchor, cache, clock_offset_s=clock_hint)
         if est is not None:
             estimates.append(est)
     if "whisper" in methods:
@@ -1178,6 +1432,7 @@ def run(*, clip_paths: list[Path], reference_path: Path | None,
     results = [reference]
     envelopes: dict = {}
     words: dict[str, list[TranscriptWord]] = {}
+    flash_cache: dict = {}
     out_path = Path(out_path)
     cache_dir = out_path.parent / "sync-transcripts"
     order_of = {labels[i]: i for i in range(len(paths))}
@@ -1194,7 +1449,7 @@ def run(*, clip_paths: list[Path], reference_path: Path | None,
         for anchor in anchors:
             estimates = _attempt_estimates(target, anchor, methods, envelopes,
                                            words, transcripts_dir, cache_dir,
-                                           whisper_model)
+                                           whisper_model, flash_cache)
             frame_s = frame_duration_s(target, anchor)
             global_wave = next((e for e in estimates if e.method == "waveform"), None)
             whispers = [e for e in estimates if e.method == "whisper"]
@@ -1268,6 +1523,28 @@ def run(*, clip_paths: list[Path], reference_path: Path | None,
                 and not any(e.method == "waveform" for e in union)):
             target.warnings.append(
                 f"Clip {target.label} has no audio: waveform sync skipped.")
+        if "flash" in methods and np is None:
+            target.warnings.append(FLASH_NO_NUMPY)
+        elif ("flash" in methods and target.camera.width <= 0
+                and not any(e.method == "flash" for e in union)):
+            target.warnings.append(
+                f"Clip {target.label} has no video: flash sync skipped.")
+        has_flash = any(e.method == "flash" for e in union)
+        if not target.camera.has_audio and not has_flash:
+            if pick_method == "clock":
+                target.warnings.append(
+                    f"Clip {target.label} has no audio and no light flash was found: "
+                    "placed by capture clock only (±2 s); "
+                    "lip sync on its shots will be off.")
+            elif pick_method == "timecode":
+                target.warnings.append(
+                    f"Clip {target.label} has no audio and no light flash was found: "
+                    "placed by timecode only (right only if the cameras were jammed); "
+                    "lip sync on its shots will be off.")
+            elif pick_method is None:
+                target.warnings.append(
+                    f"Clip {target.label} has no audio and no light flash was found: "
+                    "could not be placed on the timeline.")
         if ("whisper" in methods
                 and not any(e.method == "whisper" for e in union)
                 and not words.get(target.camera.path)

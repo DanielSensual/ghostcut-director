@@ -31,7 +31,7 @@ The same stages `director cut` runs, one command at a time. File names below are
 director sync a-cam.mp4 b-cam.mp4 lav.mp3 --out sync.json
 ```
 
-Places every clip on one shared timeline (`sync.json`) from timecode, capture-clock, waveform and Whisper offsets, checked against each other.
+Places every clip on one shared timeline (`sync.json`) from timecode, capture-clock, waveform, light-flash and Whisper offsets, checked against each other.
 
 ```bash
 director grade --sync sync.json --out grade.json
