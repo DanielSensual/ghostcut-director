@@ -584,3 +584,48 @@ Live test: TBD (the owner fills this from the real-footage run).
   match predicted to 0.001) and confirms the premise: frontal skin
   already agrees (B 0.34 vs C 0.28) while the whole-frame gains overshoot
   it to 0.38 (+0.10 on blue).
+
+# Build log: mic-air de-plosive + peak limiter (`finish` air) (2026-11-03)
+
+| Step | By | What |
+|---|---|---|
+| Brief | Project owner, with Claude Code | `AIR-BRIEF.md`: tame mic air on the peaks, from the recipe measured on the owner's take. |
+| Build | Meta **Muse Code** on **`muse-spark-1.3`** | The de-plosive + limiter in `src/director/finish.py`, `--no-deplosive` in `cli.py`/`cut.py`, `tests/test_air.py` (14 tests). Built straight from the brief (no separate design). |
+| Code review and live test | Claude Code, piloted by the owner | Real take, below. |
+
+Muse Code token use: TBD (the owner fills this from the run log).
+Live test: TBD (the owner fills this from the real-footage run).
+
+## Build notes (Muse Code)
+
+- Threshold is measured per recording in pure numpy: two cascaded 2nd-order Butterworth
+  low-passes at 150 Hz (zero-phase via FFT, matching `ffmpeg lowpass=f=150,lowpass=f=150`
+  magnitude to 0.1 dB on the take), 30 ms RMS windows, median over the louder half, +6 dB.
+  On the take that is −42.8 dBFS gated / −36.8 dBFS threshold. Without numpy, or when the
+  WAV will not read, the threshold falls back to fixed −36.0 dBFS with a
+  `finish_deplosive_fallback` note.
+- `clean_voice_command` takes an optional linear `deplosive_threshold` (`None` keeps the
+  original `-af` chain, so every existing command test stands): with it, the initial
+  high-pass becomes the recipe block over `-filter_complex` (high-pass 60, split at 160
+  doubled each side, low band through `acompressor` 20:1 attack 0.3 release 40 knee 2,
+  `amix=inputs=2:normalize=0`), then afftdn/levelling as before. Isolation, when asked
+  for, is cleaned with the same threshold: isolation runs before the de-plosive.
+- The record lives at top-level `finish.json` `deplosive` (`enabled`, `threshold_dbfs`,
+  `moments`, `fallback`), not under `voice`: a re-run measures the louder mastered file,
+  so a voice-nested threshold would break the rerun-voice-equality test. `clean_chain`
+  is unchanged for the same reason.
+- `moments` counts above-threshold 30 ms frames grouped with a 0.30 s merge gap (52 on
+  the take): all threshold crossings, where the brief's seven are the loud audible ones.
+- The limiter (`alimiter=limit=0.891251:attack=5:release=50:level=0:latency=1`, −1 dBFS,
+  ffmpeg defaults, no auto level, delay compensated) runs after loudness normalisation
+  (two-pass and single-pass silence fallback alike) and the re-measure records the final
+  true peak in `loudness_after`. If the limiter fails, the unlimited master stands with
+  a `finish_limiter_failed` warning.
+- Full suite: 667 tests (14 new), green except the same 11 pre-existing `ps`-sandbox
+  errors in `tests/test_engine_render.py` and `tests/test_render_runner.py`.
+- By hand, on the owner's take (`finish/voice_raw.wav`, read only) through the shipped
+  code: threshold −36.8 dBFS, 52 moments; low band at the seven moments −9.6/−11.8/−9.8/
+  −11.9/−13.7/−10.1/−14.2 dB (mean −11.6 dB), normal speech low band −0.6 dB, speech
+  level −0.4 dB; mastered −14.82 LUFS, final true peak −0.99 dBTP (limiter transparent).
+  Test outputs went to `/tmp/muse-air-test/`: this sandbox forbids writes to the named
+  `/Volumes/.../muse-air-test/` folder (reads worked).

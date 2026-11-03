@@ -541,7 +541,8 @@ def command_finish(args: argparse.Namespace) -> dict:
             sound=bool(args.sound), isolate=bool(args.isolate),
             loudness=(None if args.loudness is None else float(args.loudness)),
             max_provider_usd=float(args.max_provider_usd),
-            max_usd=float(args.max_usd))
+            max_usd=float(args.max_usd),
+            deplosive=not bool(args.no_deplosive))
         finish_file = job / "finish.json"
     elif args.video is not None or args.angles is not None:
         if args.video is None:
@@ -576,7 +577,8 @@ def command_finish(args: argparse.Namespace) -> dict:
             isolate=bool(args.isolate),
             loudness=(None if args.loudness is None else float(args.loudness)),
             max_provider_usd=float(args.max_provider_usd),
-            max_usd=float(args.max_usd))
+            max_usd=float(args.max_usd),
+            deplosive=not bool(args.no_deplosive))
     else:
         raise ValueError("director finish needs --job DIR or --video/--angles")
     _print_finish_summary(video, finish_file, payload)
@@ -671,6 +673,7 @@ def command_cut(args: argparse.Namespace) -> dict:
             finish_isolate=bool(args.finish_isolate),
             finish_loudness=(None if args.finish_loudness is None
                              else float(args.finish_loudness)),
+            finish_no_deplosive=bool(args.no_deplosive),
             max_provider_usd=float(args.max_provider_usd),
             no_captions=bool(args.no_captions),
             captions_preset=args.captions_preset,
@@ -1003,6 +1006,8 @@ def build_parser() -> argparse.ArgumentParser:
     cut_parser.add_argument("--finish-loudness", type=float, default=None,
                             help="Master target in LUFS, -20 to -10 "
                             "(default -14, -16 the other choice)")
+    cut_parser.add_argument("--no-deplosive", action="store_true",
+                            help="Skip the finish mic-air de-plosive")
     cut_parser.add_argument("--max-provider-usd", type=float, default=2.0,
                             help="Job-wide ElevenLabs/Higgsfield cap "
                             "(estimated list prices)")
@@ -1101,6 +1106,8 @@ def build_parser() -> argparse.ArgumentParser:
                                help="Ask Spark for sound design and generate it")
     finish_parser.add_argument("--isolate", action="store_true",
                                help="Use ElevenLabs voice isolation when connected")
+    finish_parser.add_argument("--no-deplosive", action="store_true",
+                               help="Skip the mic-air de-plosive")
     finish_parser.add_argument("--loudness", type=float, default=None,
                                help="Master target in LUFS, -20 to -10 "
                                "(default -14, -16 the other choice)")

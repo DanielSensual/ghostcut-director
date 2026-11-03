@@ -14,7 +14,9 @@ design is off unless asked. Every generated file stays in `finish/`
 with its prompt, provider, cost and licence note.
 
 Designed by Muse Code on muse-wonder-1.0, built by Muse Code on
-muse-spark-1.3 from docs/muse-code/FINISH-DESIGN.md.
+muse-spark-1.3 from docs/muse-code/FINISH-DESIGN.md. The de-plosive
+and the post-loudnorm limiter were added by Muse Code on muse-spark-1.3
+from docs/muse-code/AIR-BRIEF.md.
 """
 from __future__ import annotations
 
@@ -22,6 +24,7 @@ import math
 import os
 import re
 import time
+import wave
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -38,6 +41,11 @@ from . import angles as angles_mod
 from . import connect as connect_mod
 from . import cutlist
 from . import elevenlabs as elevenlabs_mod
+
+try:
+    import numpy as np
+except ImportError:  # the director extra is optional
+    np = None  # type: ignore[assignment]
 
 AUDIO_SR = 48000
 VOICE_HIGHPASS_HZ = 80
@@ -72,6 +80,25 @@ SPARK_TOKEN_RATES_USD_PER_1M = {
 DEFAULT_MAX_PROVIDER_USD = 2.00
 ISOLATION_MAX_S = 3600
 CUE_KINDS = ("riser", "whoosh", "impact")
+# Mic-air de-plosive (AIR-BRIEF.md): the threshold is measured per
+# recording (speech-gated low-band level + 6 dB); the filter values
+# below are the recipe as measured on the owner's take.
+DEPLOSIVE_MEASURE_FC = 150.0
+DEPLOSIVE_SPLIT_FC = 160
+DEPLOSIVE_HIGHPASS_HZ = 60
+DEPLOSIVE_RATIO = 20
+DEPLOSIVE_ATTACK_MS = 0.3
+DEPLOSIVE_RELEASE_MS = 40
+DEPLOSIVE_KNEE = 2
+DEPLOSIVE_OFFSET_DB = 6.0
+DEPLOSIVE_FALLBACK_THRESHOLD_DBFS = -36.0
+DEPLOSIVE_WINDOW_MS = 30.0
+DEPLOSIVE_MERGE_GAP_S = 0.30
+# Gentle peak limiter after loudness normalisation: -1 dBFS, ffmpeg's
+# default attack/release, no auto level, delay compensated.
+LIMITER_LIMIT = 0.891251
+LIMITER_ATTACK = 5
+LIMITER_RELEASE = 50
 
 DEVELOPER = (
     "You place sound under a finished talking-head cut. You do not edit "
@@ -305,22 +332,197 @@ def isolation_input_command(video: Path, wav: Path) -> list[str]:
             "-c:a", "pcm_s16le", str(wav)]
 
 
-def clean_voice_command(src: Path, dst: Path, *, isolated: bool) -> list[str]:
-    """Step 2: high-pass (+denoise when local) + gentle levelling. Pure."""
-    if isolated:
-        chain = (f"highpass=f={VOICE_HIGHPASS_HZ},"
-                 f"acompressor=threshold={VOICE_COMP_THRESHOLD}:"
-                 f"ratio={VOICE_COMP_RATIO}:attack={VOICE_COMP_ATTACK_MS}:"
-                 f"release={VOICE_COMP_RELEASE_MS}")
-    else:
-        chain = (f"highpass=f={VOICE_HIGHPASS_HZ},"
-                 f"afftdn=nr={VOICE_DENOISE_NR}:nf={VOICE_DENOISE_NF},"
-                 f"acompressor=threshold={VOICE_COMP_THRESHOLD}:"
-                 f"ratio={VOICE_COMP_RATIO}:attack={VOICE_COMP_ATTACK_MS}:"
-                 f"release={VOICE_COMP_RELEASE_MS}")
+def dbfs_to_linear(db: float) -> float:
+    """dBFS to linear amplitude. Pure."""
+    return 10.0 ** (float(db) / 20.0)
+
+
+def clean_voice_command(src: Path, dst: Path, *, isolated: bool,
+                        deplosive_threshold: float | None = None) -> list[str]:
+    """Step 2: high-pass (+denoise when local) + gentle levelling. Pure.
+
+    When `deplosive_threshold` (linear amplitude) is given, the initial
+    high-pass is replaced by the AIR-BRIEF de-plosive block: high-pass at
+    60 Hz, split at 160 Hz (two cascaded 2nd-order filters each side),
+    the low band through a 20:1 compressor, bands summed. `None` keeps
+    the original chain.
+    """
+    if deplosive_threshold is None:
+        if isolated:
+            chain = (f"highpass=f={VOICE_HIGHPASS_HZ},"
+                     f"acompressor=threshold={VOICE_COMP_THRESHOLD}:"
+                     f"ratio={VOICE_COMP_RATIO}:attack={VOICE_COMP_ATTACK_MS}:"
+                     f"release={VOICE_COMP_RELEASE_MS}")
+        else:
+            chain = (f"highpass=f={VOICE_HIGHPASS_HZ},"
+                     f"afftdn=nr={VOICE_DENOISE_NR}:nf={VOICE_DENOISE_NF},"
+                     f"acompressor=threshold={VOICE_COMP_THRESHOLD}:"
+                     f"ratio={VOICE_COMP_RATIO}:attack={VOICE_COMP_ATTACK_MS}:"
+                     f"release={VOICE_COMP_RELEASE_MS}")
+        return ["ffmpeg", "-v", "error", "-y", "-i", str(src),
+                "-af", chain, "-ac", "1", "-ar", str(AUDIO_SR),
+                "-c:a", "pcm_s16le", str(dst)]
+    thr = min(1.0, max(0.000976563, float(deplosive_threshold)))
+    comp = (f"acompressor=threshold={thr:.7g}:ratio={DEPLOSIVE_RATIO}"
+            f":attack={DEPLOSIVE_ATTACK_MS}:release={DEPLOSIVE_RELEASE_MS}"
+            f":knee={DEPLOSIVE_KNEE}")
+    split = (
+        f"[0:a]highpass=f={DEPLOSIVE_HIGHPASS_HZ},asplit[lo_in][hi_in];"
+        f"[lo_in]lowpass=f={DEPLOSIVE_SPLIT_FC},"
+        f"lowpass=f={DEPLOSIVE_SPLIT_FC},{comp}[lo];"
+        f"[hi_in]highpass=f={DEPLOSIVE_SPLIT_FC},"
+        f"highpass=f={DEPLOSIVE_SPLIT_FC}[hi];"
+        f"[lo][hi]amix=inputs=2:normalize=0[mixed]")
+    tail = (f"acompressor=threshold={VOICE_COMP_THRESHOLD}:"
+            f"ratio={VOICE_COMP_RATIO}:attack={VOICE_COMP_ATTACK_MS}:"
+            f"release={VOICE_COMP_RELEASE_MS}")
+    if not isolated:
+        tail = (f"afftdn=nr={VOICE_DENOISE_NR}:nf={VOICE_DENOISE_NF},{tail}")
+    graph = f"{split};[mixed]{tail}[out]"
     return ["ffmpeg", "-v", "error", "-y", "-i", str(src),
-            "-af", chain, "-ac", "1", "-ar", str(AUDIO_SR),
+            "-filter_complex", graph, "-map", "[out]",
+            "-ac", "1", "-ar", str(AUDIO_SR),
             "-c:a", "pcm_s16le", str(dst)]
+
+
+def limiter_command(src: Path, dst: Path) -> list[str]:
+    """Step 6c: gentle peak limiter after loudness normalisation. Pure."""
+    af = (f"alimiter=limit={LIMITER_LIMIT}:attack={LIMITER_ATTACK}"
+          f":release={LIMITER_RELEASE}:level=0:latency=1")
+    return ["ffmpeg", "-v", "error", "-y", "-i", str(src),
+            "-af", af, "-ac", "2", "-ar", str(AUDIO_SR),
+            "-c:a", "pcm_s16le", str(dst)]
+
+
+def _lowpass_twice(samples, sample_rate: int,
+                   cutoff: float = DEPLOSIVE_MEASURE_FC):
+    """Two cascaded 2nd-order Butterworth low-passes, zero-phase via FFT.
+
+    Matches `ffmpeg lowpass=f=<cutoff>,lowpass=f=<cutoff>` magnitude
+    (Q=0.707) to 0.1 dB on the owner's take; phase is zeroed, which the
+    RMS envelope does not see. Requires numpy. Pure.
+    """
+    assert np is not None
+    x = np.asarray(samples, dtype=np.float64).ravel()
+    if x.size == 0:
+        return x
+    w0 = 2.0 * math.pi * float(cutoff) / float(sample_rate)
+    cosw = math.cos(w0)
+    alpha = math.sin(w0) / (2.0 * 0.70710678)
+    b0 = (1.0 - cosw) / 2.0
+    b1 = 1.0 - cosw
+    b2 = b0
+    a0 = 1.0 + alpha
+    a1 = -2.0 * cosw
+    a2 = 1.0 - alpha
+    b = np.array([b0, b1, b2]) / a0
+    a = np.array([1.0, a1 / a0, a2 / a0])
+    spectrum = np.fft.rfft(x)
+    freqs = np.fft.rfftfreq(x.size, 1.0 / float(sample_rate))
+    w = 2.0 * np.pi * freqs / float(sample_rate)
+    z = np.exp(-1j * w)
+    resp = ((b[0] + b[1] * z + b[2] * z * z)
+            / (a[0] + a[1] * z + a[2] * z * z))
+    return np.fft.irfft(spectrum * resp * resp, n=x.size)
+
+
+def speech_gated_level(levels_db) -> float:
+    """Median over the louder half of the frames. Pure (needs numpy)."""
+    assert np is not None
+    levels = np.asarray(list(levels_db), dtype=np.float64).ravel()
+    if levels.size == 0:
+        return float("-inf")
+    median_all = float(np.median(levels))
+    louder = levels[levels > median_all]
+    if louder.size == 0:
+        return median_all
+    return float(np.median(louder))
+
+
+def _count_moments(above, hop_s: float) -> int:
+    """Above-threshold frames grouped into bursts. Pure (needs numpy)."""
+    assert np is not None
+    flags = np.asarray(list(above), dtype=bool).ravel()
+    if not bool(np.any(flags)):
+        return 0
+    gap_frames = max(1, int(round(DEPLOSIVE_MERGE_GAP_S / hop_s)))
+    groups = 0
+    in_run = False
+    gap = 0
+    for flag in flags:
+        if flag:
+            if not in_run:
+                groups += 1
+                in_run = True
+            gap = 0
+        elif in_run:
+            gap += 1
+            if gap > gap_frames:
+                in_run = False
+                gap = 0
+    return groups
+
+
+def measure_deplosive_threshold_from_samples(samples,
+                                             sample_rate: int
+                                             ) -> tuple[float, int]:
+    """(threshold_dbfs, moments) from mono float samples. Pure.
+
+    Low-passes at 150 Hz (twice), takes 30 ms RMS windows, medians over
+    the louder half for the speech-gated low-band level, adds 6 dB.
+    Requires numpy.
+    """
+    assert np is not None
+    x = np.asarray(samples, dtype=np.float64).ravel()
+    sr = int(sample_rate)
+    hop = max(1, int(round(sr * DEPLOSIVE_WINDOW_MS / 1000.0)))
+    nblocks = x.size // hop
+    if nblocks == 0:
+        return DEPLOSIVE_FALLBACK_THRESHOLD_DBFS, 0
+    low = _lowpass_twice(x[:nblocks * hop], sr)
+    rms = np.sqrt(np.mean(low.reshape(nblocks, hop) ** 2, axis=1))
+    with np.errstate(divide="ignore"):
+        levels = 20.0 * np.log10(np.maximum(rms, 1e-12))
+    gated = speech_gated_level(levels)
+    threshold = gated + DEPLOSIVE_OFFSET_DB
+    hop_s = hop / float(sr)
+    moments = _count_moments(levels > threshold, hop_s)
+    return round(float(threshold), 1), moments
+
+
+def measure_deplosive_threshold(wav_path: Path) -> tuple[float, int, bool]:
+    """(threshold_dbfs, moments, fallback) for a voice WAV. Never raises.
+
+    Without numpy, or when the file will not read as PCM, falls back to
+    the fixed −36 dBFS threshold with 0 moments and True.
+    """
+    if np is None:
+        return DEPLOSIVE_FALLBACK_THRESHOLD_DBFS, 0, True
+    try:
+        with wave.open(str(wav_path), "rb") as handle:
+            sr = handle.getframerate()
+            channels = handle.getnchannels()
+            width = handle.getsampwidth()
+            frames = handle.getnframes()
+            if frames <= 0 or sr <= 0 or channels <= 0:
+                return DEPLOSIVE_FALLBACK_THRESHOLD_DBFS, 0, True
+            raw = handle.readframes(frames)
+        if width == 2:
+            data = np.frombuffer(raw, dtype=np.int16).astype(np.float64)
+            data = data / 32768.0
+        elif width == 4:
+            # 32-bit PCM (signed); voice_raw is 16-bit, this is robustness.
+            data = np.frombuffer(raw, dtype=np.int32).astype(np.float64)
+            data = data / 2147483648.0
+        else:
+            return DEPLOSIVE_FALLBACK_THRESHOLD_DBFS, 0, True
+        if channels > 1:
+            data = data.reshape(-1, channels).mean(axis=1)
+        threshold, moments = measure_deplosive_threshold_from_samples(
+            data, sr)
+        return threshold, moments, False
+    except (OSError, EOFError, wave.Error, ValueError, AssertionError):
+        return DEPLOSIVE_FALLBACK_THRESHOLD_DBFS, 0, True
 
 
 def loudnorm_measure_command(wav: Path, target_lufs: float) -> list[str]:
@@ -1101,11 +1303,12 @@ def run_files(*, video_path: Path, angles_path: Path,
               taste_path: Path | None, out_path: Path,
               model: str, no_muse: bool, sound: bool, isolate: bool,
               loudness: float | None, max_provider_usd: float,
-              max_usd: float) -> dict:
+              max_usd: float, deplosive: bool = True) -> dict:
     """Finish one cut: clean → design → generate → mix → master → remux.
 
     `out_path` is the finish.json path; the finish/ work dir is its
-    sibling. Returns the finish.json payload (also written).
+    sibling. Returns the finish.json payload (also written). The mic-air
+    de-plosive is on by default; pass `deplosive=False` to skip it.
     """
     if loudness is not None and not -20.0 <= float(loudness) <= -10.0:
         raise ValueError("--loudness must be between -20 and -10")
@@ -1145,9 +1348,22 @@ def run_files(*, video_path: Path, angles_path: Path,
     # Step 1 — extract the voice.
     _run_step(extract_voice_command(video_path, voice_raw), "extract")
     voice_stats = _voice_stats(voice_raw)
+    # De-plosive threshold, measured per recording on the extracted
+    # voice (the isolated voice, when asked for, is cleaned with the
+    # same threshold: isolation runs before the de-plosive).
+    if deplosive:
+        deplosive_db, deplosive_moments, deplosive_fallback = (
+            measure_deplosive_threshold(voice_raw))
+        deplosive_linear: float | None = dbfs_to_linear(deplosive_db)
+        if deplosive_fallback:
+            notes.append("finish_deplosive_fallback:fixed -36.0 dBFS")
+    else:
+        deplosive_db, deplosive_moments, deplosive_fallback = None, 0, False
+        deplosive_linear = None
     # Step 2 — the local clean is always rendered first, so the
     # isolation fallback is a file that already exists.
-    _run_step(clean_voice_command(voice_raw, voice_clean, isolated=False),
+    _run_step(clean_voice_command(voice_raw, voice_clean, isolated=False,
+                                  deplosive_threshold=deplosive_linear),
               "clean")
 
     provider_key = _elevenlabs_key()
@@ -1203,7 +1419,8 @@ def run_files(*, video_path: Path, angles_path: Path,
                         try:
                             run_command(clean_voice_command(
                                 work_dir / "voice_isolated.mp3",
-                                isolated_clean, isolated=True))
+                                isolated_clean, isolated=True,
+                                deplosive_threshold=deplosive_linear))
                         except ToolingError:
                             try:
                                 isolated_clean.unlink()
@@ -1368,8 +1585,9 @@ def run_files(*, video_path: Path, angles_path: Path,
     _run_step(duck_mix_command(voice_clean, bed_mix, sfx_mix, premaster,
                                music_gain_db=music_gain), "duck mix")
 
-    # Step 6 — two-pass master.
+    # Step 6 — two-pass master, then the gentle limiter.
     master = work_dir / "master.wav"
+    unlimited = work_dir / "master_unlimited.wav"
     measure = run_command(loudnorm_measure_command(premaster, target),
                           check=False)
     measured = parse_loudnorm_full(measure.stderr or "")
@@ -1379,7 +1597,7 @@ def run_files(*, video_path: Path, angles_path: Path,
                     "-af",
                     f"loudnorm=I={target}:TP={TARGET_TP_DBTP}:LRA={TARGET_LRA}",
                     "-ac", "2", "-ar", str(AUDIO_SR),
-                    "-c:a", "pcm_s16le", str(master)]
+                    "-c:a", "pcm_s16le", str(unlimited)]
         try:
             run_command(fallback)
         except ToolingError as error:
@@ -1388,8 +1606,23 @@ def run_files(*, video_path: Path, angles_path: Path,
     else:
         loudness_before = {"integrated_lufs": round(measured["input_i"], 2),
                            "true_peak_dbtp": round(measured["input_tp"], 2)}
-        _run_step(loudnorm_apply_command(premaster, master, target_lufs=target,
+        _run_step(loudnorm_apply_command(premaster, unlimited,
+                                         target_lufs=target,
                                          measured=measured), "master")
+    try:
+        run_command(limiter_command(unlimited, master))
+    except ToolingError:
+        try:
+            os.replace(unlimited, master)
+        except OSError as error:
+            raise FinishError("finish: master failed "
+                              f"({error})") from error
+        warnings.append("finish_limiter_failed")
+    else:
+        try:
+            unlimited.unlink()
+        except OSError:
+            pass
     remeasure = run_command(loudnorm_measure_command(master, target),
                             check=False)
     remeasured = parse_loudnorm_full(remeasure.stderr or "")
@@ -1418,12 +1651,27 @@ def run_files(*, video_path: Path, angles_path: Path,
                       "reason": bed.reason, "confidence": bed.confidence}
     else:
         plan_music = None
+    if deplosive:
+        deplosive_record: dict = {
+            "enabled": True,
+            "threshold_dbfs": deplosive_db,
+            "moments": deplosive_moments,
+            "fallback": deplosive_fallback,
+        }
+    else:
+        deplosive_record = {
+            "enabled": False,
+            "threshold_dbfs": None,
+            "moments": 0,
+            "fallback": False,
+        }
     payload = {
         "version": 1,
         "video": video_path.name,
         "duration_s": round(duration_s, 3),
         "voice": {"method": method, "clean_chain": clean_chain,
                   "isolate_requested": isolate_requested},
+        "deplosive": deplosive_record,
         "provider_costs_are_estimates": True,
         "target_lufs": target,
         "loudness_before": loudness_before,
@@ -1455,7 +1703,7 @@ def run_files(*, video_path: Path, angles_path: Path,
 
 def run(*, job_dir: Path, model: str, no_muse: bool, sound: bool,
         isolate: bool, loudness: float | None, max_provider_usd: float,
-        max_usd: float) -> dict:
+        max_usd: float, deplosive: bool = True) -> dict:
     """Finish a job directory. Returns the finish.json payload (written)."""
     job_dir = Path(job_dir)
     video = job_dir / "cut.mp4"
@@ -1476,4 +1724,5 @@ def run(*, job_dir: Path, model: str, no_muse: bool, sound: bool,
         taste_path=taste if taste.exists() else None,
         out_path=job_dir / "finish.json", model=model, no_muse=no_muse,
         sound=sound, isolate=isolate, loudness=loudness,
-        max_provider_usd=max_provider_usd, max_usd=max_usd)
+        max_provider_usd=max_provider_usd, max_usd=max_usd,
+        deplosive=deplosive)

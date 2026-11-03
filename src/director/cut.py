@@ -142,6 +142,7 @@ class JobOptions:
     finish_sound: bool = False
     finish_isolate: bool = False
     finish_loudness: float | None = None
+    finish_no_deplosive: bool = False
     max_provider_usd: float = 2.00
     # --lut PATTERN=CUBE entries: a supplied .cube for every clip whose file name (or path)
     # matches PATTERN, for cameras Director can't read (DJI D-Log, Apple Log, ...).
@@ -868,6 +869,7 @@ def run(*, clips: list[Path], out_dir: Path,
         whisper_model: str = sync_mod.WHISPER_MODEL,
         no_finish: bool = True, finish_sound: bool = False,
         finish_isolate: bool = False, finish_loudness: float | None = None,
+        finish_no_deplosive: bool = False,
         max_provider_usd: float = 2.00,
         lut_patterns: list[str] | None = None,
         grade_reference: str | None = None,
@@ -904,7 +906,9 @@ def run(*, clips: list[Path], out_dir: Path,
         target_s=target_s, no_transcribe=no_transcribe,
         whisper_model=whisper_model, no_finish=no_finish,
         finish_sound=finish_sound, finish_isolate=finish_isolate,
-        finish_loudness=finish_loudness, max_provider_usd=max_provider_usd,
+        finish_loudness=finish_loudness,
+        finish_no_deplosive=finish_no_deplosive,
+        max_provider_usd=max_provider_usd,
         lut_patterns=list(lut_patterns or []),
         grade_reference=grade_reference,
         no_captions=no_captions, captions_preset=captions_preset,
@@ -1111,6 +1115,7 @@ def run(*, clips: list[Path], out_dir: Path,
                  "sound": options.finish_sound,
                  "isolate": options.finish_isolate,
                  "loudness": options.finish_loudness,
+                 "no_deplosive": options.finish_no_deplosive,
                  "max_provider_usd": options.max_provider_usd,
                  "taste": taste_fp,
                  "elevenlabs_connected": connect_mod.key_status(
@@ -1446,7 +1451,8 @@ def run(*, clips: list[Path], out_dir: Path,
                 loudness=options.finish_loudness,
                 max_provider_usd=max(0.0, options.max_provider_usd
                                      - provider_spent_usd),
-                max_usd=max(0.0, options.max_usd - spent_usd))
+                max_usd=max(0.0, options.max_usd - spent_usd),
+                deplosive=not options.finish_no_deplosive)
             finish_payload = payload
             meta_spend = float((payload.get("design") or {}).get("meta_usd") or 0.0)
             finish_provider_spend = float(payload["provider_spend_usd"])
