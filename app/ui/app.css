@@ -57,6 +57,22 @@ code { font-family: var(--mono); font-size: 12px; }
 .engine-dot.live { background: var(--green); box-shadow: 0 0 8px var(--green); }
 .spend { white-space: nowrap; padding: 5px 10px; border: 1px solid var(--line2); border-radius: 999px; color: var(--ghost); font-size: 12px; }
 .spend::before { content: "◆ "; font-size: 9px; }
+.conn { white-space: nowrap; padding: 5px 10px; border: 1px solid var(--line2); border-radius: 999px; color: var(--muted); font-size: 12px; }
+.conn:hover { color: var(--text); border-color: var(--ghost); }
+.conn-provider { padding: 10px 0; border-bottom: 1px solid var(--line); }
+.conn-provider:last-child { border-bottom: 0; }
+.conn-provider b { font-size: 13.5px; }
+.conn-status { font-size: 12.5px; margin-top: 2px; }
+.conn-provider .muted { font-size: 12px; }
+.conn-inputs { display: flex; gap: 8px; margin-top: 8px; }
+.conn-inputs input { flex: 1; min-width: 0; background: var(--bg); color: var(--text); border: 1px solid var(--line2); border-radius: 8px; padding: 7px 9px; font: inherit; font-size: 12.5px; }
+.conn-acts { display: flex; gap: 8px; margin-top: 8px; }
+.conn-acts button { font-size: 11.5px; padding: 4px 12px; border-radius: 6px; border: 1px solid var(--line2); color: var(--muted); }
+.conn-acts button:hover:not(:disabled) { color: var(--text); }
+.conn-acts button:disabled { opacity: 0.5; cursor: not-allowed; }
+.conn-msg { margin-top: 6px; font-size: 12px; min-height: 16px; }
+.conn-msg .err { color: #ffb3bb; }
+.conn-msg .ok { color: var(--teal); }
 .primary { background: var(--orange); color: #fff; font-weight: 600; padding: 6px 14px; border-radius: 7px; }
 .primary:hover { background: var(--orange2); }
 .pop {

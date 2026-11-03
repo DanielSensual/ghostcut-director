@@ -34,6 +34,7 @@ from ghostcut.ffmpeg_tools import (
 )
 
 from . import angles as angles_mod
+from . import connect as connect_mod
 from . import grade as grade_mod
 from . import reframe as reframe_mod
 from . import sync as sync_mod
@@ -46,8 +47,8 @@ DEFAULT_OUT_DIR = "director-cut"
 DEFAULT_MODEL = "muse-spark-1.3"
 DEFAULT_MIN_SHOT_S = 2.0
 DEFAULT_MAX_USD = 5.0
-STAGES = ("sync", "words", "tighten", "grade", "angles", "export",
-          "reframe", "qc")
+STAGES = ("sync", "words", "tighten", "grade", "angles", "finish",
+          "export", "reframe", "qc")
 WHISPER_TIMEOUT_S = 3600
 DURATION_TOLERANCE_S = 0.10
 BLACK_SHARE_WARN = 0.20
@@ -133,6 +134,14 @@ class JobOptions:
     # it can; existing callers keep working through the default.
     no_transcribe: bool = False
     whisper_model: str = sync_mod.WHISPER_MODEL
+    # Finishing (FINISH-DESIGN.md §13). no_finish defaults True so
+    # existing programmatic callers keep their old job; the CLI passes
+    # False unless --no-finish, so `director cut` finishes by default.
+    no_finish: bool = True
+    finish_sound: bool = False
+    finish_isolate: bool = False
+    finish_loudness: float | None = None
+    max_provider_usd: float = 2.00
 
 
 @dataclass(slots=True)
@@ -720,7 +729,10 @@ def run(*, clips: list[Path], out_dir: Path,
         pause_limit_s: float = 0.8,
         target_s: float | None = None,
         no_transcribe: bool = False,
-        whisper_model: str = sync_mod.WHISPER_MODEL) -> dict:
+        whisper_model: str = sync_mod.WHISPER_MODEL,
+        no_finish: bool = True, finish_sound: bool = False,
+        finish_isolate: bool = False, finish_loudness: float | None = None,
+        max_provider_usd: float = 2.00) -> dict:
     """One job: discover → sync → words → tighten → grade → angles → … → qc.
 
     The tighten stage runs unless no_tighten (the CLI enables it unless
@@ -729,6 +741,10 @@ def run(*, clips: list[Path], out_dir: Path,
     """
     if max_usd < 0:
         raise ValueError("--max-usd must be >= 0")
+    if max_provider_usd < 0:
+        raise ValueError("--max-provider-usd must be >= 0")
+    if finish_loudness is not None and not -20.0 <= float(finish_loudness) <= -10.0:
+        raise ValueError("--finish-loudness must be between -20 and -10")
     if min_shot_s < 0:
         raise ValueError("--min-shot must be >= 0")
     out_dir = Path(out_dir)
@@ -745,7 +761,9 @@ def run(*, clips: list[Path], out_dir: Path,
         no_qc=no_qc, max_usd=max_usd, force=force, project_name=project_name,
         no_tighten=no_tighten, pause_limit_s=pause_limit_s,
         target_s=target_s, no_transcribe=no_transcribe,
-        whisper_model=whisper_model)
+        whisper_model=whisper_model, no_finish=no_finish,
+        finish_sound=finish_sound, finish_isolate=finish_isolate,
+        finish_loudness=finish_loudness, max_provider_usd=max_provider_usd)
     graded = not no_grade
     tightened = not no_tighten
 
@@ -769,6 +787,8 @@ def run(*, clips: list[Path], out_dir: Path,
     if graded:
         enabled.append("grade")
     enabled.append("angles")
+    if not no_finish:
+        enabled.append("finish")
     if not no_export:
         enabled.append("export")
     if not no_vertical:
@@ -786,11 +806,14 @@ def run(*, clips: list[Path], out_dir: Path,
     tighten_section: dict | None = None
     grade_payload: dict | None = None
     angles_payload: dict | None = None
+    finish_payload: dict | None = None
+    finish_provider_spend = 0.0
     export_section: dict | None = None
     reframe_payload: dict | None = None
     qc_section: dict | None = None
     final_checks: list[QcCheck] = []
     spent_usd = 0.0
+    provider_spent_usd = 0.0
     dirty = False
 
     def _manifest(status: str, failed_stage: str | None) -> dict:
@@ -798,11 +821,14 @@ def run(*, clips: list[Path], out_dir: Path,
         for name in STAGES:
             if name in records:
                 record = records[name]
-                stages_dict[name] = {
+                entry: dict = {
                     "status": record.status, "fingerprint": record.fingerprint,
                     "outputs": list(record.outputs),
                     "spend_usd": round(record.spend_usd, 4),
                     "warnings": list(record.warnings), "error": record.error}
+                if name == "finish":
+                    entry["provider_spend_usd"] = round(finish_provider_spend, 4)
+                stages_dict[name] = entry
         return {
             "version": 1,
             "status": status,
@@ -811,6 +837,7 @@ def run(*, clips: list[Path], out_dir: Path,
             "model": options.model,
             "max_usd": options.max_usd,
             "spend_usd": round(spent_usd, 4),
+            "provider_spend_usd": round(provider_spent_usd, 4),
             "warnings": list(top_warnings),
             "inputs": [Path(clip).name for clip in options.clips],
             "stages": stages_dict,
@@ -883,10 +910,40 @@ def run(*, clips: list[Path], out_dir: Path,
                  "model": options.model, "no_muse": options.no_muse,
                  "graded": graded},
                 files)
+        if stage == "finish":
+            taste_file = out_dir / "taste.json"
+            try:
+                taste_fp = fingerprint_of(read_json(taste_file)
+                                          if taste_file.exists() else [])
+            except (OSError, ValueError):
+                taste_fp = fingerprint_of([])
+            finish_files: list[Path] = [out_dir / "cut.mp4",
+                                        out_dir / "angles.json"]
+            if words_file_current is not None:
+                finish_files.append(words_file_current)
+            if tightened:
+                finish_files.append(out_dir / "tighten.json")
+            if taste_file.exists():
+                finish_files.append(taste_file)
+            return stage_fingerprint(
+                "finish",
+                {"model": options.model, "no_muse": options.no_muse,
+                 "sound": options.finish_sound,
+                 "isolate": options.finish_isolate,
+                 "loudness": options.finish_loudness,
+                 "max_provider_usd": options.max_provider_usd,
+                 "taste": taste_fp,
+                 "elevenlabs_connected": connect_mod.key_status(
+                     "elevenlabs").connected,
+                 "higgsfield_connected": connect_mod.key_status(
+                     "higgsfield").connected},
+                finish_files)
         if stage == "export":
             files = [out_dir / "angles.json", out_dir / "sync.json"]
             if (out_dir / "grade.json").exists():
                 files.append(out_dir / "grade.json")
+            if (out_dir / "finish.json").exists():
+                files.append(out_dir / "finish.json")
             return stage_fingerprint("export", {"project_name": options.project_name},
                                      files)
         if stage == "reframe":
@@ -905,6 +962,7 @@ def run(*, clips: list[Path], out_dir: Path,
         nonlocal sync_payload, audio_section, words_file_current, grade_payload
         nonlocal angles_payload, export_section, reframe_payload
         nonlocal qc_section, final_checks, tighten_section
+        nonlocal finish_payload, finish_provider_spend, provider_spent_usd
         if stage == "sync":
             loaded = read_json(out_dir / "sync.json")
             if not isinstance(loaded, dict):
@@ -945,6 +1003,13 @@ def run(*, clips: list[Path], out_dir: Path,
             if not isinstance(loaded, dict):
                 raise ValueError(f"Not an angles.json: {out_dir / 'angles.json'}")
             angles_payload = loaded
+        elif stage == "finish":
+            loaded = read_json(out_dir / "finish.json")
+            if not isinstance(loaded, dict):
+                raise ValueError(f"Not a finish.json: {out_dir / 'finish.json'}")
+            finish_payload = loaded
+            # A skipped stage contributes this run's spend (0.0), like Meta.
+            finish_provider_spend = 0.0
         elif stage == "export":
             section = (prev or {}).get("export")
             if not isinstance(section, dict):
@@ -979,6 +1044,7 @@ def run(*, clips: list[Path], out_dir: Path,
         nonlocal sync_payload, audio_section, words_file_current, grade_payload
         nonlocal angles_payload, export_section, reframe_payload
         nonlocal qc_section, final_checks, spent_usd, tighten_section
+        nonlocal finish_payload, finish_provider_spend, provider_spent_usd
         if stage == "sync":
             payload = sync_mod.run(
                 clip_paths=list(options.clips), reference_path=options.reference_path,
@@ -1153,13 +1219,43 @@ def run(*, clips: list[Path], out_dir: Path,
             records["angles"] = StageRecord(
                 "angles", "done", fingerprint, ["angles.json", "cut.mp4"],
                 spend, list(payload.get("warnings", [])), None)
+        elif stage == "finish":
+            from . import finish as finish_mod
+
+            payload = finish_mod.run(
+                job_dir=options.out_dir, model=options.model,
+                no_muse=options.no_muse, sound=options.finish_sound,
+                isolate=options.finish_isolate,
+                loudness=options.finish_loudness,
+                max_provider_usd=max(0.0, options.max_provider_usd
+                                     - provider_spent_usd),
+                max_usd=max(0.0, options.max_usd - spent_usd))
+            finish_payload = payload
+            meta_spend = float((payload.get("design") or {}).get("meta_usd") or 0.0)
+            finish_provider_spend = float(payload["provider_spend_usd"])
+            provider_spent_usd += finish_provider_spend
+            spent_usd += meta_spend
+            # Finish rewrites cut.mp4, so the pre-run fingerprint could
+            # never match on resume; the stored print is post-run.
+            fingerprint = _fingerprint("finish")
+            records["finish"] = StageRecord(
+                "finish", "done", fingerprint, ["finish.json", "cut.mp4"],
+                meta_spend, list(payload["warnings"]), None)
         elif stage == "export":
-            section = export_timelines(
-                angles_path=out_dir / "angles.json", sync_path=out_dir / "sync.json",
-                grade_path=out_dir / "grade.json" if graded else None,
-                fcpxml_path=out_dir / "timeline.fcpxml",
-                otio_path=out_dir / "timeline.otio.json",
-                project_name=options.project_name)
+            finish_file = out_dir / "finish.json"
+            export_kwargs: dict = {
+                "angles_path": out_dir / "angles.json",
+                "sync_path": out_dir / "sync.json",
+                "grade_path": out_dir / "grade.json" if graded else None,
+                "fcpxml_path": out_dir / "timeline.fcpxml",
+                "otio_path": out_dir / "timeline.otio.json",
+                "project_name": options.project_name,
+            }
+            if (records.get("finish") is not None
+                    and records["finish"].status == "done"
+                    and finish_file.exists()):
+                export_kwargs["finish_path"] = finish_file
+            section = export_timelines(**export_kwargs)
             export_section = section
             records["export"] = StageRecord(
                 "export", "done", fingerprint,
@@ -1281,6 +1377,16 @@ def run(*, clips: list[Path], out_dir: Path,
         try:
             _execute(stage, fingerprint)
         except Exception as exc:
+            if stage == "finish":
+                # A failed finish degrades: the job continues on the
+                # untouched cut.mp4 and ships a video anyway (§13.3).
+                message = str(exc)
+                if not message.startswith("finish: "):
+                    message = f"finish: {exc}"
+                records["finish"] = StageRecord(
+                    "finish", "failed", fingerprint, [], 0.0, [], message)
+                _write_manifest(out_dir, _manifest("running", None))
+                continue
             _fail(stage, fingerprint, exc)
             raise AssertionError("unreachable")
         dirty = True
@@ -1296,6 +1402,7 @@ def run(*, clips: list[Path], out_dir: Path,
                 f"(files kept in {out_dir})")
     status = "complete"
     if (any(record.warnings for record in records.values())
+            or any(record.status == "failed" for record in records.values())
             or any(check.status == "warn" for check in final_checks)
             or any(check.source == "muse" and check.id != "muse:overall"
                    for check in final_checks)):

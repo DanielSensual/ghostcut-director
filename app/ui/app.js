@@ -79,6 +79,104 @@
   renderSpend();
   spendBtn.onclick = (e) => { e.stopPropagation(); pop.hidden = !pop.hidden; };
   document.addEventListener("click", (e) => { if (!pop.contains(e.target)) pop.hidden = true; });
+
+  // ---------- connections: outside-service keys (per-machine, never shown back) ----------
+  const connBtn = $("#connBtn"), connDlg = $("#connDlg");
+  let CONN = null;
+  const CAP_LABEL = { sfx: "Sound effects", music: "music", isolation: "voice isolation" };
+  async function loadConn() {
+    if (!LIVE) { connBtn.hidden = true; return; }
+    try {
+      CONN = (await api("/api/connections")).providers || [];
+    } catch { CONN = null; }
+    if (!CONN) { connBtn.hidden = true; return; }
+    const n = CONN.filter((p) => p.connected).length;
+    connBtn.textContent = n ? `Connections · ${n} connected` : "Connections · none connected";
+  }
+  function connStatus(p) {
+    if (!p.connected) return "Not connected";
+    if (p.source === "env") return `Connected — from ${(p.env_vars || []).join(", ")}`;
+    return "Connected — saved in Keychain";
+  }
+  function connCaps(p) {
+    if ((p.capabilities || []).length) return p.capabilities.map((c) => CAP_LABEL[c] || c).join(", ");
+    return p.unavailable_reason || "";
+  }
+  function closeConn() {
+    $$("input", connDlg).forEach((i) => (i.value = ""));
+    connDlg.hidden = true;
+  }
+  function renderConn() {
+    const body = $("#connDlgBody");
+    const blocks = (CONN || []).map((p) => {
+      const status = h("div", { class: "conn-status" }, connStatus(p));
+      const caps = h("div", { class: "muted" }, connCaps(p));
+      const msg = h("div", { class: "conn-msg", id: `connMsg-${p.id}` });
+      const inputs = p.id === "higgsfield"
+        ? [h("input", { type: "password", autocomplete: "off", placeholder: "Key ID" }),
+           h("input", { type: "password", autocomplete: "off", placeholder: "Key secret" })]
+        : [h("input", { type: "password", autocomplete: "off", placeholder: `Paste ${p.name} API key` })];
+      const saveBtn = h("button", {}, "Save");
+      const testBtn = h("button", {}, "Test");
+      const removeBtn = h("button", {}, "Remove");
+      if (p.source === "env") {
+        removeBtn.disabled = true;
+        removeBtn.title = `Unset ${(p.env_vars || []).join(" and ")} to disconnect`;
+      }
+      const say = (text, bad) => msg.replaceChildren(h("span", { class: bad ? "err" : "ok" }, text));
+      saveBtn.onclick = async () => {
+        const payload = { provider: p.id };
+        if (p.id === "higgsfield") {
+          payload.key_id = inputs[0].value;
+          payload.key_secret = inputs[1].value;
+        } else {
+          payload.key = inputs[0].value;
+        }
+        inputs.forEach((i) => (i.value = ""));
+        saveBtn.disabled = true;
+        try {
+          CONN = (await api("/api/connections/add", payload)).providers || CONN;
+          renderConn();
+          await runConnTest(p.id);
+        } catch (e) { say(e.message, true); saveBtn.disabled = false; }
+      };
+      testBtn.onclick = () => runConnTest(p.id);
+      removeBtn.onclick = async () => {
+        removeBtn.disabled = true;
+        try {
+          CONN = (await api("/api/connections/remove", { provider: p.id })).providers || CONN;
+          renderConn();
+        } catch (e) { say(e.message, true); removeBtn.disabled = false; }
+      };
+      return h("div", { class: "conn-provider" }, h("b", {}, p.name), status, caps,
+        h("div", { class: "conn-inputs" }, ...inputs), h("div", { class: "conn-acts" }, saveBtn, testBtn, removeBtn), msg);
+    });
+    body.replaceChildren(...blocks);
+    const n = (CONN || []).filter((p) => p.connected).length;
+    connBtn.textContent = n ? `Connections · ${n} connected` : "Connections · none connected";
+  }
+  async function runConnTest(id) {
+    const block = $("#connDlgBody");
+    const msg = $(`#connMsg-${id}`, block);
+    const btns = $$("button", block);
+    const testBtn = btns.find((b) => b.textContent === "Test");
+    if (testBtn) { testBtn.textContent = "Testing…"; testBtn.disabled = true; }
+    const say = (text, bad) => msg && msg.replaceChildren(h("span", { class: bad ? "err" : "ok" }, text));
+    try {
+      const j = await api("/api/connections/test", { provider: id });
+      CONN = j.providers || CONN;
+      const t = (j.tests || []).find((x) => x.provider === id);
+      renderConn();
+      const again = $(`#connMsg-${id}`);
+      if (again && t) again.replaceChildren(h("span", { class: t.ok ? "ok" : "err" }, t.message));
+    } catch (e) { say(e.message, true); }
+    const back = $$("button", $("#connDlgBody")).find((b) => b.textContent === "Testing…");
+    if (back) { back.textContent = "Test"; back.disabled = false; }
+  }
+  connBtn.onclick = () => { renderConn(); connDlg.hidden = false; };
+  $("#connDlgClose").onclick = closeConn;
+  connDlg.addEventListener("click", (e) => { if (e.target === connDlg) closeConn(); });
+  loadConn();
   $("#engineDot").classList.toggle("live", LIVE);
   $("#engineDot").title = LIVE ? "Engine connected: Muse runs on Spark" : "Static demo: Muse replies are scripted";
 
@@ -119,6 +217,7 @@
   video.onplay = () => { playBtn.textContent = "❚❚"; tick(); };
   video.onpause = () => (playBtn.textContent = "▶");
   document.addEventListener("keydown", (e) => {
+    if (!$("#connDlg").hidden) { if (e.key === "Escape") { $$("input", $("#connDlg")).forEach((i) => (i.value = "")); $("#connDlg").hidden = true; } return; }
     if (!$("#renderDlg").hidden) { if (e.key === "Escape") $("#renderDlg").hidden = true; return; }
     if (/TEXTAREA|INPUT|SELECT/.test(document.activeElement.tagName)) return;
     if (e.code === "Space") { e.preventDefault(); toggle(); }
@@ -414,7 +513,7 @@
   ["pointerup", "pointerleave", "pointercancel"].forEach((ev) => micBtn.addEventListener(ev, stopTalk));
   document.addEventListener("keydown", (e) => {
     if (e.code !== "KeyV" || e.repeat) return;
-    if (!$("#renderDlg").hidden || !$("#confirmDlg").hidden) return;
+    if (!$("#renderDlg").hidden || !$("#confirmDlg").hidden || !$("#connDlg").hidden) return;
     if (/TEXTAREA|INPUT|SELECT/.test(document.activeElement.tagName)) return;
     startTalk();
   });

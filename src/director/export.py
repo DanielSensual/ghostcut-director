@@ -129,8 +129,31 @@ def build_segments(angles_payload: dict) -> tuple[list[TimelineSegment], list[di
     return segments, gaps, warnings
 
 
+def finish_stems(finish_path: Path | None) -> list[str]:
+    """Music/effect stem file names from finish.json, in id order. Pure-ish.
+
+    [] when no finish ran, the file is missing, or it lists no stems.
+    Voice isolation is the voice, not a stem, and is never listed.
+    """
+    if finish_path is None:
+        return []
+    try:
+        data = read_json(Path(finish_path))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(data, dict) or not isinstance(data.get("assets"), list):
+        return []
+    stems = [str(asset.get("file", ""))
+             for asset in data["assets"]
+             if isinstance(asset, dict)
+             and asset.get("kind") in ("music", "riser", "whoosh", "impact")
+             and str(asset.get("file", ""))]
+    return stems
+
+
 def export_timelines(*, angles_path: Path, sync_path: Path, grade_path: Path | None,
-                     fcpxml_path: Path, otio_path: Path, project_name: str) -> dict:
+                     fcpxml_path: Path, otio_path: Path, project_name: str,
+                     finish_path: Path | None = None) -> dict:
     """Write both timelines; return the cut.json export section."""
     angles_payload = load_angles(Path(angles_path))
     sync_payload = read_json(Path(sync_path))
@@ -157,7 +180,7 @@ def export_timelines(*, angles_path: Path, sync_path: Path, grade_path: Path | N
     # only one write can succeed the .fcpxml is the one the demo opens.
     export_fcpxml(clips, segments, Path(fcpxml_path), project_name=project_name)
     export_otio(clips, segments, Path(otio_path), project_name=project_name)
-    return {
+    section: dict = {
         "fcpxml": Path(fcpxml_path).name,
         "otio": Path(otio_path).name,
         "project_name": project_name,
@@ -167,3 +190,12 @@ def export_timelines(*, angles_path: Path, sync_path: Path, grade_path: Path | N
         "luts": luts,
         "warnings": warnings,
     }
+    if finish_path is not None and Path(finish_path).exists():
+        # The installed exporters have no audio lanes: the timelines keep
+        # referencing the camera originals byte-identically, and the stems
+        # are listed here for the editor to re-lay (FINISH-DESIGN §1.3).
+        stems = finish_stems(Path(finish_path))
+        section["finish_stems"] = stems
+        if stems:
+            warnings.append(f"finish_audio_not_in_timelines:{','.join(stems)}")
+    return section

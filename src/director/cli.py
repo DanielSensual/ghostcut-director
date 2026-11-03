@@ -194,6 +194,46 @@ def command_reframe(args: argparse.Namespace) -> dict:
     return payload
 
 
+def _finish_stage_summary(payload: dict) -> str:
+    """The finish parenthetical from finish.json, or "" when unreadable."""
+    import json as _json
+
+    try:
+        data = _json.loads(
+            (Path(str(payload.get("out_dir") or "")) / "finish.json").read_text(
+                encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    voice = data.get("voice") or {}
+    method = "isolated" if voice.get("method") == "isolated" else "local"
+    bits = [method]
+    plan = data.get("plan") or {}
+    has_bed = bool(plan.get("music"))
+    n_fx = len(plan.get("effects") or [])
+    if has_bed or n_fx:
+        sound_bits = []
+        if has_bed:
+            sound_bits.append("1 bed")
+        if n_fx:
+            sound_bits.append(f"{n_fx} effect{'s' if n_fx != 1 else ''}")
+        bits.append(" + ".join(sound_bits))
+    try:
+        provider = float(data.get("provider_spend_usd") or 0.0)
+    except (TypeError, ValueError):
+        provider = 0.0
+    if provider > 0:
+        bits.append(f"provider ${provider:.2f} est.")
+    after = data.get("loudness_after") or {}
+    try:
+        loud = float(after.get("integrated_lufs"))
+        bits.append(f"{loud:.1f} LUFS")
+    except (TypeError, ValueError):
+        bits.append("loudness unmeasured")
+    return f" ({', '.join(bits)})"
+
+
 def _cut_stage_line(name: str, record: dict, payload: dict) -> str:
     status = record.get("status")
     qc_section = payload.get("qc") or {}
@@ -202,6 +242,11 @@ def _cut_stage_line(name: str, record: dict, payload: dict) -> str:
     line = f"{name}: {status}"
     if float(record.get("spend_usd") or 0.0):
         line += f" (${float(record['spend_usd']):.4f})"
+    if name == "finish":
+        if record.get("status") == "failed" and record.get("error"):
+            line += f" ({record['error']})"
+        elif record.get("status") == "done":
+            line += _finish_stage_summary(payload)
     if name == "words":
         audio = payload.get("audio") or {}
         if audio:
@@ -285,6 +330,16 @@ def _print_cut_summary(payload: dict) -> None:
         print(line)
     print(f"Wrote {out_dir}/cut.json ({payload.get('status')}, "
           f"${float(payload.get('spend_usd') or 0.0):.4f})")
+    if "finish" in stages:
+        try:
+            provider = float(payload.get("provider_spend_usd") or 0.0)
+        except (TypeError, ValueError):
+            provider = 0.0
+        print(f"Provider spend: ${provider:.2f} (estimated list prices)")
+        export_section = payload.get("export") or {}
+        if export_section.get("finish_stems"):
+            print("Note: timeline files contain picture only — re-lay finish stems from "
+                  f"{out_dir}/finish/ (see finish.json)")
     angles_record = stages.get("angles", {})
     if "cut.mp4" in (angles_record.get("outputs") or []):
         print(f"cut: {out_dir}/cut.mp4")
@@ -304,12 +359,236 @@ def _cut_manifest_mtime_ns(out_dir: Path) -> int | None:
         return None
 
 
+def command_connect(args: argparse.Namespace) -> dict:
+    import getpass as _getpass
+    import json as _json
+
+    from . import connect as connect_mod
+
+    verb = getattr(args, "connect_verb", None) or "list"
+    if verb == "list":
+        providers = connect_mod.list_providers()
+        if bool(getattr(args, "connect_json", False)):
+            print(_json.dumps({"providers": providers}))
+            return {"providers": providers}
+        for entry in providers:
+            info = connect_mod.PROVIDERS[entry["id"]]
+            if entry["connected"]:
+                if entry["source"] == "env":
+                    where = f"env {', '.join(info.env_vars)}"
+                else:
+                    where = "keychain"
+                if entry["capabilities"]:
+                    what = ", ".join(entry["capabilities"])
+                else:
+                    what = entry["unavailable_reason"].split(" — see ")[0]
+                print(f"{entry['id']}: connected ({where}) — {what}")
+            else:
+                missing = (f" (missing: {entry['missing']})"
+                           if entry.get("missing") else "")
+                print(f"{entry['id']}: not connected — "
+                      f"set {' and '.join(info.env_vars)} or: "
+                      f"director connect add {entry['id']}{missing}")
+        return {"providers": providers}
+    if verb == "add":
+        info = connect_mod.provider_info(args.provider)
+        key, key_id, key_secret = args.key, args.key_id, args.key_secret
+        if info.id == "elevenlabs":
+            if key_id is not None or key_secret is not None:
+                raise connect_mod.ConnectError(
+                    "connect: elevenlabs takes --key, not --key-id/--key-secret")
+            if key is None:
+                key = _getpass.getpass("ElevenLabs API key (input hidden): ")
+            parts = (key,)
+        else:
+            if key is not None:
+                raise connect_mod.ConnectError(
+                    "connect: higgsfield takes --key-id and --key-secret, not --key")
+            if key_id is None and key_secret is None:
+                key_id = _getpass.getpass("Higgsfield Key ID (input hidden): ")
+                key_secret = _getpass.getpass("Higgsfield Key secret (input hidden): ")
+            if key_id is None or key_secret is None:
+                missing = ("HF_API_KEY_ID" if key_id is None
+                           else "HF_API_KEY_SECRET")
+                raise connect_mod.ConnectError(
+                    "connect: Higgsfield needs both HF_API_KEY_ID and "
+                    f"HF_API_KEY_SECRET (missing: {missing})")
+            parts = (key_id, key_secret)
+        if connect_mod.key_status(info.id).source == "env":
+            if len(info.env_vars) == 1:
+                print(f"Note: {info.env_vars[0]} is set, so it will be used "
+                      f"instead of the saved key.")
+            else:
+                print(f"Note: {' and '.join(info.env_vars)} are set, so they "
+                      f"will be used instead of the saved key.")
+        connect_mod.set_provider_key(info.id, parts)
+        print(f"Saved {info.display_name} key to the macOS Keychain.")
+        result = connect_mod.test_provider(info.id)
+        if not result.ok:
+            raise connect_mod.ConnectError(result.message)
+        print(result.message)
+        return {"providers": connect_mod.list_providers()}
+    if verb == "test":
+        if args.provider is None:
+            tested = [entry for entry in connect_mod.list_providers()
+                      if entry["connected"]]
+            failures = []
+            for entry in tested:
+                result = connect_mod.test_provider(entry["id"])
+                print(result.message)
+                if not result.ok:
+                    failures.append(result)
+            if failures:
+                raise connect_mod.ConnectError(failures[0].message)
+            return {"providers": connect_mod.list_providers()}
+        result = connect_mod.test_provider(args.provider)
+        if not result.ok:
+            raise connect_mod.ConnectError(result.message)
+        print(result.message)
+        return {"providers": connect_mod.list_providers()}
+    if verb == "remove":
+        info = connect_mod.provider_info(args.provider)
+        before = connect_mod.key_status(info.id)
+        connect_mod.remove_provider_key(info.id)
+        if before.source == "env":
+            if len(info.env_vars) == 1:
+                print(f"{info.display_name} is connected through "
+                      f"{info.env_vars[0]}; unset it to disconnect.")
+            else:
+                print(f"{info.display_name} is connected through "
+                      f"{' and '.join(info.env_vars)}; unset them to disconnect.")
+        elif before.connected:
+            print(f"Removed the saved {info.display_name} key.")
+        else:
+            print(f"{info.display_name}: not connected")
+        return {"providers": connect_mod.list_providers()}
+    raise connect_mod.ConnectError(
+        f"connect: unknown verb '{verb}' (known: list, add, test, remove)")
+
+
+def command_finish(args: argparse.Namespace) -> dict:
+    from . import finish as finish_mod
+
+    require_ffmpeg_binaries()
+    if args.loudness is not None and not -20.0 <= float(args.loudness) <= -10.0:
+        raise ValueError("--loudness must be between -20 and -10")
+    if float(args.max_provider_usd) < 0:
+        raise ValueError("--max-provider-usd must be >= 0")
+    if float(args.max_usd) < 0:
+        raise ValueError("--max-usd must be >= 0")
+    explicit = [args.video, args.angles, args.tighten, args.words, args.taste]
+    if args.job is not None and any(explicit):
+        raise ValueError("--job cannot be combined with "
+                         "--video/--angles/--tighten/--words/--taste")
+    if args.job is not None:
+        job = Path(args.job)
+        if not job.exists():
+            raise ValueError(f"--job must exist: {job}")
+        if not (job / "cut.mp4").exists():
+            raise ValueError(f"--job has no cut.mp4: {job}")
+        if not (job / "angles.json").exists():
+            raise ValueError(f"--job has no angles.json: {job}")
+        video = job / "cut.mp4"
+        print(f"This will replace the audio of {video} (video stream copied).")
+        payload = finish_mod.run(
+            job_dir=job, model=args.model, no_muse=bool(args.no_muse),
+            sound=bool(args.sound), isolate=bool(args.isolate),
+            loudness=(None if args.loudness is None else float(args.loudness)),
+            max_provider_usd=float(args.max_provider_usd),
+            max_usd=float(args.max_usd))
+        finish_file = job / "finish.json"
+    elif args.video is not None or args.angles is not None:
+        if args.video is None:
+            raise ValueError("director finish needs --video CUT.mp4 (or --job DIR)")
+        if args.angles is None:
+            raise ValueError("director finish needs --angles ANGLES.json (or --job DIR)")
+        video = Path(args.video)
+        if not video.exists():
+            raise ValueError(f"--video must exist: {video}")
+        angles = Path(args.angles)
+        if not angles.exists():
+            raise ValueError(f"--angles must exist: {angles}")
+        for flag in ("tighten", "words", "taste"):
+            given = getattr(args, flag)
+            if given is not None and not Path(given).exists():
+                raise ValueError(f"--{flag} must exist: {given}")
+        tighten = (Path(args.tighten) if args.tighten
+                   else video.parent / "tighten.json")
+        words = (Path(args.words) if args.words
+                 else video.parent / "words.json")
+        taste = (Path(args.taste) if args.taste
+                 else video.parent / "taste.json")
+        finish_file = video.parent / "finish.json"
+        print(f"This will replace the audio of {video} (video stream copied).")
+        payload = finish_mod.run_files(
+            video_path=video, angles_path=angles,
+            tighten_path=tighten if tighten.exists() else None,
+            words_path=words if words.exists() else None,
+            taste_path=taste if taste.exists() else None,
+            out_path=finish_file, model=args.model,
+            no_muse=bool(args.no_muse), sound=bool(args.sound),
+            isolate=bool(args.isolate),
+            loudness=(None if args.loudness is None else float(args.loudness)),
+            max_provider_usd=float(args.max_provider_usd),
+            max_usd=float(args.max_usd))
+    else:
+        raise ValueError("director finish needs --job DIR or --video/--angles")
+    _print_finish_summary(video, finish_file, payload)
+    return payload
+
+
+def _print_finish_summary(video: Path, finish_file: Path, payload: dict) -> None:
+    voice = payload.get("voice") or {}
+    method = "isolated voice" if voice.get("method") == "isolated" else "local master"
+    after = payload.get("loudness_after") or {}
+    try:
+        loud_text = f"{float(after['integrated_lufs']):.1f}"
+    except (TypeError, ValueError, KeyError):
+        loud_text = "unmeasured"
+    try:
+        target_text = f"{float(payload.get('target_lufs', -14.0)):g}"
+    except (TypeError, ValueError):
+        target_text = "-14"
+    assets = payload.get("assets") or []
+    try:
+        provider = float(payload.get("provider_spend_usd") or 0.0)
+    except (TypeError, ValueError):
+        provider = 0.0
+    if not assets:
+        print(f"Finished {video}: {method}, {loud_text} LUFS "
+              f"(target {target_text}), 0 assets, $0.00 provider")
+    else:
+        kinds = [asset.get("kind") for asset in assets if isinstance(asset, dict)]
+        bits = []
+        if "music" in kinds:
+            bits.append("1 bed")
+        n_fx = sum(1 for kind in kinds if kind in ("riser", "whoosh", "impact"))
+        if n_fx:
+            bits.append(f"{n_fx} effect{'s' if n_fx != 1 else ''}")
+        if bits:
+            print(f"Finished {video}: {method}, {' + '.join(bits)} "
+                  f"(${provider:.2f} provider est.), {loud_text} LUFS "
+                  f"(target {target_text})")
+        else:
+            print(f"Finished {video}: {method} (${provider:.2f} provider est.), "
+                  f"{loud_text} LUFS (target {target_text})")
+    print(f"Wrote {finish_file}")
+    for note in payload.get("notes", []) or []:
+        print(note)
+    for warning in payload.get("warnings", []) or []:
+        print(f"! {warning}")
+
+
 def command_cut(args: argparse.Namespace) -> dict:
     from . import cut as cut_mod
     from .sync import parse_methods
     from .tighten import parse_target
 
     require_ffmpeg_binaries()
+    if args.finish_loudness is not None and not -20.0 <= float(args.finish_loudness) <= -10.0:
+        raise ValueError("--finish-loudness must be between -20 and -10")
+    if float(args.max_provider_usd) < 0:
+        raise ValueError("--max-provider-usd must be >= 0")
     methods = parse_methods(args.methods)
     out_dir = Path(args.out_dir)
     before_ns = _cut_manifest_mtime_ns(out_dir)
@@ -339,6 +618,12 @@ def command_cut(args: argparse.Namespace) -> dict:
             target_s=parse_target(args.target) if args.target else None,
             no_transcribe=bool(args.no_transcribe),
             whisper_model=args.whisper_model,
+            no_finish=bool(args.no_finish),
+            finish_sound=bool(args.finish_sound),
+            finish_isolate=bool(args.finish_isolate),
+            finish_loudness=(None if args.finish_loudness is None
+                             else float(args.finish_loudness)),
+            max_provider_usd=float(args.max_provider_usd),
         )
     except Exception:
         # The stage lines are the progress log: on failure, show the stages
@@ -629,6 +914,19 @@ def build_parser() -> argparse.ArgumentParser:
                             help="Target kept length, M:SS or seconds (whole beats only)")
     cut_parser.add_argument("--max-usd", type=float, default=5.0,
                             help="Refuse above this estimated Meta spend")
+    cut_parser.add_argument("--no-finish", action="store_true",
+                            help="Omit finishing; keep the recorded audio as rendered")
+    cut_parser.add_argument("--finish-sound", action="store_true",
+                            help="Ask Spark for sound design and generate it "
+                            "when ElevenLabs is connected")
+    cut_parser.add_argument("--finish-isolate", action="store_true",
+                            help="Use ElevenLabs voice isolation when connected")
+    cut_parser.add_argument("--finish-loudness", type=float, default=None,
+                            help="Master target in LUFS, -20 to -10 "
+                            "(default -14, -16 the other choice)")
+    cut_parser.add_argument("--max-provider-usd", type=float, default=2.0,
+                            help="Job-wide ElevenLabs/Higgsfield cap "
+                            "(estimated list prices)")
     cut_parser.add_argument("--force", action="store_true",
                             help="Ignore fingerprints; re-run every enabled stage")
     cut_parser.add_argument("--name", default="Director cut",
@@ -672,6 +970,51 @@ def build_parser() -> argparse.ArgumentParser:
     voice_parser.add_argument("--no-whisper", action="store_true",
                               help="No local Whisper fallback when the Meta client is unavailable")
     voice_parser.set_defaults(func=command_voice)
+
+    connect_parser = sub.add_parser("connect", help="Manage outside-service API keys")
+    connect_sub = connect_parser.add_subparsers(dest="connect_verb")
+    connect_list = connect_sub.add_parser("list", help="Show every provider's connection")
+    connect_list.add_argument("--json", action="store_true", dest="connect_json",
+                              help="Print the providers list as JSON")
+    connect_add = connect_sub.add_parser("add", help="Save a key to the macOS Keychain")
+    connect_add.add_argument("provider", help="elevenlabs or higgsfield")
+    connect_add.add_argument("--key", default=None,
+                             help="ElevenLabs API key (else prompted, hidden)")
+    connect_add.add_argument("--key-id", default=None, help="Higgsfield key ID")
+    connect_add.add_argument("--key-secret", default=None, help="Higgsfield key secret")
+    connect_test = connect_sub.add_parser("test", help="Run a provider's cheap test call")
+    connect_test.add_argument("provider", nargs="?",
+                              help="elevenlabs or higgsfield (default: every connection)")
+    connect_remove = connect_sub.add_parser("remove", help="Delete the saved key")
+    connect_remove.add_argument("provider", help="elevenlabs or higgsfield")
+    connect_parser.set_defaults(func=command_connect)
+
+    finish_parser = sub.add_parser("finish", help="Clean, mix and master the cut's audio")
+    finish_parser.add_argument("--job", default=None,
+                               help="A director cut job directory")
+    finish_parser.add_argument("--video", default=None,
+                               help="Finished cut to master (with --angles)")
+    finish_parser.add_argument("--angles", default=None,
+                               help="angles.json from director angles")
+    finish_parser.add_argument("--tighten", default=None, help="tighten.json (optional)")
+    finish_parser.add_argument("--words", default=None, help="words.json (optional)")
+    finish_parser.add_argument("--taste", default=None, help="taste.json (optional)")
+    finish_parser.add_argument("--model", default="muse-spark-1.3")
+    finish_parser.add_argument("--no-muse", action="store_true",
+                               help="No sound design (clean and master only)")
+    finish_parser.add_argument("--sound", action="store_true",
+                               help="Ask Spark for sound design and generate it")
+    finish_parser.add_argument("--isolate", action="store_true",
+                               help="Use ElevenLabs voice isolation when connected")
+    finish_parser.add_argument("--loudness", type=float, default=None,
+                               help="Master target in LUFS, -20 to -10 "
+                               "(default -14, -16 the other choice)")
+    finish_parser.add_argument("--max-usd", type=float, default=5.0,
+                               help="Refuse the design call above this Meta spend")
+    finish_parser.add_argument("--max-provider-usd", type=float, default=2.0,
+                               help="Refuse provider calls above this cap "
+                               "(estimated list prices)")
+    finish_parser.set_defaults(func=command_finish)
 
     return parser
 

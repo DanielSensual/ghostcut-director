@@ -10,7 +10,7 @@ director cut /path/to/card-dump --out-dir job1
 director cut cam-a.mp4 cam-b.mp4 lav.wav --out-dir job1
 ```
 
-That runs the whole job in one output directory: sync puts every clip on one timeline, the audio clip's word timings are made explicit in the shared timebase, take picking keeps the best take of every beat and drops the flubs, each camera is graded to match, Muse Spark picks the angle for every spoken line and renders the horizontal master `cut.mp4` to publish, the same shots export as `timeline.fcpxml` for Final Cut Pro and `timeline.otio.json` for OTIO/Resolve tools, SAM 3.1 follows the speaker for the 9:16 `vertical.mp4`, and a whole-cut check verifies the result. `cut.json` records what ran, what it cost and what QC found. `director cut --no-muse --no-sam` runs fully offline (rule picks, centred vertical, mechanical QC only), and re-running the same command resumes: stages whose inputs did not change are skipped.
+That runs the whole job in one output directory: sync puts every clip on one timeline, the audio clip's word timings are made explicit in the shared timebase, take picking keeps the best take of every beat and drops the flubs, each camera is graded to match, Muse Spark picks the angle for every spoken line and renders the horizontal master `cut.mp4` to publish, finishing cleans and masters its audio, the same shots export as `timeline.fcpxml` for Final Cut Pro and `timeline.otio.json` for OTIO/Resolve tools, SAM 3.1 follows the speaker for the 9:16 `vertical.mp4`, and a whole-cut check verifies the result. `cut.json` records what ran, what it cost and what QC found. `director cut --no-muse --no-sam` runs fully offline (rule picks, centred vertical, local finish, mechanical QC only), and re-running the same command resumes: stages whose inputs did not change are skipped.
 
 ```bash
 director cut /path/to/card-dump --out-dir job1 --pause-limit 0.8 --target 3:00
@@ -57,6 +57,24 @@ director reframe cut.mp4 --out reframe.json --shots angles.json --render vertica
 
 Reframes the finished 16:9 cut to 9:16: shot cuts come from `angles.json` or scene detection, SAM 3.1 tracks the speaker, and a smoothed per-shot crop path is written to `reframe.json`.
 
+## Connecting keys and finishing
+
+Outside services plug in through one registry (`src/director/connect.py`): ElevenLabs generates sound effects, music beds and voice isolation for finishing; Higgsfield stores a key but has no finishing capability yet, so connecting it changes nothing. Keys live in the environment (`ELEVENLABS_API_KEY`, `HF_API_KEY_ID`/`HF_API_KEY_SECRET`, which win) or the macOS Keychain via the optional `connect` extra — never in a job file, a log or an error message, and no surface ever shows a saved key back.
+
+```bash
+pip install -e ".[connect]"                    # optional: Keychain storage
+director connect list                          # every provider, connected or not
+director connect add elevenlabs                # prompts hidden, then runs the cheap test
+director connect test                          # every connection, exits 1 if any fails
+director connect remove elevenlabs
+```
+
+The app's Connections button (top bar) is the same registry: Save never echoes, Test runs the same no-generation call, Remove deletes only what Director saved.
+
+Finishing runs inside `director cut` by default (`--no-finish` skips it) and by hand as `director finish --job job1` (or `--video cut.mp4 --angles angles.json` for a file that is not a job). It cleans the voice, optionally has Muse Spark place a music bed and a few effects and generates them, ducks them under the voice, masters two-pass to −14 LUFS / −1 dBTP (−16 on request), and remuxes the result as `cut.mp4`'s audio — so `vertical.mp4` inherits it. With no keys it still cleans, levels and masters locally. `finish/` keeps every generated file with its prompt, provider, estimated cost and licence note; `finish.json` records the voice method, the plan, the measured loudness and every fallback taken.
+
+Generated audio is billed to your provider account at list prices (`cut.json` carries the estimate, capped by `--max-provider-usd`, default $2.00); use of generated files is subject to your provider's terms for your plan — each asset's `finish.json` entry says so.
+
 ## The Director app
 
 The app is the same cut with a review step. Muse proposes timeline edits and I accept the ones I want; Render re-renders only what changed into the next version; about 35 checks run before a new version replaces the current one, and revert goes back to the previous version.
@@ -95,7 +113,7 @@ The estimate prints before anything is transcribed; notes over a minute ask firs
 ## Meta AI used
 
 - Muse Spark: take picks, proposed timeline edits, the angle choice for every line, and the grade-match check.
-- Muse Wonder: the designs for sync, angles, grade and reframe.
+- Muse Wonder: the designs for sync, angles, grade, reframe and finishing.
 - Muse Code: designed and built sync, angles, grade and reframe (see Who built what).
 - SAM 3.1: person tracking for the vertical reframe.
 
@@ -116,6 +134,8 @@ From [docs/muse-code/BUILD-LOG.md](docs/muse-code/BUILD-LOG.md) and the git log,
 | Take picking (`director tighten`, the `tighten` stage of `director cut`) | Designed by Muse Code on muse-wonder-1.0, built by Muse Code on muse-spark-1.3 |
 | Voice Transcribe transcript (`director transcribe`, the transcribe step of `director cut`) | Designed by Muse Code on muse-wonder-1.0, built by Muse Code on muse-spark-1.3 |
 | Voice notes and the app opening cut jobs | Designed by Muse Code on muse-wonder-1.0, built by Muse Code on muse-spark-1.3 |
+| Outside-service connections (`director connect`, the app's Connections panel) | Designed by Muse Code on muse-wonder-1.0, built by Muse Code on muse-spark-1.3 |
+| Finishing (`director finish`, the `finish` stage of `director cut`) | Designed by Muse Code on muse-wonder-1.0, built by Muse Code on muse-spark-1.3 |
 
 Sync and reframe were first built earlier in the event by Claude Code, inside GhostCut, where they are still public. The versions here are Muse Code's rewrites: it got only the briefs, never that code, and its run logs show no reads outside this repository and its installed packages. Both were checked against the same real recordings and cut ([BUILD-LOG](docs/muse-code/BUILD-LOG.md), Live test).
 
@@ -131,6 +151,7 @@ Built during the Meta Global AI Developer Hackathon (Oct 26 – Nov 4, 2026), on
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[director]"
 pip install -e ".[muse]"                              # optional: the Meta Model API client
+pip install -e ".[connect]"                           # optional: macOS Keychain key storage
 python -m unittest discover -s tests -p 'test_*.py'
 ```
 

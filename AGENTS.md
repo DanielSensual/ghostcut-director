@@ -36,8 +36,10 @@ skips is normal.
 - `transcribe.py`: the production-audio clip → Voice Transcribe turns (16 kHz WAV, silence chunks, speakers reconciled) aligned onto Whisper word times → enriched `words.json` + `transcript.json` (`director transcribe`, the words stage of `director cut`).
 - `voice.py`: a spoken note → Meta transcription (local Whisper fallback) → notes anchored by playhead, spoken timecode or quoted words → Muse Spark resolves each to checked `cutlist` operations → `voice.json`, applied with `--apply` (`director voice`, the app's mic and memo drop).
   - `export.py`: `angles.json` shots → FCPXML and OTIO timelines through the installed `ghostcut` exporters.
+  - `connect.py` + `elevenlabs.py` + `higgsfield.py`: the outside-service registry — env-or-Keychain keys, cheap no-generation test calls, key-free messages. ElevenLabs is sound effects, music and voice isolation over stdlib HTTP; Higgsfield stores a key and tests it only (no finishing capability yet).
+  - `finish.py`: the finished cut's voice cleaned locally (or isolated when connected and asked) → Muse Spark places a bed and effects (guestlist, optional) → the provider generates them → ducked under the voice → two-pass master → remuxed as `cut.mp4`'s audio. `finish/` keeps every asset with its licence note; `finish.json` records the plan, the measured loudness and every fallback.
 - `app/` — the Director Mac app: `main.py` (pywebview window), `engine.py` (local server), `muse.py` (Muse edits), `cutjob.py` (opens a `director cut` job as a project, re-renders it),
-  `render*.py` (re-render accepted edits, verify, promote, revert), `make_demo.py` (timeline from a cut).
+  `render*.py` (re-render accepted edits, verify, promote, revert), `make_demo.py` (timeline from a cut), the Connections panel (outside-service keys, per machine).
 - `scripts/` — the first end-to-end Director test run and the day-1 take-picking spike.
 - `docs/` — design docs, Muse Code briefs and build logs, outside reviews.
 

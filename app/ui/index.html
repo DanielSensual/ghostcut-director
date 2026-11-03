@@ -25,6 +25,7 @@
   <div class="top-right">
     <span class="engine-dot" id="engineDot"></span>
     <button class="spend" id="spendBtn" title="Meta API spend on this project"></button>
+    <button class="conn" id="connBtn" title="Outside-service API keys">Connections</button>
     <button class="primary" data-view="deliver">Export</button>
   </div>
   <div class="pop" id="spendPop" hidden></div>
@@ -139,6 +140,14 @@
     <h3 id="renderDlgTitle">Render</h3>
     <div id="renderDlgBody"></div>
     <div class="dlg-acts"><button id="renderDlgClose">Close</button><button class="primary" id="renderStart" disabled>Start</button></div>
+  </div>
+</div>
+
+<div class="modal" id="connDlg" hidden>
+  <div class="dlg" role="dialog" aria-modal="true" aria-labelledby="connDlgTitle">
+    <h3 id="connDlgTitle">Connections</h3>
+    <div id="connDlgBody"></div>
+    <div class="dlg-acts"><button id="connDlgClose">Close</button></div>
   </div>
 </div>
 

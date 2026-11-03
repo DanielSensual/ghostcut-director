@@ -330,3 +330,77 @@ Live test: TBD (the owner fills this from the real-footage run).
 - Full suite: 496 tests (46 new), green except the same 11 pre-existing
   `ps`-sandbox errors in `tests/test_engine_render.py` and
   `tests/test_render_runner.py`.
+
+# Build log: connections + finishing (`connect`, `finish`) (2026-11-03)
+
+| Step | By | What |
+|---|---|---|
+| Brief | Project owner, with Claude Code | `FINISH-BRIEF.md`: outside-service keys, and finishing the cut's audio — clean voice, optional generated sound, mastered loudness. |
+| Design | Meta **Muse Code** on **`muse-wonder-1.0`** | `FINISH-DESIGN.md`: the provider registry, ElevenLabs/Higgsfield calls, the `finish` stage and `director finish`, the Connections panel. |
+| Build | Meta **Muse Code** on **`muse-spark-1.3`** | `src/director/connect.py`, `elevenlabs.py`, `higgsfield.py`, `finish.py`, the `finish` stage, `director connect`/`director finish`, `tests/test_connect.py`, `tests/test_finish.py`. |
+| Code review and live test | Claude Code, piloted by the owner | Real footage, below. |
+
+Muse Code token use: TBD (the owner fills this from the run log).
+Live test: TBD (the owner fills this from the real-footage run).
+
+## Build notes (Muse Code)
+
+- The design's engine section assumes `send_json`/`_json_body`
+  helpers the engine does not have, so the Connections routes use the
+  existing `_json`/`_body` dispatch and the existing `{"error": ...}`
+  envelope (the UI's error check reads `error`); paths, methods, the
+  64 KiB body cap and every message string are as designed. The panel
+  builds its rows with the existing `h()` text nodes rather than the
+  `esc()` helper the design names — no such helper exists, and text
+  nodes escape by construction.
+- Provider `transport` parameters default to `None` and resolve to
+  `http_request` at call time instead of binding it as the default:
+  a bound default would put the fake-transport seam the design's
+  tests use out of `mock.patch.object`'s reach.
+- `design_with_muse` returns the `cached` bit as a fifth element; the
+  designed 4-tuple cannot report it without inferring it from a
+  $0.00 spend.
+- `list_providers` carries two extra key-free fields the design's
+  own tests and panel need: `missing` (the half-pair var, item 3)
+  and `env_vars` (names only, for the panel's "Connected — from …"
+  line). `director connect list` prints the Higgsfield reason
+  without its " — see FINISH-DESIGN §1.6" tail, matching the
+  designed line.
+- `duck_mix_command` takes the taste-resolved `music_gain_db`
+  (default −20.0): the pinned signature has nowhere for the low
+  gain to enter the graph.
+- Measured FFmpeg behaviour the design does not mention: `amix`
+  upmixes a mono input implicitly at −3 dB per channel, so the duck
+  graphs duplicate the mono voice at unity with `pan` first
+  (`[0:a]asplit=2[vm][key];[vm]pan=stereo|c0=c0|c1=c0[v]`); without
+  it the voice sits 3 dB under its design level against stereo
+  stems. Provider-asset fixtures are stereo like real ElevenLabs
+  MP3s for the same reason (mono fixtures would misstate stem
+  levels another −3 dB through `-ac 2`/`aformat`).
+- The finish fingerprint is stored post-run: the stage rewrites
+  `cut.mp4`, so a pre-run print could never match on resume (every
+  resume would re-finish). Recomputing after execute keeps
+  cut.mp4-change detection and makes skip work.
+- A failed finish degrades (record `failed`, the job continues on
+  the untouched `cut.mp4`, final status `complete_with_warnings`).
+  The repo has no continue-after-failure path — a failed grade
+  fails the job — so this arm is new, per the design's
+  demo-must-ship rule.
+- `cut` passes `finish_path` to `export_timelines` only when the
+  finish stage ran (stage-shaped fakes keep working), the section
+  gains `finish_stems` only then, and the re-lay warning only when
+  stems exist.
+- Non-finite loudnorm values (pure silence) parse to unmeasurable,
+  routing silence through the designed single-pass fallback.
+- `connect test <provider>` raises on failure without pre-printing,
+  so the shell sees one `Error:` line, not two.
+- Full suite: 550 tests (54 new: 14 connections, 40 finishing),
+  green except the same 11 pre-existing `ps`-sandbox errors in
+  `tests/test_engine_render.py` and `tests/test_render_runner.py`
+  (verified identical on the pristine tree: sandbox
+  `PermissionError`, not this build).
+- By hand: `director finish` on a 6 s synthetic lavfi cut with no
+  keys connected (local clean + master only) reported `local
+  master, -14.0 LUFS (target -14), 0 assets, $0.00 provider`; an
+  independent loudnorm re-measure of the remuxed `cut.mp4` read
+  −14.02 LUFS integrated, −12.92 dBTP, picture untouched.

@@ -19,6 +19,7 @@ Repository = "https://github.com/DanielSensual/ghostcut-director"
 [project.optional-dependencies]
 muse = ["guestlist @ git+https://github.com/DanielSensual/guestlist"]
 director = ["numpy>=1.26", "Pillow>=10"]
+connect = ["keyring>=24"]
 
 [project.scripts]
 director = "director.cli:main"

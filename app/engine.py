@@ -54,6 +54,8 @@ CUTJOB_BUSY = "Re-rendering — {} after it finishes"
 LOG_TAIL = 256_000
 VOICE_MODEL = "muse-spark-1.3"
 VOICE_MAX_USD = 2.00
+CONNECTIONS_MAX_BODY = 64 * 1024
+NO_CONNECT = "Connections are unavailable in this app build (director package not found)."
 
 
 class Busy(Exception):
@@ -384,6 +386,77 @@ class Engine:
             raise ValueError(str(e)) from e
         return {"entries": payload.get("entries", [])}
 
+    # ---------- connections: outside-service keys (per-machine, no job) ----------
+
+    def _connect(self):
+        """director.connect, with src/ put on the path here (503 without it)."""
+        src = str(ROOT / "src")
+        if src not in sys.path:
+            sys.path.insert(0, src)
+        try:
+            from director import connect as connect_mod
+        except ImportError as e:
+            raise Unavailable(NO_CONNECT) from e
+        return connect_mod
+
+    def connections_list(self) -> dict:
+        cm = self._connect()
+        return {"providers": cm.list_providers()}
+
+    def connections_test(self, provider: str | None = None) -> dict:
+        cm = self._connect()
+        try:
+            if provider:
+                results = [cm.test_provider(provider)]
+            else:
+                results = [cm.test_provider(entry["id"])
+                           for entry in cm.list_providers()
+                           if entry["connected"]]
+        except cm.ConnectError as e:
+            raise ValueError(str(e)) from e
+        return {"providers": cm.list_providers(),
+                "tests": [{"provider": r.provider, "ok": r.ok,
+                           "message": r.message, "detail": r.detail}
+                          for r in results]}
+
+    def connections_add(self, provider: str, key: str | None = None,
+                        key_id: str | None = None,
+                        key_secret: str | None = None) -> dict:
+        cm = self._connect()
+        name = (provider or "").strip()
+        try:
+            info = cm.provider_info(name)
+        except cm.ConnectError as e:
+            raise ValueError(str(e)) from e
+        if info.id == "elevenlabs":
+            if not (key or "").strip():
+                raise ValueError("connect: missing 'key' for elevenlabs")
+            parts = (key or "",)
+        else:
+            if not (key_id or "").strip():
+                raise ValueError("connect: missing 'key_id' for higgsfield")
+            if not (key_secret or "").strip():
+                raise ValueError("connect: missing 'key_secret' for higgsfield")
+            parts = (key_id or "", key_secret or "")
+        try:
+            cm.set_provider_key(info.id, parts)
+        except cm.ConnectError as e:
+            raise ValueError(str(e)) from e
+        return {"providers": cm.list_providers()}
+
+    def connections_remove(self, provider: str) -> dict:
+        cm = self._connect()
+        name = (provider or "").strip()
+        try:
+            cm.provider_info(name)
+        except cm.ConnectError as e:
+            raise ValueError(str(e)) from e
+        try:
+            cm.remove_provider_key(name)
+        except cm.ConnectError as e:
+            raise ValueError(str(e)) from e
+        return {"providers": cm.list_providers()}
+
     def cutjob_status(self) -> dict:
         return dict(self._cutjob_state)
 
@@ -617,6 +690,8 @@ class Handler(SimpleHTTPRequestHandler):
             return self._call(self._project)
         if url.path == "/api/taste":
             return self._call(self.engine.taste_list)
+        if url.path == "/api/connections":
+            return self._call(self.engine.connections_list)
         if url.path == "/api/cutjob/rerender":
             return self._call(self.engine.cutjob_status)
         if url.path == "/api/render":
@@ -656,6 +731,13 @@ class Handler(SimpleHTTPRequestHandler):
         if self.headers.get("Content-Type", "").split(";")[0].strip() != "application/json":
             return self._json({"error": "JSON only"}, 415)
         path = urlparse(self.path).path
+        if path.startswith("/api/connections"):
+            try:
+                size = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                size = 0
+            if size > CONNECTIONS_MAX_BODY:
+                return self._json({"error": "Request too large"}, 400)
         return self._call(lambda: self._post(path, self._body()))
 
     def _post(self, path: str, body: dict) -> dict:
@@ -696,6 +778,14 @@ class Handler(SimpleHTTPRequestHandler):
             return e.taste_remove(str(body.get("id", "")))
         if path == "/api/cutjob/rerender":
             return e.start_cutjob_rerender()
+        if path == "/api/connections/test":
+            return e.connections_test(body.get("provider"))
+        if path == "/api/connections/add":
+            return e.connections_add(str(body.get("provider") or ""),
+                                     body.get("key"), body.get("key_id"),
+                                     body.get("key_secret"))
+        if path == "/api/connections/remove":
+            return e.connections_remove(str(body.get("provider") or ""))
         raise FileNotFoundError("unknown endpoint")
 
     # HTTP Range, so the video player can seek (Safari/WKWebView will not play without it).
