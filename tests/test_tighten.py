@@ -846,13 +846,13 @@ class AnglesIntegrationTests(unittest.TestCase):
     def test_audio_part_command(self) -> None:
         self.assertEqual(
             angles_mod.audio_part_command("/a.wav", 12.5, 3.0,
-                                          Path("/o.m4a")),
+                                          Path("/o.wav")),
             ["ffmpeg", "-v", "error", "-y",
              "-ss", "12.500000", "-t", "3.000000",
              "-i", "/a.wav", "-map", "0:a:0",
              "-af", ("afade=t=in:st=0:d=0.008,"
                      "afade=t=out:st=2.992000:d=0.008,aresample=48000"),
-             "-c:a", "aac", "-b:a", "192k", "/o.m4a"])
+             "-c:a", "pcm_s16le", "-ac", "1", "/o.wav"])
         short = angles_mod.audio_part_command("/a.wav", 0.0, 0.005,
                                               Path("/o.m4a"))
         self.assertIn("afade=t=out:st=0.000000:d=0.008", " ".join(short))
@@ -927,3 +927,61 @@ class SyntheticRenderTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"),
+                     "needs ffmpeg and ffprobe")
+class ManySpanRenderTests(unittest.TestCase):
+    def test_many_kept_spans_keep_audio_on_the_picture(self) -> None:
+        # Live 2026-11-03: nine kept spans, each encoded to AAC on its own, left the audio
+        # 0.26 s longer than the picture. Parts are PCM now; AAC is encoded once.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            for name in ("a.mp4", "b.mp4"):
+                done = subprocess.run(
+                    ["ffmpeg", "-v", "error", "-y",
+                     "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=30:duration=20",
+                     "-f", "lavfi", "-i", "sine=frequency=440:duration=20",
+                     "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                     "-c:a", "aac", "-shortest", str(tmp_path / name)],
+                    capture_output=True, text=True)
+                self.assertEqual(done.returncode, 0, msg=done.stderr)
+            sync = _write_sync(
+                tmp_path / "sync.json",
+                [_sync_clip("A", str(tmp_path / "a.mp4"), 0.0, duration=20.0,
+                            width=320, height=180),
+                 _sync_clip("B", str(tmp_path / "b.mp4"), 0.0, duration=20.0,
+                            width=320, height=180)],
+                str(tmp_path / "a.mp4"))
+            # Eight different sentences: each becomes its own beat and kept span.
+            sentences = ["Cameras roll.", "Drones fly.", "Lights flicker.", "Editors sleep.",
+                         "Clients wait.", "Takes repeat.", "Audio drifts.", "Picture holds."]
+            timed = []
+            for i, sentence in enumerate(sentences):
+                first, second = sentence.split()
+                t = 1.0 + 2.2 * i
+                timed += [_w(first, t, t + 0.4), _w(second, t + 0.5, t + 0.9)]
+            words = _write_words(tmp_path / "words.json", timed)
+            tighten_path = tmp_path / "tighten.json"
+            payload = tighten_mod.run(
+                sync_path=sync, words_path=words, out_path=tighten_path,
+                audio_label="A", pause_limit_s=0.8, target_s=None,
+                model="muse-spark-1.3", no_muse=True, max_usd=5.0)
+            self.assertGreaterEqual(len(payload["kept_spans"]), 6)
+            angles_mod.run(
+                sync_path=sync, words_path=words,
+                out_path=tmp_path / "angles.json", audio_label="A",
+                render_path=tmp_path / "cut.mp4", min_shot_s=0.2,
+                model="muse-spark-1.3", no_muse=True,
+                tighten_path=tighten_path)
+            durations = {}
+            for kind in ("v", "a"):
+                probed = subprocess.run(
+                    ["ffprobe", "-v", "error", "-select_streams", f"{kind}:0",
+                     "-show_entries", "stream=duration", "-of", "csv=p=0",
+                     str(tmp_path / "cut.mp4")], capture_output=True, text=True)
+                durations[kind] = float(probed.stdout.strip())
+            self.assertGreater(durations["v"], 10.0)
+            # Before the fix: +21 ms over 8 spans (and +0.26 s over the real job's 38 parts).
+            self.assertLess(abs(durations["v"] - durations["a"]), 0.010,
+                            msg=f"video {durations['v']:.3f} s vs audio {durations['a']:.3f} s")

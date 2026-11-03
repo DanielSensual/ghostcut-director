@@ -376,10 +376,12 @@ class ChainTests(unittest.TestCase):
         self.assertIn("in_range=full", vf)
 
     def test_no_lut_is_the_legacy_look(self) -> None:
-        self.assertEqual(
-            lut_filter_chain(SourceColour(), None, "30"),
-            "scale=1920:1080:force_original_aspect_ratio=decrease:flags=lanczos,"
-            "pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p")
+        from director.grade import FILL_OR_FIT
+        self.assertEqual(lut_filter_chain(SourceColour(), None, "30"),
+                         f"{FILL_OR_FIT},fps=30,format=yuv420p")
+        # near-widescreen fills (no letterbox), vertical keeps its whole picture
+        self.assertIn("between(a,1.4,2.4)", FILL_OR_FIT)
+        self.assertIn("pad=1920:1080", FILL_OR_FIT)
 
     def test_bad_lut_path(self) -> None:
         with self.assertRaises(GradeError):
@@ -420,7 +422,7 @@ class AnglesGradeTests(unittest.TestCase):
         self.assertNotIn("lut3d", black)
         ungraded = parts[2][parts[2].index("-vf") + 1]
         self.assertNotIn("lut3d", ungraded)
-        self.assertIn("scale=1920:1080", ungraded)
+        self.assertIn("pad=1920:1080", ungraded)
         for cmd in parts:
             self.assertEqual(cmd[cmd.index("-color_primaries") + 1], "bt709")
 
@@ -727,3 +729,14 @@ class GradeCommandTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReferenceChoiceTests(unittest.TestCase):
+    def test_audio_recorder_reference_falls_back_to_first_camera(self) -> None:
+        from director.grade import GradeClip, choose_reference
+        clips = [GradeClip("A", "lav.wav", "", 0.0, 692.0, width=0),
+                 GradeClip("B", "sony.mp4", "s-log3-cine", 151.6, 152.1, width=3840),
+                 GradeClip("C", "dji.mov", "rec709", 143.5, 162.0, width=5120)]
+        self.assertEqual(choose_reference(clips, "A", None), "B")
+        self.assertEqual(choose_reference(clips, "A", "C"), "C")
+        self.assertEqual(choose_reference(clips[1:], "B", None), "B")

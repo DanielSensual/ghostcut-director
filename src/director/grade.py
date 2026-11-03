@@ -459,6 +459,21 @@ def parse_lut_specs(items: list[str]) -> dict[str, Path]:
 
 # ---------------------------------------------------------------- sync views, probe, sampling, match
 
+def choose_reference(clips: list[GradeClip], sync_label: str,
+                     reference_label: str | None) -> str:
+    """The camera to match colour to: --reference, else the sync reference, unless that has
+    no picture (an audio recorder), in which case the first placed camera. Pure."""
+    if reference_label:
+        return reference_label
+    by_label = {c.label: c for c in clips}
+    if sync_label in by_label and by_label[sync_label].width <= 0:
+        cameras = sorted((c for c in clips if c.width > 0 and c.offset_s is not None),
+                         key=lambda c: c.label)
+        if cameras:
+            return cameras[0].label
+    return sync_label
+
+
 def load_sync_for_grade(path: Path) -> tuple[str, list[GradeClip]]:
     """sync.json reference clip's label plus one GradeClip view per clip."""
     data = read_json(Path(path))
@@ -548,6 +563,17 @@ def _input_scale(colour: SourceColour) -> str:
             f":out_range=full:flags=accurate_rnd+full_chroma_int")
 
 
+# Frame a camera into the 16:9 master. Near-widescreen sources (aspect 1.4 to 2.4: a DJI
+# 5120x2700 at 1.9:1, a 2.39 anamorphic) fill the frame with a small centre crop: letterbox
+# bars that come and go on every angle change are worse. Vertical or 4:3 footage keeps its
+# whole picture, pillarboxed. The single quotes keep the commas inside the expressions.
+FILL_OR_FIT = (
+    f"scale=w='if(between(a,1.4,2.4),if(gte(a,16/9),-2,{OUT_W}),if(gte(a,16/9),{OUT_W},-2))'"
+    f":h='if(between(a,1.4,2.4),if(gte(a,16/9),{OUT_H},-2),if(gte(a,16/9),-2,{OUT_H}))'"
+    f":flags=lanczos,crop='min(iw,{OUT_W})':'min(ih,{OUT_H})',"
+    f"pad={OUT_W}:{OUT_H}:(ow-iw)/2:(oh-ih)/2,setsar=1")
+
+
 def lut_filter_chain(colour: SourceColour, lut: Path | None, fps: str = "30") -> str:
     """The -vf for one graded shot. lut=None is today's legacy look verbatim.
 
@@ -558,10 +584,8 @@ def lut_filter_chain(colour: SourceColour, lut: Path | None, fps: str = "30") ->
     matters because the join is stream copy.
     """
     if lut is None:
-        return (f"scale={OUT_W}:{OUT_H}:force_original_aspect_ratio=decrease:flags=lanczos,"
-                f"pad={OUT_W}:{OUT_H}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps},format=yuv420p")
-    graded = (f"scale={OUT_W}:{OUT_H}:force_original_aspect_ratio=decrease:flags=lanczos,"
-              f"pad={OUT_W}:{OUT_H}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps},"
+        return f"{FILL_OR_FIT},fps={fps},format=yuv420p"
+    graded = (f"{FILL_OR_FIT},fps={fps},"
               f"scale=out_color_matrix=bt709:out_range=tv,format=yuv420p,"
               f"setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv")
     return (f"{_input_scale(colour)},format=rgb48le,"
@@ -843,7 +867,7 @@ def run(*, sync_path: Path, out_path: Path, reference_label: str | None = None,
     warnings: list[str] = []
     sync_label, clips = load_sync_for_grade(sync_path)
     by_label = {c.label: c for c in clips}
-    label = reference_label or sync_label
+    label = choose_reference(clips, sync_label, reference_label)
     if label not in by_label:
         raise ValueError(f"Unknown --reference label: {label}")
     reference = by_label[label]

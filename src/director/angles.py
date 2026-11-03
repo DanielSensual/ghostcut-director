@@ -867,7 +867,11 @@ def frame_grid(shots: list[Shot], fps: float) -> list[float]:
 
 def audio_part_command(audio_path: str, audio_in_s: float,
                        duration_s: float, out: Path) -> list[str]:
-    """One tightened audio part: the kept span's sound with click-killing fades."""
+    """One tightened audio part: the kept span's sound with click-killing fades.
+
+    PCM, not AAC: every AAC file carries encoder priming and frame padding (~20–40 ms), and
+    a cut of nine parts drifted 0.26 s behind the picture. The join encodes AAC once.
+    """
     fade_out_start = max(0.0, duration_s - CROSSFADE_S)
     return ["ffmpeg", "-v", "error", "-y",
             "-ss", f"{audio_in_s:.6f}", "-t", f"{duration_s:.6f}",
@@ -875,7 +879,7 @@ def audio_part_command(audio_path: str, audio_in_s: float,
             "-af", (f"afade=t=in:st=0:d={CROSSFADE_S},"
                     f"afade=t=out:st={fade_out_start:.6f}:d={CROSSFADE_S},"
                     f"aresample={AUDIO_SR}"),
-            "-c:a", "aac", "-b:a", "192k", str(out)]
+            "-c:a", "pcm_s16le", "-ac", "1", str(out)]
 
 
 def _snapped_span_audio(shots: list[Shot], kept_spans: list[dict],
@@ -976,11 +980,12 @@ def render_commands(shots: list[Shot], clips_by_label: dict[str, SyncClip], audi
     for audio_in_s, duration_s, pos in _snapped_span_audio(shots, kept_spans, audio):
         parts.append(audio_part_command(
             audio.path, audio_in_s, duration_s,
-            parts_dir / f"audio_{pos:03d}.m4a"))
+            parts_dir / f"audio_{pos:03d}.wav"))
     final = ["ffmpeg", "-v", "error", "-y",
              "-f", "concat", "-safe", "0", "-i", str(parts_dir / "parts.txt"),
              "-f", "concat", "-safe", "0", "-i", str(parts_dir / "audio_parts.txt"),
-             "-map", "0:v:0", "-map", "1:a:0", "-c", "copy",
+             "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy",
+             "-c:a", "aac", "-b:a", "192k",
              "-movflags", "+faststart", str(out)]
     return parts, "\n".join(listing) + "\n", final
 

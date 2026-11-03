@@ -256,7 +256,7 @@ class CommandTests(unittest.TestCase):
         for cmd in parts:
             self.assertTrue(all(isinstance(x, str) for x in cmd))
             self.assertEqual(cmd.count("-i"), 1)  # one decoder open at a time
-            self.assertIn("scale=1920:1080", " ".join(cmd))
+            self.assertIn("pad=1920:1080", " ".join(cmd))
         # 30 fps: 3 s, 1 s and 3 s are exactly 90, 30 and 90 frames
         self.assertEqual([cmd[cmd.index("-frames:v") + 1] for cmd in parts], ["90", "30", "90"])
         self.assertEqual(parts[0][parts[0].index("-ss") + 1], "2.000000")
