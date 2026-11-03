@@ -18,7 +18,7 @@ Demo video (3 minutes): VIDEO_LINK_HERE — placeholder, the link goes here.
 
 ## Built with Meta's AI
 
-This repository is the work that Meta's Muse Code designed and built during the event. The pattern for most features was: I and Claude Code wrote a brief, Muse Code on `muse-wonder-1.0` wrote the design, and Muse Code on `muse-spark-1.3` wrote the code and tests. Sections below cite [docs/muse-code/BUILD-LOG.md](docs/muse-code/BUILD-LOG.md) for every number.
+Most of this repository is work that Meta's Muse Code designed and built during the event; the Director app and its render checks were built by Claude Code with me (see Who built what). The pattern for most features was: I and Claude Code wrote a brief, Muse Code on `muse-wonder-1.0` wrote the design, and Muse Code on `muse-spark-1.3` wrote the code and tests. Sections below cite [docs/muse-code/BUILD-LOG.md](docs/muse-code/BUILD-LOG.md) for every number.
 
 - **Muse Code chose `director cut` itself.** The brief for that piece ([docs/muse-code/OPEN-BRIEF.md](docs/muse-code/OPEN-BRIEF.md)) listed problems an editor hits and left the choice of what to build open. Muse Code chose the one-step `director cut` command — folder in, finished job out — and designed it in `OPEN-DESIGN.md` before building it (BUILD-LOG.md, "Build log: `director cut` (2026-11-03)").
 - **Muse Spark inside the product.** Spark picks takes (`tighten`), picks the camera for each line (`angles`), proposes the title hook (`captions`), places sound in `finish`, resolves voice notes, and watches a proxy of the finished cut for the whole-cut QC pass. The mechanical checks run after it and can overrule it; every overrule is recorded (BUILD-LOG.md, "Build log: `ghostcut angles` (2026-11-01)"; "Build log: take picking (`tighten`) (2026-11-03)").
@@ -56,7 +56,7 @@ The same stages run by hand, one command at a time — see the commands referenc
 
 ## Tested on real footage
 
-These numbers are copied from the live-test sections of [docs/muse-code/BUILD-LOG.md](docs/muse-code/BUILD-LOG.md). Nothing here comes from synthetic tests.
+These numbers are copied from the live-test sections of [docs/muse-code/BUILD-LOG.md](docs/muse-code/BUILD-LOG.md). Two rows (the local master and the demo) are synthetic and say so; every other row is real footage.
 
 | Check | What was measured | Result |
 |---|---|---|
