@@ -444,7 +444,7 @@ def build_parser() -> argparse.ArgumentParser:
     sync_parser.add_argument("--reference", default=None,
                              help="Reference clip (default: the longest clip)")
     sync_parser.add_argument("--methods", default=None,
-                             help="Subset of timecode,clock,waveform,whisper")
+                             help="Subset of timecode,clock,waveform,flash,whisper")
     sync_parser.add_argument("--transcripts", default=None,
                              help="Directory of word-timed Whisper JSON transcripts")
     sync_parser.add_argument("--whisper-model", default=WHISPER_MODEL,
@@ -477,7 +477,7 @@ def build_parser() -> argparse.ArgumentParser:
     cut_parser.add_argument("--transcripts", default=None,
                             help="Directory of per-clip word-timed Whisper JSON transcripts")
     cut_parser.add_argument("--methods", default=None,
-                            help="Subset of timecode,clock,waveform,whisper")
+                            help="Subset of timecode,clock,waveform,flash,whisper")
     cut_parser.add_argument("--whisper-model", default=WHISPER_MODEL,
                             help="Local Whisper model for word timings (mlx_whisper --model)")
     cut_parser.add_argument("--no-grade", action="store_true",
