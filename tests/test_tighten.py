@@ -336,6 +336,28 @@ class VerifyTests(unittest.TestCase):
         duration = float(commands[0][commands[0].index("-t") + 1])
         self.assertLessEqual(duration, 2.3 + 1e-6)
 
+    def test_last_word_ending_just_after_the_clip_still_reaches_spark(self) -> None:
+        # Live 2026-11-03 again: the final word ended a fraction of a second after the
+        # covering camera's last frame, and the whole take fell back to the rule.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            sync = _write_sync(
+                tmp_path / "sync.json",
+                [_sync_clip("A", str(tmp_path / "a.mp4"), 0.0, duration=1.8)],
+                str(tmp_path / "a.mp4"))
+            words = _write_words(
+                tmp_path / "words.json",
+                [_w("hello", 1.0, 1.4), _w("there.", 1.5, 2.0)])
+            reply = types.SimpleNamespace(data="garbage", usd=0.0, cached=False)
+            with _fake_guestlist(reply) as calls, _no_proxy():
+                payload = tighten_mod.run(
+                    sync_path=sync, words_path=words,
+                    out_path=tmp_path / "tighten.json",
+                    audio_label="A", pause_limit_s=0.8, target_s=None,
+                    model="muse-spark-1.3", no_muse=False, max_usd=5.0)
+        self.assertNotIn("tighten_window_no_video:0", payload["warnings"])
+        self.assertTrue(any(call[0] == "video_json" for call in calls))
+
 
 class RuleTests(unittest.TestCase):
     def test_rule_beats_keeps_last_full_pass(self) -> None:

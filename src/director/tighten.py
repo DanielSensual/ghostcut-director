@@ -31,6 +31,7 @@ from .cutlist import HEAD_PAD_S, PAUSE_KEEP_S, TAIL_PAD_S  # noqa: F401 (re-expo
 MAX_UTTERANCE_S = 6.0
 UTTERANCE_PAUSE_S = 1.2
 WINDOW_MAX_S = 240.0
+COVER_SLACK_S = 0.5
 WINDOW_MAX_UTTERANCES = 60
 WINDOW_TAIL_S = 15.0
 PROXY_FPS = 5
@@ -955,8 +956,10 @@ def run(*, sync_path: Path, words_path: Path, out_path: Path,
                 if not owned:
                     break
                 candidate_end = candidate.offset_s + candidate.duration_s
-                if (candidate.offset_s <= owned[0].start_s + 1e-9
-                        and max(u.end_s for u in owned) <= candidate_end + 1e-9):
+                # Half a second of slack: a word that ends just after the clip still counts
+                # (the words stage keeps words by midpoint); the window is clipped below.
+                if (candidate.offset_s <= owned[0].start_s + COVER_SLACK_S
+                        and max(u.end_s for u in owned) <= candidate_end + COVER_SLACK_S):
                     video, covered = candidate, True
                     window = replace(window,
                                      start_s=max(window.start_s, candidate.offset_s),
