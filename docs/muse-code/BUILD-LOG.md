@@ -629,3 +629,52 @@ Live test: TBD (the owner fills this from the real-footage run).
   level −0.4 dB; mastered −14.82 LUFS, final true peak −0.99 dBTP (limiter transparent).
   Test outputs went to `/tmp/muse-air-test/`: this sandbox forbids writes to the named
   `/Volumes/.../muse-air-test/` folder (reads worked).
+
+# Build log: slow push-in on every shot (`--push-in`) (2026-11-03)
+
+| Step | By | What |
+|---|---|---|
+| Brief | Project owner, with Claude Code | `PUSH-BRIEF.md`: a slow push-in on every shot, from the owner's note on the final take ("the video looks good, need a slight push-in effect on it"). |
+| Build | Meta **Muse Code** on **`muse-spark-1.3`** | The push-in segment in `src/director/angles.py`, `--push-in` in `cli.py`/`cut.py`/`cutjob.py`, `tests/test_push_in.py` (22 tests) plus 2 cut tests. Built straight from the brief (no separate design). |
+
+Muse Code token use: TBD (the owner fills this from the run log).
+
+## Build notes (Muse Code)
+
+- Each rendered camera shot scales from 100% on its first frame to
+  (100 + PERCENT)% on its last, in the same per-shot filter chain after the
+  grade and the fill-or-fit framing, at the output size. Black shots are
+  untouched, shot boundaries stay on `frame_grid`, durations are unchanged.
+- The zoom centre eases from the frame centre to the speaker: one face
+  sample per shot at the shot's middle, rendered at the output size through
+  the shot's own grade and framing chain (so the box needs no coordinate
+  mapping) and read by one lips-helper run. The gaze/lips data carries no
+  persisted face boxes, so the shot-middle sample is the face source; when
+  it has no face the shot pushes about the frame centre. At 3-6% only
+  near-centre faces are reached; zoompan clamps the window at the frame
+  edges and the clamped drift stays smooth (measured, no jumps).
+- Smoothing was chosen by measurement on a synthetic bar pattern (black
+  bars on white, per-frame centroids against the ideal path; static noise
+  floor 0.00 px), hard case 3% over 120 frames: `scale` with `eval=frame`
+  plus `crop` with `iw`-based offsets is broken (crop x/y only re-evaluate
+  when the input size changes, and `iw` is then init-stale: the zoom pivots
+  about the top-left corner, +29 px error); zoompan with no upscale
+  stair-steps (rms 0.58 px, holds on half the frames); zoompan on a 2x
+  upscale still sawtooths (rms 0.29 px, max 1.13 px). The two 4x finalists
+  tie (zoompan rms 0.05 px, scale/crop rms 0.05 px, both with clamped drift
+  clean); zoompan won on render speed (2.3 s vs 4.0 s per 120 frames) and
+  on mechanism (documented per-frame z/x/y rather than the crop re-config
+  quirk). The committed render test asserts the brief's metric on the real
+  chain: frame-to-frame scale rises monotonically with no reversals and
+  lands at 1.05 for a 5% push.
+- `push_in` is recorded in `angles.json` and top-level in `cut.json`, and
+  is part of the angles render fingerprint, so changing it re-renders. The
+  app's re-render keeps the job's push-in on both paths.
+- Full suite: 727 tests (24 new: 22 in `tests/test_push_in.py`, 2 in
+  `tests/test_cut.py`), green except the same 11 pre-existing `ps`-sandbox
+  errors in `tests/test_engine_render.py` and `tests/test_render_runner.py`.
+- By hand, on a synthetic two-camera shoot (`testsrc2` + sine, all output
+  under `/tmp/pushcli/`): `director angles --no-muse --push-in 5 --render`
+  records `push_in: 5.0`, samples one face frame per shot, and renders
+  1920x1080 with the exact frame count and duration (102 frames, 3.4 s);
+  the pushed render differs from `--push-in 0` at the same duration.

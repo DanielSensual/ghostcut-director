@@ -639,7 +639,8 @@ class _CutStageFakes:
         return payload
 
     def angles_run(self, *, sync_path, words_path, out_path, audio_label,
-                   render_path, min_shot_s, model, no_muse, grade_path=None):
+                   render_path, min_shot_s, model, no_muse, grade_path=None,
+                   push_in=0.0):
         self.calls["angles"] += 1
         payload = {"version": 1, "sync": str(sync_path),
                    "words": str(words_path), "reference": "A",

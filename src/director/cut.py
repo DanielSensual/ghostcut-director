@@ -158,6 +158,8 @@ class JobOptions:
     title: str | None = None
     no_title: bool = False
     fonts_dir: str | None = None
+    # Slow push-in on every camera shot (PUSH-BRIEF.md). 0 disables.
+    push_in: float = 0.0
 
 
 @dataclass(slots=True)
@@ -875,7 +877,8 @@ def run(*, clips: list[Path], out_dir: Path,
         grade_reference: str | None = None,
         no_captions: bool = True, captions_preset: str = "house",
         captions_horizontal: bool = False, title: str | None = None,
-        no_title: bool = False, fonts_dir: str | None = None) -> dict:
+        no_title: bool = False, fonts_dir: str | None = None,
+        push_in: float = 0.0) -> dict:
     """One job: discover → sync → words → tighten → grade → angles → … → qc.
 
     The tighten stage runs unless no_tighten (the CLI enables it unless
@@ -890,6 +893,8 @@ def run(*, clips: list[Path], out_dir: Path,
         raise ValueError("--finish-loudness must be between -20 and -10")
     if min_shot_s < 0:
         raise ValueError("--min-shot must be >= 0")
+    if not push_in >= 0:
+        raise ValueError(f"--push-in must be >= 0, have {push_in}")
     out_dir = Path(out_dir)
     discovered = discover_clips([Path(clip) for clip in clips], out_dir)
     options = JobOptions(
@@ -913,7 +918,7 @@ def run(*, clips: list[Path], out_dir: Path,
         grade_reference=grade_reference,
         no_captions=no_captions, captions_preset=captions_preset,
         captions_horizontal=captions_horizontal, title=title,
-        no_title=no_title, fonts_dir=fonts_dir)
+        no_title=no_title, fonts_dir=fonts_dir, push_in=push_in)
     graded = not no_grade
     tightened = not no_tighten
 
@@ -989,6 +994,7 @@ def run(*, clips: list[Path], out_dir: Path,
             "out_dir": str(options.out_dir),
             "model": options.model,
             "max_usd": options.max_usd,
+            "push_in": options.push_in,
             "spend_usd": round(spent_usd, 4),
             "provider_spend_usd": round(provider_spent_usd, 4),
             "warnings": list(top_warnings),
@@ -1092,7 +1098,7 @@ def run(*, clips: list[Path], out_dir: Path,
                 "angles",
                 {"audio": audio_section["label"], "min_shot_s": options.min_shot_s,
                  "model": options.model, "no_muse": options.no_muse,
-                 "graded": graded},
+                 "graded": graded, "push_in": options.push_in},
                 files)
         if stage == "finish":
             taste_file = out_dir / "taste.json"
@@ -1423,6 +1429,7 @@ def run(*, clips: list[Path], out_dir: Path,
                 "min_shot_s": options.min_shot_s, "model": options.model,
                 "no_muse": options.no_muse,
                 "grade_path": out_dir / "grade.json" if graded else None,
+                "push_in": options.push_in,
             }
             if tightened:
                 angles_kwargs["tighten_path"] = out_dir / "tighten.json"

@@ -158,6 +158,7 @@ From [docs/muse-code/BUILD-LOG.md](docs/muse-code/BUILD-LOG.md) and the git log,
 | Try it with no footage (`director demo`) | Built by Muse Code on muse-spark-1.3 from DEMO-BRIEF.md |
 | Gaze angle choice and skin match (`look`) | Built by Muse Code on muse-spark-1.3 from LOOK-BRIEF.md, after the owner's review of the final take |
 | Mic-air de-plosive + peak limiter (the `finish` de-plosive, `--no-deplosive`) | Built by Muse Code on muse-spark-1.3 from AIR-BRIEF.md |
+| Slow push-in on every shot (`angles`/`cut --push-in`) | Built by Muse Code on muse-spark-1.3 from PUSH-BRIEF.md, after the owner's review of the final take |
 
 Sync and reframe were first built earlier in the event by Claude Code, inside GhostCut, where they are still public. The versions here are Muse Code's rewrites: it got only the briefs, never that code, and its run logs show no reads outside this repository and its installed packages. Both were checked against the same real recordings and cut ([BUILD-LOG](docs/muse-code/BUILD-LOG.md), Live test).
 

@@ -411,6 +411,10 @@ def rerender(job_dir: Path, demo: Path | None) -> dict:
         min_shot_s = float(angles.get("min_shot_s", 2.0))
     except (TypeError, ValueError):
         min_shot_s = 2.0
+    try:
+        push_in = float(angles.get("push_in", 0.0))
+    except (TypeError, ValueError):
+        push_in = 0.0
     model = str(angles.get("model") or "muse-spark-1.3")
     grade_path = None
     declared = angles.get("grade")
@@ -427,11 +431,12 @@ def rerender(job_dir: Path, demo: Path | None) -> dict:
                 out_path=job_dir / "angles.json",
                 audio_label=audio_label, render_path=nxt,
                 min_shot_s=min_shot_s, model=model, no_muse=False,
-                grade_path=grade_path, tighten_path=tighten_path)
+                grade_path=grade_path, tighten_path=tighten_path,
+                push_in=push_in)
             shots = payload.get("shots", [])
         else:
             _render_untightened(angles_mod, job_dir, audio_label,
-                                grade_path, nxt)
+                                grade_path, nxt, push_in)
             shots = angles.get("shots", [])
     except Exception:
         nxt.unlink(missing_ok=True)
@@ -461,7 +466,7 @@ def rerender(job_dir: Path, demo: Path | None) -> dict:
 
 def _render_untightened(angles_mod, job_dir: Path,  # type: ignore[no-untyped-def]
                         audio_label: str | None, grade_path: Path | None,
-                        out: Path) -> None:
+                        out: Path, push_in: float = 0.0) -> None:
     """Re-render the current angles.json shots as they stand."""
     reference, clips = angles_mod.load_sync(job_dir / "sync.json")
     by_label = {c.label: c for c in clips}
@@ -500,4 +505,4 @@ def _render_untightened(angles_mod, job_dir: Path,  # type: ignore[no-untyped-de
     grade = (angles_mod.load_grade(grade_path)
              if grade_path is not None else None)
     angles_mod.render(shots, by_label, audio, out, grade=grade,
-                      kept_spans=None)
+                      kept_spans=None, push_in=push_in)

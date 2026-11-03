@@ -440,10 +440,12 @@ class StageFakes:
         return payload
 
     def angles_run(self, *, sync_path, words_path, out_path, audio_label,
-                   render_path, min_shot_s, model, no_muse, grade_path=None):
+                   render_path, min_shot_s, model, no_muse, grade_path=None,
+                   push_in=0.0):
         self.calls["angles"] += 1
         payload = _angles_payload([_shot(0, 0.0, 3.0, "A"), _shot(1, 3.0, 6.0, "B")])
         payload["spend_usd"] = self.angles_spend
+        payload["push_in"] = push_in
         write_json(Path(out_path), payload)
         if render_path is not None:
             Path(render_path).touch()
@@ -638,7 +640,8 @@ class ResumeTests(unittest.TestCase):
             fakes = StageFakes()
 
             def _empty(*, sync_path, words_path, out_path, audio_label,
-                       render_path, min_shot_s, model, no_muse, grade_path=None):
+                       render_path, min_shot_s, model, no_muse, grade_path=None,
+                       push_in=0.0):
                 fakes.calls["angles"] += 1
                 raise ValueError("nothing to render")
 
@@ -1161,3 +1164,36 @@ class CameraCoverageTests(unittest.TestCase):
                  TimedWord("late", 400.0, 400.5)]
         self.assertEqual([w.text for w in words_on_camera(words, spans)], ["hello"])
         self.assertEqual(len(words_on_camera(words, [])), 3)
+
+
+class PushInTests(unittest.TestCase):
+    def test_cut_records_push_in_and_reruns_angles(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            first, second, words = _job_dir(tmp_path)
+            out_dir = tmp_path / "out"
+            fakes = StageFakes()
+            with _stubbed_run(self, fakes):
+                payload = _run_job(first, second, words, out_dir, push_in=4.0)
+            self.assertEqual(payload["push_in"], 4.0)
+            saved = json.loads((out_dir / "angles.json").read_text(encoding="utf-8"))
+            self.assertEqual(saved["push_in"], 4.0)
+            calls = dict(fakes.calls)
+            with _stubbed_run(self, fakes):
+                resumed = _run_job(first, second, words, out_dir, push_in=4.0)
+            self.assertEqual(dict(fakes.calls), calls)
+            self.assertEqual(resumed["stages"]["angles"]["status"], "skipped")
+            with _stubbed_run(self, fakes):
+                rerun = _run_job(first, second, words, out_dir, push_in=5.0)
+            self.assertEqual(rerun["push_in"], 5.0)
+            self.assertEqual(rerun["stages"]["angles"]["status"], "done")
+            self.assertEqual(fakes.calls["angles"], calls["angles"] + 1)
+
+    def test_cut_rejects_negative_push_in(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            first, second, words = _job_dir(tmp_path)
+            out_dir = tmp_path / "out"
+            with _stubbed_run(self, StageFakes()):
+                with self.assertRaises(ValueError):
+                    _run_job(first, second, words, out_dir, push_in=-1.0)

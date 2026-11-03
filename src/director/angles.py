@@ -10,10 +10,12 @@ ambiguous lines carry the gaze numbers in Spark's prompt. Mechanical checks
 overrule Muse when its camera does not cover the line, merge same-camera
 lines, merge short shots, and pin cuts to inter-word gaps. Without guestlist
 (--no-muse) a deterministic rule opens on the reference camera and alternates.
+With --push-in, each rendered camera shot creeps toward the speaker.
 """
 from __future__ import annotations
 
 import json
+import shutil
 from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
@@ -33,6 +35,8 @@ LONG_SHOT_S = 15.0
 SHOT_SIZES = ("wide", "medium", "close", "side")
 CROSSFADE_S = 0.008
 AUDIO_SR = 48000
+PUSH_UPSCALE = 4
+PUSH_FACES_DIR = "push-faces"
 
 DEVELOPER = (
     "You are Muse, the multicam angle picker inside GhostCut. You are given, for each of "
@@ -889,6 +893,147 @@ def _map_shots_to_output(shots: list[Shot], lines: list[Line],
     return out
 
 
+# ---------------------------------------------------------------- push-in (PUSH-BRIEF.md)
+
+def face_centre_from_box(box: tuple[float, float, float, float]) -> tuple[float, float]:
+    """Vision face box to a normalised zoom centre in ffmpeg coordinates. Pure.
+
+    Vision boxes are (x, y, w, h) normalised with the origin at the lower
+    left; the push-in wants (fx, fy) with the origin at the upper left.
+    Clamped into the frame.
+    """
+    x, y, w, h = (float(v) for v in box)
+    return (min(1.0, max(0.0, x + w / 2)),
+            min(1.0, max(0.0, 1.0 - (y + h / 2))))
+
+
+def push_in_filter(push_in: float, frames: int, fx: float, fy: float,
+                   fps_s: str) -> str:
+    """The push-in segment for one shot's filter chain, or "" when disabled. Pure.
+
+    `push_in` is percent: the shot scales from 100% on its first frame to
+    (100 + push_in)% on its last, linearly in the output frame count. The
+    zoom centre eases from the frame centre to (fx, fy), so a shot always
+    starts on its unpushed framing and creeps toward the speaker; zoompan
+    clamps the window at the frame edges, which is where an off-centre face
+    ends up (at these percents only near-centre faces are reached). The
+    input is upscaled 4x first so zoompan interpolates sub-pixel: measured
+    0.05 px rms against the ideal path, against 0.29 px at 2x and 0.58 px
+    with no upscale, with no reversals in the frame-to-frame scale.
+    """
+    if not push_in > 0 or frames <= 1:
+        return ""
+    fx = min(1.0, max(0.0, float(fx)))
+    fy = min(1.0, max(0.0, float(fy)))
+    last = frames - 1
+    gain = push_in / 100.0
+    up_w, up_h = OUT_W * PUSH_UPSCALE, OUT_H * PUSH_UPSCALE
+    if fx == 0.5 and fy == 0.5:
+        x = "iw/2-(iw/zoom/2)"
+        y = "ih/2-(ih/zoom/2)"
+    else:
+        x = f"(0.5+({fx:.6f}-0.5)*on/{last})*iw-(iw/zoom/2)"
+        y = f"(0.5+({fy:.6f}-0.5)*on/{last})*ih-(ih/zoom/2)"
+    return (f"scale={up_w}:{up_h}:flags=lanczos,"
+            f"zoompan=z='1+{gain:.6f}*on/{last}':x='{x}':y='{y}'"
+            f":d=1:s={OUT_W}x{OUT_H}:fps={fps_s}")
+
+
+def push_face_frame_command(clip_path: str, at_s: float, vf: str,
+                            out: Path) -> list[str]:
+    """One output-size face-sample frame through the shot's own grade and framing."""
+    return ["ffmpeg", "-v", "error", "-ss", f"{at_s:.3f}", "-i", clip_path,
+            "-frames:v", "1", "-vf", vf, "-q:v", "4", "-y", str(out)]
+
+
+def push_face_frame_name(shot_id: int, camera: str) -> str:
+    return f"P{shot_id:03d}_{camera}.jpg"
+
+
+def shot_face_centres(shots: list[Shot], clips_by_label: dict[str, SyncClip],
+                      grade: dict[str, GradeShotInfo] | None, fps_s: str,
+                      frames_dir: Path) -> dict[int, tuple[float, float]]:
+    """Normalised face centre per non-black shot, sampled at the shot's middle.
+
+    One frame per shot, rendered at the output size through the shot's own
+    grade and fill-or-fit chain so the box needs no coordinate mapping, then
+    one helper run reads them all. Anything that stops the sampling — no
+    ffmpeg, no helper, no face — leaves that shot (or every shot) without a
+    centre rather than raising; the render falls back to the frame centre.
+    Never raises.
+    """
+    try:
+        from .sync import build_lips_helper, run_lips_helper
+    except ImportError:
+        return {}
+    wanted_shots = [s for s in shots if s.camera != "black"]
+    if not wanted_shots or shutil.which("ffmpeg") is None:
+        return {}
+    try:
+        helper, _ = build_lips_helper()
+    except Exception:
+        return {}
+    if helper is None:
+        return {}
+    try:
+        Path(frames_dir).mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return {}
+    look = lut_filter_chain(SourceColour(), None, fps_s)
+    wanted: dict[str, int] = {}
+    for shot in wanted_shots:
+        clip = clips_by_label.get(shot.camera)
+        if clip is None or not clip.path:
+            continue
+        middle = (shot.start_s + shot.end_s) / 2
+        at = shot.clip_in_s + (middle - shot.start_s)
+        info = grade.get(shot.camera) if grade is not None else None
+        vf = lut_filter_chain(info.colour, info.lut, fps_s) if info and info.lut else look
+        name = push_face_frame_name(shot.id, shot.camera)
+        out = Path(frames_dir) / name
+        try:
+            cached = out.exists() and out.stat().st_size > 0
+        except OSError:
+            cached = False
+        if not cached:
+            try:
+                run_command(push_face_frame_command(clip.path, at, vf, out))
+            except Exception:
+                continue
+        try:
+            if out.exists() and out.stat().st_size > 0:
+                wanted[name] = shot.id
+        except OSError:
+            continue
+    if not wanted:
+        return {}
+    try:
+        found = run_lips_helper(helper, Path(frames_dir))
+    except Exception:
+        return {}
+    if found is None:
+        return {}
+    try:
+        ordered = sorted(p.name for p in Path(frames_dir).iterdir()
+                         if not p.name.startswith(".")
+                         and p.suffix.lower() in (".jpg", ".jpeg"))
+    except OSError:
+        return {}
+    by_index = {frame.index: frame for frame in found}
+    centres: dict[int, tuple[float, float]] = {}
+    for pos, name in enumerate(ordered):
+        if name not in wanted:
+            continue
+        frame = by_index.get(pos)
+        if frame is None or frame.box is None:
+            continue
+        try:
+            centres[wanted[name]] = face_centre_from_box(frame.box)
+        except (TypeError, ValueError):
+            continue
+    return centres
+
+
 # ---------------------------------------------------------------- render (list only; run_command does the work)
 
 def _out_fps(audio: SyncClip) -> str:
@@ -958,7 +1103,10 @@ def _snapped_span_audio(shots: list[Shot], kept_spans: list[dict],
 def render_commands(shots: list[Shot], clips_by_label: dict[str, SyncClip], audio: SyncClip,
                     out: Path, *,
                     grade: dict[str, GradeShotInfo] | None = None,
-                    kept_spans: list[dict] | None = None) -> tuple[list[list[str]], str, list[str]]:
+                    kept_spans: list[dict] | None = None,
+                    push_in: float = 0.0,
+                    face_centres: dict[int, tuple[float, float]] | None = None
+                    ) -> tuple[list[list[str]], str, list[str]]:
     """One ffmpeg run per shot, then a stream-copy join with the uncut audio laid under it.
 
     Shot by shot keeps one camera decoder open at a time: a single filtergraph over every 4K input
@@ -973,10 +1121,15 @@ def render_commands(shots: list[Shot], clips_by_label: dict[str, SyncClip], audi
     returned commands are then the video parts (one per shot, in order)
     followed by the audio parts (one per rendered span portion, in span
     order); render() splits them back apart by len(shots).
+    With push_in, each camera shot carries the push-in segment after its
+    grade and fill-or-fit framing (black shots are untouched); a shot's
+    centre comes from face_centres by shot id, else the frame centre.
     Returns (part commands, concat list text, final command).
     """
     if not shots:
         raise ValueError("nothing to render")
+    if not push_in >= 0:
+        raise ValueError(f"--push-in must be >= 0, have {push_in}")
     if grade is not None:
         unknown = sorted(set(grade) - set(clips_by_label))
         if unknown:
@@ -1001,6 +1154,14 @@ def render_commands(shots: list[Shot], clips_by_label: dict[str, SyncClip], audi
             cmd += ["-ss", f"{clip_in:.6f}", "-t", f"{dur + 1:.6f}", "-i", clips_by_label[shot.camera].path]
         info = grade.get(shot.camera) if grade is not None else None
         vf = lut_filter_chain(info.colour, info.lut, fps_s) if info and info.lut else look
+        if shot.camera != "black" and push_in > 0:
+            fx, fy = (face_centres or {}).get(shot.id, (0.5, 0.5))
+            segment = push_in_filter(push_in, frames, fx, fy, fps_s)
+            if segment:
+                needle = f"fps={fps_s},"
+                if vf.count(needle) != 1:
+                    raise ValueError("cannot place the push-in: unexpected filter chain")
+                vf = vf.replace(needle, f"{needle}{segment},", 1)
         cmd += ["-map", "0:v:0", "-vf", vf, "-frames:v", str(frames), "-an",
                 "-c:v", "libx264", "-preset", "medium", "-crf", "16"]
         if grade is not None:
@@ -1034,7 +1195,11 @@ def render_commands(shots: list[Shot], clips_by_label: dict[str, SyncClip], audi
 def render(shots: list[Shot], clips_by_label: dict[str, SyncClip],
            audio: SyncClip, out: Path,
            grade: dict[str, GradeShotInfo] | None = None,
-           kept_spans: list[dict] | None = None) -> None:
+           kept_spans: list[dict] | None = None,
+           push_in: float = 0.0,
+           face_centres: dict[int, tuple[float, float]] | None = None) -> None:
+    if not push_in >= 0:
+        raise ValueError(f"--push-in must be >= 0, have {push_in}")
     for shot in shots:
         if shot.camera == "black":
             continue
@@ -1043,8 +1208,15 @@ def render(shots: list[Shot], clips_by_label: dict[str, SyncClip],
             raise ToolingError(f"Clip file missing for camera {shot.camera}")
     if not Path(audio.path).exists():
         raise ToolingError(f"Audio file missing: {audio.path}")
+    if push_in > 0 and face_centres is None:
+        parts_dir = Path(out).with_name(Path(out).stem + ".parts")
+        face_centres = shot_face_centres(shots, clips_by_label, grade,
+                                         _out_fps(audio),
+                                         parts_dir / PUSH_FACES_DIR)
     parts, listing, final = render_commands(shots, clips_by_label, audio, out,
-                                            grade=grade, kept_spans=kept_spans)
+                                            grade=grade, kept_spans=kept_spans,
+                                            push_in=push_in,
+                                            face_centres=face_centres)
     parts_dir = Path(out).with_name(Path(out).stem + ".parts")
     parts_dir.mkdir(parents=True, exist_ok=True)
     for cmd in parts:
@@ -1063,13 +1235,19 @@ def render(shots: list[Shot], clips_by_label: dict[str, SyncClip],
 def run(*, sync_path: Path, words_path: Path, out_path: Path, audio_label: str | None,
         render_path: Path | None, min_shot_s: float, model: str, no_muse: bool,
         grade_path: Path | None = None,
-        tighten_path: Path | None = None) -> dict:
+        tighten_path: Path | None = None,
+        push_in: float = 0.0) -> dict:
     """Load, pick angles, check, optionally render, and write angles.json.
 
     With tighten_path, lines are built per kept span, shots are emitted on
     the output timeline (with their source times recorded), and the render
     cuts audio per kept span. Without it, behaviour is exactly as before.
+    With push_in, each rendered camera shot creeps from 100% to
+    (100 + push_in)% about the shot's face centre (the frame centre when
+    the shot has no face); black shots are untouched.
     """
+    if not push_in >= 0:
+        raise ValueError(f"--push-in must be >= 0, have {push_in}")
     sync_path, words_path, out_path = Path(sync_path), Path(words_path), Path(out_path)
     reference, clips = load_sync(sync_path)
     grade = load_grade(grade_path) if grade_path is not None else None
@@ -1179,7 +1357,8 @@ def run(*, sync_path: Path, words_path: Path, out_path: Path, audio_label: str |
             raise ValueError("nothing to render")
         render(shots, by_label, audio, Path(render_path), grade=grade,
                kept_spans=(tighten["kept_spans"] if tighten is not None
-                           else None))
+                           else None),
+               push_in=push_in)
 
     def shot_lut(shot: Shot) -> str | None:
         info = grade.get(shot.camera) if grade is not None else None
@@ -1213,6 +1392,7 @@ def run(*, sync_path: Path, words_path: Path, out_path: Path, audio_label: str |
         "method": method,
         "model": model,
         "min_shot_s": round(min_shot_s, 3),
+        "push_in": round(push_in, 3),
         "spend_usd": round(spend, 3),
         "warnings": warnings,
         "lines": [{"id": l.id, "start_s": round(l.start_s, 3), "end_s": round(l.end_s, 3),

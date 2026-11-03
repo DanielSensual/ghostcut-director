@@ -54,6 +54,7 @@ def command_angles(args: argparse.Namespace) -> dict:
         no_muse=bool(args.no_muse),
         grade_path=Path(args.grade) if getattr(args, "grade", None) else None,
         tighten_path=Path(args.tighten) if getattr(args, "tighten", None) else None,
+        push_in=float(getattr(args, "push_in", 0.0) or 0.0),
     )
     for shot in payload.get("shots", []):
         for overrule in shot.get("overrules", []):
@@ -681,6 +682,7 @@ def command_cut(args: argparse.Namespace) -> dict:
             title=args.title,
             no_title=bool(args.no_title),
             fonts_dir=args.fonts_dir,
+            push_in=float(args.push_in),
         )
     except Exception:
         # The stage lines are the progress log: on failure, show the stages
@@ -896,6 +898,9 @@ def build_parser() -> argparse.ArgumentParser:
     angles_parser.add_argument("--no-muse", action="store_true", help="Use the deterministic rule fallback")
     angles_parser.add_argument("--grade", default=None, help="grade.json from director grade")
     angles_parser.add_argument("--tighten", default=None, help="tighten.json from director tighten")
+    angles_parser.add_argument("--push-in", type=float, default=0.0,
+                               help="Slow push-in on every camera shot: percent zoom from "
+                                    "its first to its last frame (0 disables; try 3-6)")
     angles_parser.set_defaults(func=command_angles)
 
     tighten_parser = sub.add_parser("tighten", help="Pick the takes, lose the flubs")
@@ -982,6 +987,9 @@ def build_parser() -> argparse.ArgumentParser:
     cut_parser.add_argument("--model", default="muse-spark-1.3")
     cut_parser.add_argument("--min-shot", type=float, default=2.0,
                             help="Shorter shots merge into a neighbour")
+    cut_parser.add_argument("--push-in", type=float, default=0.0,
+                            help="Slow push-in on every camera shot: percent zoom from "
+                                 "its first to its last frame (0 disables; try 3-6)")
     cut_parser.add_argument("--no-vertical", action="store_true", help="Skip the 9:16 reframe")
     cut_parser.add_argument("--no-sam", action="store_true",
                             help="Centre every vertical shot, no SAM tracking")
