@@ -12,6 +12,7 @@ first sample sits on the timeline, so clip time `t` is timeline time
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -49,6 +50,8 @@ MARGIN_CLEAR = 0.08
 SECOND_PEAK_EXCLUSION_S = 1.0
 GUIDE_EXTRA_S = 0.5
 GUIDE_R_TOLERANCE = 0.02
+# mlx_whisper's own default is whisper-tiny, too loose for word edges that place cuts.
+WHISPER_MODEL = os.environ.get("DIRECTOR_WHISPER_MODEL", "mlx-community/whisper-large-v3-turbo")
 WHISPER_PHRASE_WORDS = 3
 WHISPER_CLUSTER_S = 0.3
 WHISPER_MIN_MOMENTS = 2
@@ -777,7 +780,7 @@ def get_transcript_words(clip: CameraInfo, transcripts_dir: Path | None,
     cache_dir.mkdir(parents=True, exist_ok=True)
     try:
         done = subprocess.run(
-            ["mlx_whisper", clip.path, "--output-format", "json",
+            ["mlx_whisper", clip.path, "--model", WHISPER_MODEL, "--output-format", "json",
              "--output-dir", str(cache_dir), "--word-timestamps", "True",
              "--verbose", "False"],
             capture_output=True, timeout=3600)
