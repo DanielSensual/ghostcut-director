@@ -114,6 +114,24 @@ Built by Muse Code on `muse-spark-1.3` from `docs/muse-code/FLASH-BRIEF.md`: the
 
 Muse Code token use: TBD (the owner fills this from the run log).
 
+## Lips method (Muse Code on `muse-spark-1.3`)
+
+Brief and validated recipe by the owner with Claude Code (`docs/muse-code/LIPS-BRIEF.md`), built by Muse Code on
+`muse-spark-1.3`: the sixth sync method, `lips`, for cameras with no usable audio. A shipped Swift helper reads
+Apple Vision inner-lip openings per frame (built once with `swiftc -O` into the cache, keyed by the source hash;
+the method skips with a warning when swiftc or Vision is unavailable). Each clip with picture gets a coarse
+low-resolution pass to find the median face box, then full-rate frames cropped around it with margin at full
+resolution (the camera's `.cube` from `grade.json` or a supplied cube applied first), scaled so the face is ~400 px
+tall, over the 300 s window with the most speech. The measured signal is kept as validated: 3-frame average minus
+the ~1 s average, z-scored, for lips and for band-passed log-RMS audio alike; Pearson correlation at each lag over
+the whole overlap; confidence from the best-over-rival-more-than-0.5-s-away ratio (below 1.5 cross-checks only,
+2 and up good); the clock only breaks near ties. Lips-vs-lips is reported first and preferred; resolution runs
+waveform → whisper → lips → flash → timecode → clock, and a lips placement is named with its ratio in the
+warnings (which is also how it reaches `cut.json`). Touched `src/director/sync.py`, the new
+`src/director/lips_helper.swift`, `tests/test_sync.py`, this section and one README line.
+
+Muse Code token use: TBD (the owner fills this from the run log).
+
 # Build log: `director reframe` (2026-11-02)
 
 Who did what, so the credit is exact.

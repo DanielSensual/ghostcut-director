@@ -2,8 +2,8 @@
 
 Each clip started at a different moment, so `director sync` finds where every
 clip sits on one timeline and writes `sync.json`. Several methods each estimate
-a clip's offset (timecode, capture clock, waveform cross-correlation,
-light-flash edges, Whisper word matches), then they are checked against each
+a clip's offset (timecode, capture clock, waveform cross-correlation, lip
+movement, light-flash edges, Whisper word matches), then they are checked against each
 other, because any single method can be confidently wrong. Convention: a clip's
 `offset_s` is where its first sample sits on the timeline, so clip time `t` is
 timeline time `t + offset_s`; the reference clip sits at 0.
@@ -12,12 +12,14 @@ timeline time `t + offset_s`; the reference clip sits at 0.
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -37,9 +39,9 @@ try:
 except ImportError:  # the director extra is optional
     np = None  # type: ignore[assignment]
 
-METHODS = ("timecode", "clock", "waveform", "flash", "whisper")
+METHODS = ("timecode", "clock", "waveform", "lips", "flash", "whisper")
 PRECISION_S = {"timecode": 0.0, "clock": 2.0, "waveform": 0.002,
-               "flash": 1.0 / 30, "whisper": 0.15}
+               "lips": 1.0 / 30, "flash": 1.0 / 30, "whisper": 0.15}
 CONFIDENCE = {"timecode": 0.5, "clock": 0.2}
 
 SAMPLE_RATE = 8000
@@ -76,6 +78,24 @@ FLASH_MIN_Z = 8.0
 FLASH_MIN_STEP = 10.0
 FLASH_MIN_GAP_S = 0.25
 FLASH_GAP_MARGIN_S = 0.05
+# Lip sync, measured 2026-11-03 on real footage (A7S III front, Mavic 3 at 45
+# degrees, lav recorder): inner-lip opening per frame from Apple Vision,
+# prepped like the audio and correlated over the whole overlap.
+LIPS_SPAN_S = 300.0
+LIPS_RATIO_LOW = 1.5
+LIPS_RATIO_GOOD = 2.0
+LIPS_RIVAL_EXCLUSION_S = 0.5
+LIPS_TIE_TOLERANCE = 0.02
+LIPS_MIN_OVERLAP_S = 60.0
+LIPS_SMOOTH_FRAMES = 3
+LIPS_AUDIO_BAND_HZ = (300, 3000)
+LIPS_AUDIO_RATE = 16000
+LIPS_COARSE_FPS = 2.0
+LIPS_COARSE_WIDTH = 320
+LIPS_CROP_MARGIN = 0.5
+LIPS_FACE_TARGET_PX = 400.0
+LIPS_HELPER_NAME = "lips-helper"
+LIPS_CACHE_DIRNAME = "ghostcut-director"
 
 
 class SyncError(RuntimeError):
@@ -163,6 +183,30 @@ class FlashEdge:
     time_s: float
     sign: int
     magnitude: float
+
+
+@dataclass(slots=True)
+class LipsFrame:
+    index: int
+    opening: float | None
+    box: tuple[float, float, float, float] | None
+
+
+@dataclass(slots=True)
+class LipsTrack:
+    times: list[float]
+    opening: list[float]
+    fps: float
+    face_frac: float
+
+
+@dataclass(slots=True)
+class LipsLag:
+    relative_s: float
+    r: float
+    rival_r: float
+    ratio: float
+    overlap_s: float
 
 
 def _label_for_index(i: int) -> str:
@@ -1122,9 +1166,639 @@ def flash_estimate(target: ClipResult, anchor: ClipResult, flash_cache: dict, *,
     )
 
 
+# ---------------------------------------------------------------- lips
+
+def parse_lips_output(text: str) -> list[LipsFrame]:
+    """Helper stdout to per-frame openings and face boxes. Pure; skips bad lines."""
+    frames: list[LipsFrame] = []
+    for raw in (text or "").splitlines():
+        parts = raw.split()
+        if len(parts) < 2:
+            continue
+        try:
+            index = int(parts[0])
+        except ValueError:
+            continue
+        if parts[1] == "NOFACE":
+            frames.append(LipsFrame(index, None, None))
+            continue
+        try:
+            opening = None if parts[1] == "NA" else float(parts[1])
+        except ValueError:
+            continue
+        box: tuple[float, float, float, float] | None = None
+        if len(parts) >= 3:
+            try:
+                x, y, w, h = (float(v) for v in parts[2].split(","))
+            except ValueError:
+                continue
+            box = (x, y, w, h)
+        frames.append(LipsFrame(index, opening, box))
+    frames.sort(key=lambda f: f.index)
+    return frames
+
+
+def median_box(frames: list[LipsFrame]) -> tuple[float, float, float, float] | None:
+    """Median face box over the frames that have one. Pure."""
+    boxes = [f.box for f in frames if f.box is not None]
+    if not boxes:
+        return None
+    return (float(_median([b[0] for b in boxes])),
+            float(_median([b[1] for b in boxes])),
+            float(_median([b[2] for b in boxes])),
+            float(_median([b[3] for b in boxes])))
+
+
+def _moving_average(values, window: int):
+    """Trailing mean over `window` samples, shrunk at the start. Pure."""
+    vals = np.asarray(values, dtype=np.float64).ravel()
+    width = max(1, int(window))
+    n = len(vals)
+    if n == 0:
+        return vals
+    cumsum = np.concatenate(([0.0], np.cumsum(vals)))
+    span = np.minimum(np.arange(n) + 1, width)
+    start = np.arange(n) + 1 - span
+    return (cumsum[1:] - cumsum[start]) / span
+
+
+def lips_prep(openings, fps: float):
+    """3-frame average minus the ~1 s average, z-scored. Pure; None when flat.
+
+    The measured recipe, applied to both the lip openings and the per-frame
+    audio: no-face gaps interpolate, ends extend.
+    """
+    if np is None:
+        return None
+    vals = np.asarray([np.nan if v is None else v for v in openings],
+                      dtype=np.float64).ravel()
+    if vals.size < 2:
+        return None
+    valid = np.isfinite(vals)
+    if not np.any(valid):
+        return None
+    if not np.all(valid):
+        xp = np.flatnonzero(valid)
+        vals = np.interp(np.arange(vals.size), xp, vals[valid])
+    baseline_window = int(round(fps)) if fps > 0 else 24
+    detrended = _moving_average(vals, LIPS_SMOOTH_FRAMES) \
+        - _moving_average(vals, baseline_window)
+    std = float(np.std(detrended))
+    if std == 0.0:
+        return None
+    return (detrended - float(np.mean(detrended))) / std
+
+
+def lips_audio_per_frame(samples, sample_rate: float, times: list[float]):
+    """Log RMS of band-passed audio inside each frame interval. Pure."""
+    if np is None or sample_rate <= 0 or len(times) < 1:
+        return None
+    audio = np.asarray(samples, dtype=np.float64).ravel()
+    edges = list(times)
+    dts = np.diff(np.asarray(times, dtype=np.float64))
+    edges.append(float(times[-1]) + (float(np.median(dts)) if dts.size else 1.0 / 30))
+    out = np.empty(len(times))
+    for k, (a, b) in enumerate(zip(edges[:-1], edges[1:])):
+        i0 = max(0, int(round(a * sample_rate)))
+        i1 = max(i0 + 1, min(len(audio), int(round(b * sample_rate))))
+        if i0 >= len(audio):
+            out[k] = np.log(LOG_EPS)
+            continue
+        seg = audio[i0:i1]
+        out[k] = float(np.log(np.sqrt(np.mean(seg * seg)) + LOG_EPS))
+    return out
+
+
+def lips_resample(times, values, grid_hz: float):
+    """(observed start, values on a uniform grid) by linear interpolation. Pure."""
+    if np is None or grid_hz <= 0:
+        return None
+    t = np.asarray(times, dtype=np.float64).ravel()
+    v = np.asarray(values, dtype=np.float64).ravel()
+    if t.size < 2 or v.size != t.size:
+        return None
+    t0, t1 = float(t[0]), float(t[-1])
+    if not t1 > t0:
+        return None
+    grid = np.arange(t0, t1, 1.0 / float(grid_hz))
+    if grid.size < 2:
+        return None
+    return t0, np.interp(grid, t, v)
+
+
+def lips_best_lag(ref_times, ref_vals, tgt_times, tgt_vals, grid_hz: float, *,
+                  clock_relative_s: float | None = None) -> LipsLag | None:
+    """Best anchor-minus-target lag over the whole overlap, with the rival ratio.
+
+    The measured recipe: Pearson correlation of the z-scored series at each
+    lag, best wins, confidence is best over the best score more than 0.5 s
+    away. Like the waveform search, the FFT pass only proposes candidate lags
+    and the reported r is the exact Pearson over each candidate's actual
+    overlap. The clock never narrows the search: it only picks between near
+    ties (within 0.02 of the best). Pure.
+    """
+    if np is None:
+        return None
+    ref_grid = lips_resample(ref_times, ref_vals, grid_hz)
+    tgt_grid = lips_resample(tgt_times, tgt_vals, grid_hz)
+    if ref_grid is None or tgt_grid is None:
+        return None
+    ref_t0, ref = ref_grid
+    tgt_t0, tgt = tgt_grid
+    hop_s = 1.0 / float(grid_hz)
+    n, m = len(ref), len(tgt)
+    ref_std = float(np.std(ref))
+    tgt_std = float(np.std(tgt))
+    if ref_std == 0 or tgt_std == 0:
+        return None
+    ref_z = (ref - float(np.mean(ref))) / ref_std
+    tgt_z = (tgt - float(np.mean(tgt))) / tgt_std
+    size = 1
+    while size < n + m - 1:
+        size <<= 1
+    corr = np.fft.irfft(np.fft.rfft(ref_z, size) * np.conj(np.fft.rfft(tgt_z, size)), size)
+    lags = np.arange(-(m - 1), n)
+    raw = corr[np.where(lags >= 0, lags, size + lags)]
+    counts = np.where(lags >= 0, np.minimum(n, m + lags) - lags, np.minimum(n, m + lags))
+    counts = np.maximum(counts, 0)
+    approx = np.full(n + m - 1, -np.inf)
+    ok = counts > 0
+    approx[ok] = raw[ok] / counts[ok]
+    overlap_s = counts * hop_s
+    required = min(LIPS_MIN_OVERLAP_S, 0.5 * min(n, m) * hop_s)
+    approx[overlap_s + 1e-9 < required] = -np.inf
+    order = np.argsort(-approx, kind="stable")
+    # Spread the re-scored candidates across distinct peaks, as in find_peak.
+    suppressed: list[int] = []
+    for i in order:
+        i = int(i)
+        if not np.isfinite(approx[i]):
+            continue
+        if all(abs(float(lags[i]) - float(lags[j])) * hop_s
+               >= LIPS_RIVAL_EXCLUSION_S - 1e-9 for j in suppressed):
+            suppressed.append(i)
+        if len(suppressed) >= N_EXACT_RESCORE:
+            break
+    if not suppressed:
+        return None
+    exact = {i: _overlap_pearson(ref, tgt, int(lags[i])) for i in suppressed}
+    best = max(suppressed, key=lambda i: (exact[i], float(approx[i])))
+    best_r = float(exact[best])
+    if not np.isfinite(best_r) or best_r <= 0:
+        return None
+    base = ref_t0 - tgt_t0
+    if clock_relative_s is not None:
+        tied = [i for i in suppressed
+                if np.isfinite(exact[i])
+                and best_r - float(exact[i]) <= LIPS_TIE_TOLERANCE + 1e-12]
+        if len(tied) > 1:
+            best = min(tied, key=lambda i: abs(
+                base + float(lags[i]) * hop_s - clock_relative_s))
+            best_r = float(exact[best])
+    best_lag = int(lags[best])
+    far = np.abs(lags - best_lag) * hop_s >= LIPS_RIVAL_EXCLUSION_S - 1e-9
+    rivals = [i for i in suppressed
+              if i != best and bool(far[i]) and np.isfinite(exact[i])]
+    rival_r = -1.0
+    if rivals:
+        rival_r = float(max(exact[i] for i in rivals))
+    else:
+        far_candidates = [int(i) for i in order
+                          if bool(far[int(i)])
+                          and np.isfinite(approx[int(i)])][:N_EXACT_RESCORE]
+        if far_candidates:
+            far_exact = [_overlap_pearson(ref, tgt, int(lags[i]))
+                         for i in far_candidates]
+            far_finite = [v for v in far_exact if np.isfinite(v)]
+            if far_finite:
+                rival_r = float(max(far_finite))
+    if rival_r > 1e-9:
+        ratio = best_r / rival_r
+    else:
+        ratio = float("inf") if best_r > 0 else 0.0
+    return LipsLag(relative_s=base + best_lag * hop_s, r=best_r,
+                   rival_r=rival_r, ratio=ratio,
+                   overlap_s=float(overlap_s[best]))
+
+
+def lips_confidence(ratio: float) -> float:
+    """Ratio bands from the measured recipe: below 1.5 is low, 2 and up good."""
+    if ratio >= LIPS_RATIO_GOOD:
+        return 0.85
+    if ratio >= LIPS_RATIO_LOW:
+        return 0.65
+    return 0.35
+
+
+def lips_precision_s(target: ClipResult, anchor: ClipResult) -> float:
+    """One frame, like the flash precision. Pure."""
+    return frame_duration_s(target, anchor)
+
+
+def lips_helper_source() -> Path:
+    """The shipped Swift helper source next to this module."""
+    return Path(__file__).parent / "lips_helper.swift"
+
+
+def lips_cache_dir() -> Path:
+    """Where the built helper lives."""
+    return Path.home() / "Library" / "Caches" / LIPS_CACHE_DIRNAME
+
+
+def build_lips_helper(cache_dir: Path | None = None) -> tuple[Path | None, str | None]:
+    """(helper binary, None), building with `swiftc -O` when needed.
+
+    The binary is cached by the source hash. Anything that stops the build
+    (not macOS, no swiftc, unreadable source) returns (None, reason) instead;
+    the caller skips the method with a warning. Never raises.
+    """
+    if sys.platform != "darwin":
+        return None, "not running on macOS (Apple Vision is required)"
+    if shutil.which("swiftc") is None:
+        return None, "swiftc not found (install the Xcode command-line tools)"
+    src = lips_helper_source()
+    if not src.exists():
+        return None, f"helper source missing: {src}"
+    try:
+        digest = hashlib.sha256(src.read_bytes()).hexdigest()[:16]
+    except OSError:
+        return None, f"helper source unreadable: {src}"
+    dest_dir = Path(cache_dir) if cache_dir is not None else lips_cache_dir()
+    dest = dest_dir / f"{LIPS_HELPER_NAME}-{digest}"
+    if dest.exists():
+        return dest, None
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None, f"cannot write the helper cache: {dest_dir}"
+    tmp = dest_dir / f"{LIPS_HELPER_NAME}-{digest}.tmp"
+    try:
+        done = subprocess.run(["swiftc", "-O", str(src), "-o", str(tmp)],
+                              capture_output=True, timeout=600)
+    except Exception:
+        return None, "swiftc failed to run"
+    if done.returncode != 0:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None, "the Vision helper could not be built"
+    try:
+        os.replace(tmp, dest)
+    except OSError:
+        return None, f"cannot write the helper cache: {dest_dir}"
+    return dest, None
+
+
+def run_lips_helper(helper: Path, frames_dir: Path,
+                    timeout_s: float = 3600) -> list[LipsFrame] | None:
+    """Parsed helper output, or None when Vision failed. Never raises."""
+    try:
+        done = subprocess.run([str(helper), str(frames_dir)],
+                              capture_output=True, timeout=timeout_s)
+    except Exception:
+        return None
+    if done.returncode != 0:
+        return None
+    try:
+        text = done.stdout.decode("utf-8", errors="replace")
+    except Exception:
+        return None
+    return parse_lips_output(text)
+
+
+def lips_audio_decode_command(path: Path) -> list[str]:
+    """Mono speech-band audio on stdout as f32le for the lips-vs-audio signal."""
+    low, high = LIPS_AUDIO_BAND_HZ
+    return ["ffmpeg", "-v", "error", "-i", str(path), "-map", "0:a:0", "-ac", "1",
+            "-ar", str(LIPS_AUDIO_RATE), "-af", f"highpass=f={low},lowpass=f={high}",
+            "-f", "f32le", "pipe:1"]
+
+
+def decode_lips_audio(path: Path, *, has_audio: bool = True):
+    """Decoded mono samples for lips-vs-audio, or None when there are none."""
+    if np is None or not has_audio:
+        return None
+    try:
+        done = subprocess.run(lips_audio_decode_command(Path(path)),
+                              capture_output=True, timeout=600)
+    except Exception:
+        return None
+    if done.returncode != 0 or not done.stdout:
+        return None
+    return np.frombuffer(done.stdout, dtype=np.float32).copy()
+
+
+def lips_coarse_command(path: Path, start_s: float, span_s: float,
+                        out_pattern: str) -> list[str]:
+    """Low-resolution, low-rate frames to find the face box."""
+    return ["ffmpeg", "-v", "error", "-ss", str(start_s), "-i", str(path),
+            "-t", str(span_s), "-map", "0:v:0",
+            "-vf", f"fps={LIPS_COARSE_FPS},scale={LIPS_COARSE_WIDTH}:-2",
+            "-f", "image2", "-q:v", "4", str(out_pattern)]
+
+
+def _escape_filter_path(path: Path) -> str:
+    return str(path).replace("\\", "\\\\").replace(":", "\\:") \
+        .replace(",", "\\,").replace("'", "\\'")
+
+
+def lips_crop_filter(box: tuple[float, float, float, float],
+                     width: int, height: int,
+                     *, cube: Path | None = None) -> str:
+    """Crop around the face box (with margin), scaled so the face is ~400 px tall.
+
+    The box is Vision-normalised (origin lower-left); ffmpeg's origin is
+    upper-left. The camera LUT, when one was found, converts first. Pure.
+    """
+    x, y, w, h = (float(v) for v in box)
+    w = min(max(w, 0.0), 1.0)
+    h = min(max(h, 0.0), 1.0)
+    cx = min(max(x + w / 2, 0.0), 1.0)
+    cy = min(max(1.0 - y - h / 2, 0.0), 1.0)
+    cw = min(w * (1.0 + LIPS_CROP_MARGIN), 1.0)
+    ch = min(h * (1.0 + LIPS_CROP_MARGIN), 1.0)
+    x0 = min(max(cx - cw / 2, 0.0), 1.0 - cw)
+    y0 = min(max(cy - ch / 2, 0.0), 1.0 - ch)
+    px = min(max(int(round(x0 * width)), 0), max(width - 2, 0))
+    py = min(max(int(round(y0 * height)), 0), max(height - 2, 0))
+    pw = min(max(int(round(cw * width)), 2), width - px)
+    ph = min(max(int(round(ch * height)), 2), height - py)
+    px -= px % 2
+    py -= py % 2
+    pw -= pw % 2
+    ph -= ph % 2
+    face_h = max(h * height, 1.0)
+    scale = LIPS_FACE_TARGET_PX / face_h
+    out_w = max(2, 2 * int(round(pw * scale / 2)))
+    out_h = max(2, 2 * int(round(ph * scale / 2)))
+    filt = f"crop={pw}:{ph}:{px}:{py},scale={out_w}:{out_h}"
+    if cube is not None:
+        filt = f"lut3d='{_escape_filter_path(Path(cube))}'," + filt
+    return filt
+
+
+def lips_frames_command(path: Path, start_s: float, span_s: float, crop: str,
+                        out_pattern: str) -> list[str]:
+    """Full-rate cropped frames (with the LUT in `crop`) for the Vision pass."""
+    return ["ffmpeg", "-v", "info", "-ss", str(start_s), "-i", str(path),
+            "-t", str(span_s), "-map", "0:v:0", "-vf", f"{crop},showinfo",
+            "-vsync", "0", "-f", "image2", "-q:v", "4", str(out_pattern)]
+
+
+def choose_lips_span(duration_s: float, span_s: float = LIPS_SPAN_S,
+                     samples=None, sample_rate: float = 0) -> tuple[float, float]:
+    """(start, length): the `span_s` window with the most speech energy. Pure."""
+    duration = max(0.0, float(duration_s))
+    if duration <= 0:
+        return (0.0, 0.0)
+    span = min(max(1.0, float(span_s)), duration)
+    if span >= duration or samples is None or sample_rate <= 0 or np is None:
+        return (0.0, span)
+    audio = np.asarray(samples, dtype=np.float64).ravel()
+    if audio.size < 2:
+        return (0.0, span)
+    bins = max(1, int(duration))
+    energy = np.zeros(bins)
+    idx = np.minimum((np.arange(audio.size) / sample_rate).astype(int), bins - 1)
+    np.add.at(energy, idx, audio * audio)
+    width = max(1, int(round(span)))
+    if width >= bins:
+        return (0.0, span)
+    cumsum = np.concatenate(([0.0], np.cumsum(energy)))
+    totals = cumsum[width:] - cumsum[:-width]
+    start = float(np.argmax(totals))
+    return (start, min(span, duration - start))
+
+
+def _lips_helper_cached(lips_cache: dict) -> Path | None:
+    """The built helper, building once; None with a cached reason when not."""
+    if ("helper",) not in lips_cache:
+        helper, reason = build_lips_helper()
+        lips_cache[("helper",)] = helper
+        lips_cache[("helper_reason",)] = reason
+    return lips_cache[("helper",)]
+
+
+def get_lips_audio(camera: CameraInfo, lips_cache: dict):
+    """Cached full-length speech-band samples for one clip, or None."""
+    key = (camera.path, "lips_audio")
+    if key in lips_cache:
+        return lips_cache[key]
+    samples = decode_lips_audio(Path(camera.path), has_audio=camera.has_audio)
+    lips_cache[key] = samples
+    return samples
+
+
+def get_lips_track(camera: CameraInfo, lips_cache: dict, *,
+                   span_s: float = LIPS_SPAN_S, cube: Path | None = None,
+                   audio_samples=None) -> LipsTrack | None:
+    """Inner-lip openings over the analysed span; a coarse pass finds the box.
+
+    Frames go to a temp dir at the clip's own rate, cropped around the median
+    face box with margin at full resolution (the camera LUT first when given),
+    scaled so the face is ~400 px tall. Cached per clip; None when there is no
+    face, no helper, or no decodable video.
+    """
+    key = (camera.path, "lips_track")
+    if key in lips_cache:
+        return lips_cache[key]
+    track = _build_lips_track(camera, lips_cache, span_s=span_s, cube=cube,
+                              audio_samples=audio_samples)
+    lips_cache[key] = track
+    return track
+
+
+def _build_lips_track(camera: CameraInfo, lips_cache: dict, *,
+                      span_s: float, cube: Path | None,
+                      audio_samples) -> LipsTrack | None:
+    if np is None or camera.width <= 0 or camera.fps <= 0:
+        return None
+    helper = _lips_helper_cached(lips_cache)
+    if helper is None:
+        return None
+    duration = camera.duration_s if camera.duration_s > 0 else 0.0
+    if duration <= 0:
+        return None
+    start, span = choose_lips_span(duration, span_s, audio_samples,
+                                   LIPS_AUDIO_RATE)
+    if span <= 0:
+        return None
+    with tempfile.TemporaryDirectory(prefix="lips-") as tmp:
+        coarse_dir = Path(tmp) / "coarse"
+        coarse_dir.mkdir()
+        try:
+            coarse = subprocess.run(
+                lips_coarse_command(Path(camera.path), start, span,
+                                    str(coarse_dir / "c%06d.jpg")),
+                capture_output=True, timeout=600)
+        except Exception:
+            return None
+        if coarse.returncode != 0:
+            return None
+        found = run_lips_helper(helper, coarse_dir)
+        if found is None:
+            lips_cache[("helper",)] = None
+            lips_cache[("helper_reason",)] = "the Vision helper failed to run"
+            return None
+        box = median_box(found)
+        if box is None or not found:
+            return None
+        face_frac = sum(1 for f in found if f.box is not None) / len(found)
+        print(f"lips: clip {camera.label}: face in {face_frac:.0%} of coarse "
+              f"frames; analysing ~{int(span * camera.fps)} frames over "
+              f"{span:.0f} s", flush=True)
+        fine_dir = Path(tmp) / "fine"
+        fine_dir.mkdir()
+        crop = lips_crop_filter(box, camera.width, camera.height, cube=cube)
+        try:
+            fine = subprocess.run(
+                lips_frames_command(Path(camera.path), start, span, crop,
+                                    str(fine_dir / "f%06d.jpg")),
+                capture_output=True, timeout=3600)
+        except Exception:
+            return None
+        if fine.returncode != 0:
+            return None
+        files = sorted(fine_dir.glob("f*.jpg"))
+        if len(files) < 2:
+            return None
+        frames = run_lips_helper(helper, fine_dir)
+        if frames is None:
+            lips_cache[("helper",)] = None
+            lips_cache[("helper_reason",)] = "the Vision helper failed to run"
+            return None
+        by_index = {f.index: f for f in frames}
+        try:
+            stderr = fine.stderr.decode("utf-8", errors="replace")
+        except Exception:
+            stderr = ""
+        pts = [float(m) for m in _PTS_TIME_RE.findall(stderr)]
+        if len(pts) == len(files):
+            t0 = pts[0]
+            times = [start + (p - t0) for p in pts]
+        else:
+            times = [start + k / camera.fps for k in range(len(files))]
+        openings = []
+        for k in range(len(files)):
+            frame = by_index.get(k)
+            openings.append(float("nan") if frame is None or frame.opening is None
+                            else float(frame.opening))
+        faces = sum(1 for o in openings if o == o)
+        if faces == 0:
+            return None
+        return LipsTrack(times=times, opening=openings, fps=camera.fps,
+                         face_frac=faces / len(openings))
+
+
+def lips_pair_estimates(target: ClipResult, anchor: ClipResult, lips_cache: dict, *,
+                        clock_offset_s: float | None = None,
+                        span_s: float = LIPS_SPAN_S,
+                        cubes: dict[str, Path] | None = None) -> list[Estimate]:
+    """Target lips vs anchor lips and anchor audio over the whole overlap.
+
+    Two views of the same mouth are the stronger signal (measured r 0.93,
+    ratio 9.7), so lips-vs-lips is reported first; the clock only breaks near
+    ties, never narrows the search. Pure apart from decode and Vision.
+    """
+    if np is None or anchor.offset_s is None:
+        return []
+    cubes = cubes or {}
+    target_audio = get_lips_audio(target.camera, lips_cache) \
+        if target.camera.has_audio else None
+    track = get_lips_track(target.camera, lips_cache, span_s=span_s,
+                            cube=cubes.get(target.label),
+                            audio_samples=target_audio)
+    if track is None:
+        return []
+    tgt_prep = lips_prep(track.opening, track.fps)
+    if tgt_prep is None:
+        return []
+    anchor_audio = get_lips_audio(anchor.camera, lips_cache) \
+        if anchor.camera.has_audio else None
+    anchor_track = get_lips_track(anchor.camera, lips_cache, span_s=span_s,
+                                  cube=cubes.get(anchor.label),
+                                  audio_samples=anchor_audio)
+    clock_relative = None if clock_offset_s is None \
+        else clock_offset_s - anchor.offset_s
+    precision = lips_precision_s(target, anchor)
+    estimates: list[Estimate] = []
+    if anchor_track is not None:
+        anch_prep = lips_prep(anchor_track.opening, anchor_track.fps)
+        if anch_prep is not None:
+            lag = lips_best_lag(anchor_track.times, anch_prep,
+                                track.times, tgt_prep,
+                                max(track.fps, anchor_track.fps),
+                                clock_relative_s=clock_relative)
+            if lag is not None:
+                estimates.append(Estimate(
+                    method="lips", offset_s=anchor.offset_s + lag.relative_s,
+                    confidence=lips_confidence(lag.ratio),
+                    precision_s=precision, against=anchor.label,
+                    detail={"kind": "lips-lips", "r": lag.r,
+                            "rival_r": lag.rival_r, "ratio": lag.ratio,
+                            "overlap_s": lag.overlap_s,
+                            "face_frac": round(track.face_frac, 3),
+                            "anchor_face_frac": round(anchor_track.face_frac, 3)},
+                ))
+    if anchor_audio is not None and len(anchor_audio) > 0:
+        duration = anchor.camera.duration_s
+        if duration <= 0:
+            duration = len(anchor_audio) / LIPS_AUDIO_RATE
+        n_frames = max(2, int(duration * track.fps))
+        audio_times = [k / track.fps for k in range(n_frames)]
+        per_frame = lips_audio_per_frame(anchor_audio, LIPS_AUDIO_RATE,
+                                         audio_times)
+        audio_prep = lips_prep(per_frame, track.fps) \
+            if per_frame is not None else None
+        if audio_prep is not None:
+            lag = lips_best_lag(audio_times, audio_prep,
+                                track.times, tgt_prep, track.fps,
+                                clock_relative_s=clock_relative)
+            if lag is not None:
+                estimates.append(Estimate(
+                    method="lips", offset_s=anchor.offset_s + lag.relative_s,
+                    confidence=lips_confidence(lag.ratio),
+                    precision_s=precision, against=anchor.label,
+                    detail={"kind": "lips-audio", "r": lag.r,
+                            "rival_r": lag.rival_r, "ratio": lag.ratio,
+                            "overlap_s": lag.overlap_s,
+                            "face_frac": round(track.face_frac, 3)},
+                ))
+    return estimates
+
+
+def _lips_cube_map(lips_grade: Path | None,
+                   lips_cubes: dict[str, Path | str] | None) -> dict[str, Path]:
+    """Clip label to .cube path: grade.json's luts, overridden by supplied cubes."""
+    out: dict[str, Path] = {}
+    if lips_grade is not None:
+        try:
+            data = json.loads(Path(lips_grade).read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+        base = Path(lips_grade).parent
+        cameras = data.get("cameras") if isinstance(data, dict) else None
+        for cam in cameras if isinstance(cameras, list) else []:
+            if not isinstance(cam, dict):
+                continue
+            label, lut = cam.get("label"), cam.get("lut")
+            if label and lut:
+                candidate = base / str(lut)
+                if candidate.exists():
+                    out[str(label)] = candidate
+    for label, cube in (lips_cubes or {}).items():
+        candidate = Path(cube)
+        if candidate.exists():
+            out[str(label)] = candidate
+    return out
+
+
 # ---------------------------------------------------------------- combining
 
-_BACKING_METHODS = ("whisper", "timecode", "flash")
+_BACKING_METHODS = ("whisper", "timecode", "flash", "lips")
+_PICK_RANK = {"waveform": 0, "whisper": 1, "lips": 2, "flash": 3,
+              "timecode": 4, "clock": 5}
 
 
 def frame_duration_s(target: ClipResult, anchor: ClipResult) -> float:
@@ -1197,14 +1871,54 @@ def _waveform_trusted(estimates: list[Estimate],
                 other = by_key.get(theirs)
                 if (other is not None and other.method in _BACKING_METHODS
                         and not other.detail.get("confidence_halved", False)
+                        and (other.method != "lips"
+                             or other.detail.get("ratio", 0.0) >= LIPS_RATIO_LOW)
                         and check.agree):
                     return wave
     return None
 
 
+def _lips_backed_waveform(estimates: list[Estimate],
+                          checks: list[EstimateCheck]) -> Estimate | None:
+    """First unclear waveform that a qualifying lips estimate agrees with. Pure."""
+    by_key = {(e.method, e.against): e for e in estimates}
+    for wave in (e for e in estimates if e.method == "waveform"):
+        if wave.detail.get("clear", False):
+            continue
+        for check in checks:
+            sides = [((check.a, check.against_a), (check.b, check.against_b)),
+                     ((check.b, check.against_b), (check.a, check.against_a))]
+            for (mine, theirs) in sides:
+                if mine != (wave.method, wave.against):
+                    continue
+                other = by_key.get(theirs)
+                if (other is not None and other.method == "lips"
+                        and other.detail.get("ratio", 0.0) >= LIPS_RATIO_LOW
+                        and check.agree):
+                    return wave
+    return None
+
+
+def _best_lips_pick(estimates: list[Estimate]) -> Estimate | None:
+    """First qualifying lips-vs-lips, else first qualifying lips-vs-audio. Pure.
+
+    Two views of the same mouth are the stronger signal, so lips-vs-lips is
+    preferred whenever it qualifies; below a ratio of 1.5 lips only
+    cross-checks, never places.
+    """
+    qualifying = [e for e in estimates
+                  if e.method == "lips"
+                  and e.detail.get("ratio", 0.0) >= LIPS_RATIO_LOW]
+    for kind in ("lips-lips", "lips-audio"):
+        for est in qualifying:
+            if est.detail.get("kind") == kind:
+                return est
+    return None
+
+
 def choose_pick(estimates: list[Estimate],
                 checks: list[EstimateCheck]) -> tuple[float | None, str | None]:
-    """Waveform, Whisper, flash, timecode, clock, else unplaced. Pure; order is trust."""
+    """Waveform, Whisper, lips, flash, timecode, clock, else unplaced. Pure; order is trust."""
     trusted = _waveform_trusted(estimates, checks)
     if trusted is not None:
         return trusted.offset_s, "waveform"
@@ -1212,6 +1926,9 @@ def choose_pick(estimates: list[Estimate],
         if (est.method == "whisper" and est.detail.get("moments", 0) >= WHISPER_MIN_MOMENTS
                 and est.confidence >= WHISPER_MIN_CONFIDENCE):
             return est.offset_s, "whisper"
+    lips_pick = _best_lips_pick(estimates)
+    if lips_pick is not None:
+        return lips_pick.offset_s, "lips"
     for est in estimates:
         if est.method == "flash":
             return est.offset_s, "flash"
@@ -1241,9 +1958,19 @@ def attempt_warnings(target: ClipResult, estimates: list[Estimate],
     if (pick_method == "flash" and picked is not None
             and picked.detail.get("matched_edges", 0) <= 1):
         warnings.append("Placed by a single light flash: check by eye.")
+    if pick_method == "lips" and picked is not None:
+        kind = picked.detail.get("kind", "lips")
+        ratio = picked.detail.get("ratio")
+        if isinstance(ratio, (int, float)):
+            warnings.append(
+                f"Placed by lip movement ({kind} against {picked.against}, "
+                f"ratio {ratio:.2f}).")
+        else:
+            warnings.append(
+                f"Placed by lip movement ({kind} against {picked.against}).")
     seen: set[tuple[str, str]] = set()
     for est in estimates:
-        if est.method not in ("timecode", "whisper", "flash"):
+        if est.method not in ("timecode", "whisper", "flash", "lips"):
             continue
         if (est.method, est.against) in seen:
             continue
@@ -1293,6 +2020,7 @@ def attempt_warnings(target: ClipResult, estimates: list[Estimate],
 
 WAVEFORM_NO_NUMPY = "Waveform sync unavailable: numpy is not installed."
 FLASH_NO_NUMPY = "Flash sync unavailable: numpy is not installed."
+LIPS_NO_NUMPY = "Lip sync unavailable: numpy is not installed."
 
 
 def parse_methods(text: str | None) -> list[str]:
@@ -1315,7 +2043,8 @@ def _round(value: float | None, places: int):
 
 def _estimate_payload(est: Estimate) -> dict:
     detail = dict(est.detail)
-    for key in ("r", "second_r", "margin", "overlap_s", "confidence_before_halving"):
+    for key in ("r", "second_r", "margin", "overlap_s", "rival_r", "ratio",
+                "confidence_before_halving"):
         if isinstance(detail.get(key), (int, float)):
             detail[key] = round(float(detail[key]), 3)
     if isinstance(detail.get("drift_ppm"), (int, float)):
@@ -1402,7 +2131,10 @@ def _attempt_estimates(target: ClipResult, anchor: ClipResult, methods: list[str
 
 def run(*, clip_paths: list[Path], reference_path: Path | None,
         methods: list[str], transcripts_dir: Path | None, out_path: Path,
-        whisper_model: str = WHISPER_MODEL) -> dict:
+        whisper_model: str = WHISPER_MODEL,
+        lips_span_s: float = LIPS_SPAN_S,
+        lips_grade: Path | None = None,
+        lips_cubes: dict[str, Path | str] | None = None) -> dict:
     """Place every clip on the reference's timeline; write sync.json."""
     paths = [Path(p) for p in clip_paths]
     if len(paths) < 2:
@@ -1438,6 +2170,9 @@ def run(*, clip_paths: list[Path], reference_path: Path | None,
     envelopes: dict = {}
     words: dict[str, list[TranscriptWord]] = {}
     flash_cache: dict = {}
+    lips_cache: dict = {}
+    lips_cube_map = _lips_cube_map(lips_grade, lips_cubes)
+    lips_crosscheck_done = False
     out_path = Path(out_path)
     cache_dir = out_path.parent / "sync-transcripts"
     order_of = {labels[i]: i for i in range(len(paths))}
@@ -1490,6 +2225,40 @@ def run(*, clip_paths: list[Path], reference_path: Path | None,
                 break
             if fallback is None and pick_method is not None:
                 fallback = (estimates, checks, pick_offset, pick_method)
+        # Lips runs only where the audio methods did not place the clip (plus
+        # one cross-check on an audio-placed camera): Vision over hundreds of
+        # seconds is the dearest step in the run.
+        lips_added: list[Estimate] = []
+        lips_tried = False
+        if ("lips" in methods and target.camera.width > 0
+                and target.camera.fps > 0):
+            if accepted is not None:
+                provisional = accepted[3]
+            elif fallback is not None:
+                provisional = fallback[3]
+            else:
+                provisional = None
+            if provisional in ("waveform", "whisper"):
+                lips_anchors = [] if lips_crosscheck_done else [reference]
+                crosscheck = bool(lips_anchors)
+            else:
+                lips_anchors = list(anchors)
+                crosscheck = False
+            lips_tried = bool(lips_anchors)
+            if lips_anchors and np is not None:
+                clock_by_anchor: dict[str, float | None] = {}
+                for anchor, estimates, _checks in attempts:
+                    clock_est = next((e for e in estimates
+                                      if e.method == "clock"), None)
+                    clock_by_anchor[anchor.label] = clock_est.offset_s \
+                        if clock_est is not None else None
+                for anchor in lips_anchors:
+                    lips_added.extend(lips_pair_estimates(
+                        target, anchor, lips_cache,
+                        clock_offset_s=clock_by_anchor.get(anchor.label),
+                        span_s=lips_span_s, cubes=lips_cube_map))
+                if crosscheck:
+                    lips_crosscheck_done = True
         union: list[Estimate] = []
         seen_keys: set[tuple[str, str]] = set()
         for _anchor, estimates, _checks in attempts:
@@ -1499,14 +2268,25 @@ def run(*, clip_paths: list[Path], reference_path: Path | None,
                         continue
                     seen_keys.add((est.method, est.against))
                 union.append(est)
+        union.extend(lips_added)
         ref_frame = frame_duration_s(target, reference)
         final_checks = build_checks(union, ref_frame)
         if accepted is not None:
             _est, _chk, pick_offset, pick_method = accepted
-        elif fallback is not None:
-            _est, _chk, pick_offset, pick_method = fallback
         else:
-            pick_offset, pick_method = None, None
+            upgraded = _lips_backed_waveform(union, final_checks) \
+                if lips_added else None
+            lips_pick = _best_lips_pick(union) if lips_added else None
+            if upgraded is not None:
+                pick_offset, pick_method = upgraded.offset_s, "waveform"
+            elif lips_pick is not None and (
+                    fallback is None or _PICK_RANK["lips"]
+                    < _PICK_RANK.get(fallback[3], 99)):
+                pick_offset, pick_method = lips_pick.offset_s, "lips"
+            elif fallback is not None:
+                _est, _chk, pick_offset, pick_method = fallback
+            else:
+                pick_offset, pick_method = None, None
         target.estimates = union
         target.checks = final_checks
         target.offset_s = pick_offset
@@ -1534,6 +2314,13 @@ def run(*, clip_paths: list[Path], reference_path: Path | None,
                 and not any(e.method == "flash" for e in union)):
             target.warnings.append(
                 f"Clip {target.label} has no video: flash sync skipped.")
+        if "lips" in methods and lips_tried and np is None:
+            target.warnings.append(LIPS_NO_NUMPY)
+        elif ("lips" in methods and lips_tried
+                and lips_cache.get(("helper",)) is None):
+            reason = lips_cache.get(("helper_reason",)) \
+                or "the Vision helper is unavailable"
+            target.warnings.append(f"Lip sync unavailable: {reason}.")
         has_flash = any(e.method == "flash" for e in union)
         if not target.camera.has_audio and not has_flash:
             if pick_method == "clock":
