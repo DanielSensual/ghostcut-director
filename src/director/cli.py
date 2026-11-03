@@ -128,6 +128,140 @@ def command_reframe(args: argparse.Namespace) -> dict:
     return payload
 
 
+def _cut_stage_line(name: str, record: dict, payload: dict) -> str:
+    status = record.get("status")
+    qc_section = payload.get("qc") or {}
+    if name == "qc" and qc_section:
+        status = qc_section.get("status")
+    line = f"{name}: {status}"
+    if float(record.get("spend_usd") or 0.0):
+        line += f" (${float(record['spend_usd']):.4f})"
+    if name == "words":
+        audio = payload.get("audio") or {}
+        if audio:
+            extra = ""
+            if audio.get("words_shifted_s"):
+                extra = f", shifted {float(audio['words_shifted_s']):+.3f}s"
+            line += (f" ({audio.get('words', 0)} words, "
+                     f"{audio.get('words_source')}{extra})")
+    elif name == "export":
+        section = payload.get("export") or {}
+        if section:
+            n_shots = section.get("shots_exported", 0)
+            n_gaps = len(section.get("gaps", []))
+            line += (f" ({n_shots} shot{'s' if n_shots != 1 else ''}, "
+                     f"{n_gaps} gap{'s' if n_gaps != 1 else ''})")
+    elif name == "qc" and qc_section:
+        checks = qc_section.get("checks", [])
+        n_checks = len(checks)
+        n_findings = sum(1 for check in checks
+                         if check.get("source") == "muse"
+                         and check.get("id") != "muse:overall")
+        line += f" ({n_checks} checks, {n_findings} muse findings)"
+    return line
+
+
+def _cut_warnings(payload: dict) -> list[str]:
+    from .cut import STAGES
+
+    lines: list[str] = []
+    stages = payload.get("stages", {})
+    for name in STAGES:
+        if name not in stages:
+            continue
+        for warning in stages[name].get("warnings", []):
+            if name == "sync":
+                lines.append(f"! {warning}")
+            else:
+                lines.append(f"! {name}: {warning}")
+    return lines
+
+
+def _print_cut_progress(payload: dict) -> None:
+    from .cut import STAGES
+
+    stages = payload.get("stages", {})
+    for name in STAGES:
+        if name in stages:
+            print(_cut_stage_line(name, stages[name], payload))
+
+
+def _print_cut_summary(payload: dict) -> None:
+    out_dir = payload.get("out_dir", "")
+    stages = payload.get("stages", {})
+    _print_cut_progress(payload)
+    for line in _cut_warnings(payload):
+        print(line)
+    print(f"Wrote {out_dir}/cut.json ({payload.get('status')}, "
+          f"${float(payload.get('spend_usd') or 0.0):.4f})")
+    angles_record = stages.get("angles", {})
+    if "cut.mp4" in (angles_record.get("outputs") or []):
+        print(f"cut: {out_dir}/cut.mp4")
+    reframe_record = stages.get("reframe")
+    if reframe_record and "vertical.mp4" in (reframe_record.get("outputs") or []):
+        print(f"vertical: {out_dir}/vertical.mp4")
+    export_record = stages.get("export")
+    if export_record and export_record.get("outputs"):
+        joined = ", ".join(f"{out_dir}/{name}" for name in export_record["outputs"])
+        print(f"timelines: {joined}")
+
+
+def _cut_manifest_mtime_ns(out_dir: Path) -> int | None:
+    try:
+        return Path(out_dir, "cut.json").stat().st_mtime_ns
+    except OSError:
+        return None
+
+
+def command_cut(args: argparse.Namespace) -> dict:
+    from . import cut as cut_mod
+    from .sync import parse_methods
+
+    require_ffmpeg_binaries()
+    methods = parse_methods(args.methods)
+    out_dir = Path(args.out_dir)
+    before_ns = _cut_manifest_mtime_ns(out_dir)
+    try:
+        payload = cut_mod.run(
+            clips=[Path(entry) for entry in args.inputs],
+            out_dir=out_dir,
+            reference_path=Path(args.reference) if args.reference else None,
+            audio_path=Path(args.audio) if args.audio else None,
+            words_path=Path(args.words) if args.words else None,
+            transcripts_dir=Path(args.transcripts) if args.transcripts else None,
+            methods=methods,
+            no_grade=bool(args.no_grade),
+            grade_check=bool(args.grade_check),
+            no_muse=bool(args.no_muse),
+            model=args.model,
+            min_shot_s=float(args.min_shot),
+            no_vertical=bool(args.no_vertical),
+            no_sam=bool(args.no_sam),
+            no_export=bool(args.no_export),
+            no_qc=bool(args.no_qc),
+            max_usd=float(args.max_usd),
+            force=bool(args.force),
+            project_name=args.name,
+        )
+    except Exception:
+        # The stage lines are the progress log: on failure, show the stages
+        # this run completed before cli.main prints the error. The mtime
+        # guard keeps a stale manifest from a previous run silent, and this
+        # must never mask the original exception.
+        try:
+            if _cut_manifest_mtime_ns(out_dir) != before_ns:
+                import json
+
+                payload = json.loads(Path(out_dir, "cut.json").read_text(encoding="utf-8"))
+                if isinstance(payload, dict):
+                    _print_cut_progress(payload)
+        except Exception:
+            pass
+        raise
+    _print_cut_summary(payload)
+    return payload
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="GhostCut Director: multicam cutting on Meta's Muse models")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -175,6 +309,44 @@ def build_parser() -> argparse.ArgumentParser:
     reframe_parser.add_argument("--max-usd", type=float, default=2.0,
                                 help="Refuse above this estimated SAM spend")
     reframe_parser.set_defaults(func=command_reframe)
+
+    cut_parser = sub.add_parser("cut", help="Cut a folder of cards to a finished cut in one step")
+    cut_parser.add_argument("inputs", metavar="INPUT", nargs="+",
+                            help="Media files and/or folders")
+    cut_parser.add_argument("--out-dir", default="director-cut",
+                            help="Job directory; created by the first stage that writes")
+    cut_parser.add_argument("--reference", default=None,
+                            help="Reference clip (default: the longest clip)")
+    cut_parser.add_argument("--audio", default=None,
+                            help="Production-audio clip file (default: the reference clip)")
+    cut_parser.add_argument("--words", default=None,
+                            help="Word-timed Whisper JSON in timeline times")
+    cut_parser.add_argument("--transcripts", default=None,
+                            help="Directory of per-clip word-timed Whisper JSON transcripts")
+    cut_parser.add_argument("--methods", default=None,
+                            help="Subset of timecode,clock,waveform,whisper")
+    cut_parser.add_argument("--no-grade", action="store_true",
+                            help="Skip grading; render cameras as recorded")
+    cut_parser.add_argument("--grade-check", action="store_true",
+                            help="Ask Muse Spark to check the grade match")
+    cut_parser.add_argument("--no-muse", action="store_true",
+                            help="No Meta model calls for picks or checks (SAM still runs; see --no-sam)")
+    cut_parser.add_argument("--model", default="muse-spark-1.3")
+    cut_parser.add_argument("--min-shot", type=float, default=2.0,
+                            help="Shorter shots merge into a neighbour")
+    cut_parser.add_argument("--no-vertical", action="store_true", help="Skip the 9:16 reframe")
+    cut_parser.add_argument("--no-sam", action="store_true",
+                            help="Centre every vertical shot, no SAM tracking")
+    cut_parser.add_argument("--no-export", action="store_true",
+                            help="Skip the FCPXML/OTIO timeline export")
+    cut_parser.add_argument("--no-qc", action="store_true", help="Skip the whole-cut check")
+    cut_parser.add_argument("--max-usd", type=float, default=5.0,
+                            help="Refuse above this estimated Meta spend")
+    cut_parser.add_argument("--force", action="store_true",
+                            help="Ignore fingerprints; re-run every enabled stage")
+    cut_parser.add_argument("--name", default="Director cut",
+                            help="Project name written into both timelines")
+    cut_parser.set_defaults(func=command_cut)
 
     return parser
 

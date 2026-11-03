@@ -145,3 +145,36 @@ A real 60 s 4K talking cut, five shots, the speaker deliberately off centre:
   pass — so the test asserts interior exactness within 1e-6 and edges bounded by 2.5 steps instead.
 - `shot_sample_range(shots, index, n_samples)` indexes into `shot_sample_ranges(shots, n_samples)`, since
   sample ownership needs the whole shot list (bisect over start times).
+
+# Build log: `director cut` (2026-11-03)
+
+| Step | By | What |
+|---|---|---|
+| Brief | Project owner, with Claude Code | `OPEN-BRIEF.md`: the open feature choice. |
+| Design | Meta **Muse Code** on **`muse-wonder-1.0`** | `OPEN-DESIGN.md`: the `director cut` feature — one-step orchestration, words bridge, timeline export, whole-cut QC. |
+| Build | Meta **Muse Code** on **`muse-spark-1.3`** | `src/director/cut.py`, `src/director/export.py`, the `cut` command in `cli.py`, `tests/test_cut.py`, `tests/test_export.py`. |
+| Code review and live test | Claude Code, piloted by the owner | Real footage, below. |
+
+Muse Code token use: TBD (the owner fills this from the run log).
+Live test: TBD (the owner fills this from the real-footage run).
+
+## Build notes (Muse Code)
+
+- The build also carries a 5-line fix in `src/director/reframe.py` (`render`): a static crop path — every
+  centred shot, i.e. every `--no-sam` render — emitted an empty sendcmd script, which ffmpeg refuses with
+  "No commands were specified", so `director reframe --no-sam --render` failed on the untouched tree (no
+  existing test renders; all use `render_path=None`). The design's offline path (`--no-sam`, §13 "the job
+  completes") and its end-to-end test (item 22, `no_sam=True`) both assume centred renders work. The fix
+  pins the single crop position at t=0 when the script would otherwise be empty; `sendcmd_text`, the move
+  count and every JSON shape are unchanged, all existing reframe tests still pass, and item 22 is the
+  regression test. Allowed by the brief ("change existing modules where your feature needs it"); the only
+  departure from the design's §2 file table.
+- `build_media_clips` keeps its designed `(sync_payload, used_labels)` signature and raises its
+  unknown-label `ExportError` without the sync path; `export_timelines`, which owns the path, raises the
+  full §8.2 message. Same condition, same exception type, no other difference.
+- On a stage failure the CLI prints the completed stage lines (reread from the `cut.json` the run just
+  wrote, guarded by mtime so a stale manifest stays silent) before `cli.main` prints the error, per §11.3's
+  "the stage lines are the progress log".
+- Full suite: 376 tests, green except the same 11 pre-existing `ps`-sandbox errors in
+  `tests/test_engine_render.py` and `tests/test_render_runner.py` that fail identically on the untouched
+  tree (verified before and after this build).

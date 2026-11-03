@@ -665,6 +665,11 @@ def render(
     script_path: Path,
 ) -> int:
     text, moves = sendcmd_text(crop_xs, fps=fps)
+    if not text.strip():
+        # A static crop path (every centred shot) emits no commands, which
+        # sendcmd refuses ("No commands were specified"). Pin the single
+        # crop position at t=0; moves stays 0, which is what happened.
+        text = f"{0.0:.6f} crop@rf x {crop_xs[0] if crop_xs else 0};\n"
     script_path.parent.mkdir(parents=True, exist_ok=True)
     script_path.write_text(text, encoding="utf-8")
     Path(render_path).parent.mkdir(parents=True, exist_ok=True)
