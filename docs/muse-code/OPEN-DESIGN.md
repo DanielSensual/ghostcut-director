@@ -1723,11 +1723,3 @@ against what the watch showed. Record the outcome, the stage spends
 and any defect found in the BUILD-LOG section above. The synthetic
 end-to-end test (§14 item 22) proves the plumbing; only this run
 proves the editor's afternoon.
-
-This is a plan, not a special mode; I haven't started implementation.
-Reply `go` to execute this plan, or tell me what to change.
-
-
-
-
-
