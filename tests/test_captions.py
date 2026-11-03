@@ -191,8 +191,8 @@ class AssSrtTests(unittest.TestCase):
     def test_horizontal_scaling(self) -> None:
         text = captions_mod.build_ass(self._lines(), preset="house",
                                       width=1920, height=1080)
-        self.assertIn("Style: Cap,Poppins SemiBold,46,", text)
-        self.assertIn(",1,3,0,2,34,34,439,1", text)
+        self.assertIn("Style: Cap,Poppins SemiBold,58,", text)
+        self.assertIn(",1,4,0,2,115,115,119,1", text)
         events = [line for line in text.splitlines()
                   if line.startswith("Dialogue:")]
         self.assertTrue(all("{\\blur4}" in event for event in events))

@@ -309,8 +309,8 @@ def style_line(preset: str, width: int, height: int) -> str:
 
     Vertical (`house`, 1080x1920) is the brief's style line verbatim:
     bottom-centre with MarginV 780, so the baseline sits about y = 1140.
-    Horizontal scales every size by height (82 -> 46, margins 60/60/780
-    -> 34/34/439, outline 5 -> 3): the same look in the lower third.
+    Horizontal is a lower third sized for landscape (1920x1080: 58 px,
+    outline 4, margins 115/115/119).
     """
     if preset not in PRESETS:
         raise CaptionsError(f"captions: unknown preset {preset!r} "
@@ -320,6 +320,13 @@ def style_line(preset: str, width: int, height: int) -> str:
     outline = max(1, round(HOUSE_OUTLINE * scale))
     margin_lr = round(HOUSE_MARGIN_LR * scale)
     margin_v = round(HOUSE_MARGIN_V * scale)
+    if width > height:
+        # Landscape is its own layout: scaling the 9:16 numbers gave 46 px captions at
+        # mid-chest on the final take. A true lower third reads at ~5.4% of frame height.
+        size = max(8, round(height * 0.054))
+        outline = max(1, round(height * 0.0037))
+        margin_lr = round(width * 0.06)
+        margin_v = round(height * 0.11)
     font = HOUSE_FONT if preset == PRESET_HOUSE else BOLD_FONT
     return (f"Style: Cap,{font},{size},&H00FFFFFF,&H00FFFFFF,&H4C000000,"
             f"&H78000000,0,0,0,0,100,100,0,0,1,{outline},0,2,"
