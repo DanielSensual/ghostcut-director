@@ -49,7 +49,7 @@ DEFAULT_MODEL = "muse-spark-1.3"
 DEFAULT_MIN_SHOT_S = 2.0
 DEFAULT_MAX_USD = 5.0
 STAGES = ("sync", "words", "tighten", "grade", "angles", "finish",
-          "export", "reframe", "qc")
+          "export", "reframe", "captions", "qc")
 WHISPER_TIMEOUT_S = 3600
 DURATION_TOLERANCE_S = 0.10
 BLACK_SHARE_WARN = 0.20
@@ -146,6 +146,15 @@ class JobOptions:
     # --lut PATTERN=CUBE entries: a supplied .cube for every clip whose file name (or path)
     # matches PATTERN, for cameras Director can't read (DJI D-Log, Apple Log, ...).
     lut_patterns: list[str] = field(default_factory=list)
+    # Burned-in captions (CAPTIONS-BRIEF.md). no_captions defaults True so
+    # existing programmatic callers keep their old job; the CLI passes
+    # False unless --no-captions, so `director cut` captions by default.
+    no_captions: bool = True
+    captions_preset: str = "house"
+    captions_horizontal: bool = False
+    title: str | None = None
+    no_title: bool = False
+    fonts_dir: str | None = None
 
 
 @dataclass(slots=True)
@@ -468,7 +477,8 @@ def _probe_stats(path: Path) -> dict | None:
 
 def mechanical_qc(*, out_dir: Path, sync_payload: dict, angles_payload: dict,
                   reframe_payload: dict | None,
-                  export_section: dict | None) -> list[QcCheck]:
+                  export_section: dict | None,
+                  captions_section: dict | None = None) -> list[QcCheck]:
     """Deterministic whole-cut checks, in record order. Check 9 never fails."""
     out_dir = Path(out_dir)
     checks: list[QcCheck] = []
@@ -563,6 +573,61 @@ def mechanical_qc(*, out_dir: Path, sync_payload: dict, angles_payload: dict,
             "timelines_parse", "mechanical",
             "pass" if (fcpxml_ok and otio_ok) else "fail",
             {"fcpxml": fcpxml_ok, "otio": otio_ok}))
+
+    if captions_section is not None:
+        caption_files = ["captions.srt", "captions.ass", "captions.json"]
+        present = {}
+        for name in caption_files:
+            try:
+                present[name] = (out_dir / name).exists() \
+                    and (out_dir / name).stat().st_size > 0
+            except OSError:
+                present[name] = False
+        checks.append(QcCheck(
+            "captions_exist", "mechanical",
+            "pass" if all(present.values()) else "fail",
+            {name: present[name] for name in caption_files}))
+        target = out_dir / "vertical.mp4"
+        if not target.exists():
+            target = out_dir / "cut.mp4"
+        target_stats = _probe_stats(target)
+        if target_stats is None:
+            checks.append(QcCheck("captions_in_range", "mechanical", "warn",
+                                  {"skipped": target.name}))
+        else:
+            video_dur = float(target_stats.get("duration_s") or 0.0)
+            try:
+                saved = json.loads(
+                    (out_dir / "captions.json").read_text(encoding="utf-8"))
+                saved_lines = saved.get("lines", [])
+            except (OSError, ValueError):
+                saved_lines = None
+            if not isinstance(saved_lines, list):
+                checks.append(QcCheck("captions_in_range", "mechanical",
+                                      "warn", {"skipped": "captions.json"}))
+            else:
+                bad: list[int] = []
+                for entry in saved_lines:
+                    if not isinstance(entry, dict):
+                        continue
+                    try:
+                        start = float(entry.get("start_s", 0.0))
+                        end = float(entry.get("end_s", 0.0))
+                    except (TypeError, ValueError):
+                        bad.append(int(entry.get("id", -1)))
+                        continue
+                    if start < -1e-6 or end > video_dur + DURATION_TOLERANCE_S \
+                            or end < start:
+                        try:
+                            bad.append(int(entry.get("id", -1)))
+                        except (TypeError, ValueError):
+                            bad.append(-1)
+                checks.append(QcCheck(
+                    "captions_in_range", "mechanical",
+                    "pass" if not bad else "fail",
+                    {"lines": len(saved_lines),
+                     "video_s": round(video_dur, 3),
+                     "outside_ids": bad[:12]}))
 
     try:
         process = run_command(loudnorm_command(out_dir / "cut.mp4"), check=False)
@@ -727,6 +792,18 @@ def _spend_of(payload: dict) -> float:
     return float(payload.get("spend_usd") or 0.0)
 
 
+def _captions_section(captions_payload: dict) -> dict:
+    """The cut.json captions section from a captions.json payload."""
+    title = captions_payload.get("title") or {}
+    return {
+        "file": "captions.json",
+        "preset": captions_payload.get("preset", "house"),
+        "lines": len(captions_payload.get("lines", []) or []),
+        "title": title.get("text") if isinstance(title, dict) else None,
+        "burned": list(captions_payload.get("burned", []) or []),
+    }
+
+
 def _tighten_section(tighten_payload: dict) -> dict:
     """The cut.json tighten section from a tighten.json payload."""
     kept = [s for s in tighten_payload.get("kept_spans", []) or []]
@@ -761,7 +838,10 @@ def run(*, clips: list[Path], out_dir: Path,
         no_finish: bool = True, finish_sound: bool = False,
         finish_isolate: bool = False, finish_loudness: float | None = None,
         max_provider_usd: float = 2.00,
-        lut_patterns: list[str] | None = None) -> dict:
+        lut_patterns: list[str] | None = None,
+        no_captions: bool = True, captions_preset: str = "house",
+        captions_horizontal: bool = False, title: str | None = None,
+        no_title: bool = False, fonts_dir: str | None = None) -> dict:
     """One job: discover → sync → words → tighten → grade → angles → … → qc.
 
     The tighten stage runs unless no_tighten (the CLI enables it unless
@@ -793,7 +873,10 @@ def run(*, clips: list[Path], out_dir: Path,
         whisper_model=whisper_model, no_finish=no_finish,
         finish_sound=finish_sound, finish_isolate=finish_isolate,
         finish_loudness=finish_loudness, max_provider_usd=max_provider_usd,
-        lut_patterns=list(lut_patterns or []))
+        lut_patterns=list(lut_patterns or []),
+        no_captions=no_captions, captions_preset=captions_preset,
+        captions_horizontal=captions_horizontal, title=title,
+        no_title=no_title, fonts_dir=fonts_dir)
     graded = not no_grade
     tightened = not no_tighten
 
@@ -823,6 +906,8 @@ def run(*, clips: list[Path], out_dir: Path,
         enabled.append("export")
     if not no_vertical:
         enabled.append("reframe")
+    if not options.no_captions:
+        enabled.append("captions")
     if not no_qc:
         enabled.append("qc")
 
@@ -840,6 +925,7 @@ def run(*, clips: list[Path], out_dir: Path,
     finish_provider_spend = 0.0
     export_section: dict | None = None
     reframe_payload: dict | None = None
+    captions_section: dict | None = None
     qc_section: dict | None = None
     final_checks: list[QcCheck] = []
     spent_usd = 0.0
@@ -874,6 +960,7 @@ def run(*, clips: list[Path], out_dir: Path,
             "audio": audio_section,
             "tighten": tighten_section,
             "export": export_section,
+            "captions": captions_section,
             "qc": qc_section,
         }
 
@@ -994,6 +1081,24 @@ def run(*, clips: list[Path], out_dir: Path,
         if stage == "reframe":
             return stage_fingerprint("reframe", {"no_sam": options.no_sam},
                                      [out_dir / "cut.mp4", out_dir / "angles.json"])
+        if stage == "captions":
+            assert audio_section is not None and words_file_current is not None
+            files = [words_file_current, out_dir / "angles.json"]
+            if tightened:
+                files.append(out_dir / "tighten.json")
+            if (out_dir / "vertical.mp4").exists():
+                files.append(out_dir / "vertical.mp4")
+            if options.captions_horizontal and (out_dir / "cut.mp4").exists():
+                files.append(out_dir / "cut.mp4")
+            if options.fonts_dir is not None:
+                files.append(Path(options.fonts_dir))
+            return stage_fingerprint(
+                "captions",
+                {"preset": options.captions_preset,
+                 "horizontal": options.captions_horizontal,
+                 "title": options.title, "no_title": options.no_title,
+                 "model": options.model, "no_muse": options.no_muse},
+                files)
         if stage == "qc":
             files = [out_dir / "cut.mp4"]
             if not no_vertical:
@@ -1008,6 +1113,7 @@ def run(*, clips: list[Path], out_dir: Path,
         nonlocal angles_payload, export_section, reframe_payload
         nonlocal qc_section, final_checks, tighten_section
         nonlocal finish_payload, finish_provider_spend, provider_spent_usd
+        nonlocal captions_section
         if stage == "sync":
             loaded = read_json(out_dir / "sync.json")
             if not isinstance(loaded, dict):
@@ -1065,6 +1171,12 @@ def run(*, clips: list[Path], out_dir: Path,
             if not isinstance(loaded, dict):
                 raise ValueError(f"Not a reframe.json: {out_dir / 'reframe.json'}")
             reframe_payload = loaded
+        elif stage == "captions":
+            loaded = read_json(out_dir / "captions.json")
+            if not isinstance(loaded, dict):
+                raise ValueError(
+                    f"Not a captions.json: {out_dir / 'captions.json'}")
+            captions_section = _captions_section(loaded)
         elif stage == "qc":
             section = (prev or {}).get("qc")
             if not isinstance(section, dict) or not isinstance(section.get("checks"), list):
@@ -1090,6 +1202,7 @@ def run(*, clips: list[Path], out_dir: Path,
         nonlocal angles_payload, export_section, reframe_payload
         nonlocal qc_section, final_checks, spent_usd, tighten_section
         nonlocal finish_payload, finish_provider_spend, provider_spent_usd
+        nonlocal captions_section
         if stage == "sync":
             sync_kwargs: dict = {}
             if luts:
@@ -1333,12 +1446,53 @@ def run(*, clips: list[Path], out_dir: Path,
             records["reframe"] = StageRecord(
                 "reframe", "done", fingerprint, ["reframe.json", "vertical.mp4"],
                 spend, list(payload.get("warnings", [])), None)
+        elif stage == "captions":
+            from . import captions as captions_mod
+
+            assert audio_section is not None and words_file_current is not None
+            tighten_file = out_dir / "tighten.json" if tightened else None
+            try:
+                payload = captions_mod.run(
+                    words_path=words_file_current,
+                    angles_path=out_dir / "angles.json",
+                    tighten_path=tighten_file,
+                    out_dir=out_dir,
+                    preset=options.captions_preset,
+                    title=options.title, no_title=options.no_title,
+                    fonts_dir=Path(options.fonts_dir)
+                    if options.fonts_dir is not None else None,
+                    burn_horizontal=options.captions_horizontal,
+                    model=options.model, no_muse=options.no_muse,
+                    max_usd=max(0.0, options.max_usd - spent_usd))
+            except Exception as exc:
+                if isinstance(exc, captions_mod.CaptionsError):
+                    raise CutError(str(exc)) from exc
+                raise CutError(f"captions: {exc}") from exc
+            spend = _spend_of(payload)
+            spent_usd += spend
+            captions_section = _captions_section(payload)
+            outputs = ["captions.srt", "captions.ass", "captions.json"]
+            if payload.get("ass_horizontal"):
+                outputs.append(str(payload["ass_horizontal"]))
+            if payload.get("title"):
+                outputs.append("title.png")
+                if "cut.mp4" in (payload.get("burned") or []) \
+                        and (out_dir / "title-1920x1080.png").exists():
+                    outputs.append("title-1920x1080.png")
+            outputs.extend(str(name) for name in (payload.get("burned") or []))
+            # Captions rewrites the mp4s, so the pre-run fingerprint could
+            # never match on resume; the stored print is post-run.
+            fingerprint = _fingerprint("captions")
+            records["captions"] = StageRecord(
+                "captions", "done", fingerprint, outputs,
+                spend, list(payload.get("warnings", [])), None)
         elif stage == "qc":
             assert sync_payload is not None and angles_payload is not None
             checks = mechanical_qc(
                 out_dir=out_dir, sync_payload=sync_payload,
                 angles_payload=angles_payload, reframe_payload=reframe_payload,
-                export_section=export_section)
+                export_section=export_section,
+                captions_section=captions_section)
             stage_warnings: list[str] = []
             muse_spend = 0.0
             if options.no_muse:

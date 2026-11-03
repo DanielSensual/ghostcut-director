@@ -164,6 +164,43 @@ def command_sync(args: argparse.Namespace) -> dict:
     return payload
 
 
+def command_captions(args: argparse.Namespace) -> dict:
+    from .captions import run as run_captions
+
+    require_ffmpeg_binaries()
+    job = Path(args.job)
+    tighten = job / "tighten.json"
+    payload = run_captions(
+        words_path=job / "words.json",
+        angles_path=job / "angles.json",
+        tighten_path=tighten if tighten.exists() else None,
+        out_dir=job,
+        preset=args.preset,
+        title=args.title,
+        no_title=bool(args.no_title),
+        fonts_dir=Path(args.fonts_dir) if args.fonts_dir else None,
+        burn_horizontal=bool(args.captions_horizontal),
+        model=args.model,
+        max_usd=float(args.max_usd),
+        no_muse=bool(args.no_muse),
+    )
+    title = payload.get("title") or {}
+    summary = (f"{payload.get('lines_n', 0)} lines, "
+               f"{payload.get('words_kept', 0)} words "
+               f"(${float(payload.get('spend_usd') or 0.0):.4f})")
+    if title.get("text"):
+        summary += f", title \"{title['text']}\" ({title.get('font', '')})"
+    print(summary)
+    for name in payload.get("burned", []):
+        target = job / name
+        clean = target.with_name(f"{target.stem}.clean{target.suffix}").name
+        print(f"Burned {target} (clean kept as {clean})")
+    for warning in payload.get("warnings", []):
+        print(f"! {warning}")
+    print(f"Wrote {job / 'captions.srt'}, {job / 'captions.ass'}")
+    return payload
+
+
 def command_reframe(args: argparse.Namespace) -> dict:
     from .reframe import run as run_reframe
 
@@ -287,6 +324,15 @@ def _cut_stage_line(name: str, record: dict, payload: dict) -> str:
             n_gaps = len(section.get("gaps", []))
             line += (f" ({n_shots} shot{'s' if n_shots != 1 else ''}, "
                      f"{n_gaps} gap{'s' if n_gaps != 1 else ''})")
+    elif name == "captions":
+        section = payload.get("captions") or {}
+        if section:
+            line += f" ({section.get('lines', 0)} lines"
+            if section.get("title"):
+                line += f", title \"{section['title']}\""
+            if section.get("burned"):
+                line += f", burned {', '.join(section['burned'])}"
+            line += ")"
     elif name == "qc" and qc_section:
         checks = qc_section.get("checks", [])
         n_checks = len(checks)
@@ -625,6 +671,12 @@ def command_cut(args: argparse.Namespace) -> dict:
             finish_loudness=(None if args.finish_loudness is None
                              else float(args.finish_loudness)),
             max_provider_usd=float(args.max_provider_usd),
+            no_captions=bool(args.no_captions),
+            captions_preset=args.captions_preset,
+            captions_horizontal=bool(args.captions_horizontal),
+            title=args.title,
+            no_title=bool(args.no_title),
+            fonts_dir=args.fonts_dir,
         )
     except Exception:
         # The stage lines are the progress log: on failure, show the stages
@@ -931,6 +983,22 @@ def build_parser() -> argparse.ArgumentParser:
     cut_parser.add_argument("--max-provider-usd", type=float, default=2.0,
                             help="Job-wide ElevenLabs/Higgsfield cap "
                             "(estimated list prices)")
+    cut_parser.add_argument("--no-captions", action="store_true",
+                            help="Skip burned-in captions and the title hook")
+    cut_parser.add_argument("--captions-preset", default="house",
+                            choices=["house", "bold"],
+                            help="Caption style (default house)")
+    cut_parser.add_argument("--captions-horizontal", action="store_true",
+                            help="Burn captions into cut.mp4 as well as "
+                            "vertical.mp4")
+    cut_parser.add_argument("--title", default=None,
+                            help="Title hook text, or 'auto' for a "
+                            "Muse-proposed hook (default: no title)")
+    cut_parser.add_argument("--no-title", action="store_true",
+                            help="No cinematic title")
+    cut_parser.add_argument("--fonts-dir", default=None,
+                            help="Folder of extra fonts for captions "
+                            "and the title")
     cut_parser.add_argument("--force", action="store_true",
                             help="Ignore fingerprints; re-run every enabled stage")
     cut_parser.add_argument("--name", default="Director cut",
@@ -1019,6 +1087,30 @@ def build_parser() -> argparse.ArgumentParser:
                                help="Refuse provider calls above this cap "
                                "(estimated list prices)")
     finish_parser.set_defaults(func=command_finish)
+
+    captions_parser = sub.add_parser("captions", help="Burn captions and a title hook into a finished job")
+    captions_parser.add_argument("--job", required=True,
+                                 help="A director cut job directory")
+    captions_parser.add_argument("--preset", default="house",
+                                 choices=["house", "bold"],
+                                 help="Caption style (default house)")
+    captions_parser.add_argument("--title", default=None,
+                                 help="Title hook text, or 'auto' for a "
+                                 "Muse-proposed hook (default: no title)")
+    captions_parser.add_argument("--no-title", action="store_true",
+                                 help="No cinematic title")
+    captions_parser.add_argument("--fonts-dir", default=None,
+                                 help="Folder of extra fonts for captions "
+                                 "and the title")
+    captions_parser.add_argument("--captions-horizontal", action="store_true",
+                                 help="Burn captions into cut.mp4 as well as "
+                                 "vertical.mp4")
+    captions_parser.add_argument("--model", default="muse-spark-1.3")
+    captions_parser.add_argument("--max-usd", type=float, default=5.0,
+                                 help="Refuse the title call above this Meta spend")
+    captions_parser.add_argument("--no-muse", action="store_true",
+                                 help="No title proposal (captions still burn)")
+    captions_parser.set_defaults(func=command_captions)
 
     return parser
 

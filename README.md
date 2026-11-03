@@ -10,7 +10,7 @@ director cut /path/to/card-dump --out-dir job1
 director cut cam-a.mp4 cam-b.mp4 lav.wav --out-dir job1
 ```
 
-That runs the whole job in one output directory: sync puts every clip on one timeline, the audio clip's word timings are made explicit in the shared timebase, take picking keeps the best take of every beat and drops the flubs, each camera is graded to match, Muse Spark picks the angle for every spoken line and renders the horizontal master `cut.mp4` to publish, finishing cleans and masters its audio, the same shots export as `timeline.fcpxml` for Final Cut Pro and `timeline.otio.json` for OTIO/Resolve tools, SAM 3.1 follows the speaker for the 9:16 `vertical.mp4`, and a whole-cut check verifies the result. `cut.json` records what ran, what it cost and what QC found. `director cut --no-muse --no-sam` runs fully offline (rule picks, centred vertical, local finish, mechanical QC only), and re-running the same command resumes: stages whose inputs did not change are skipped.
+That runs the whole job in one output directory: sync puts every clip on one timeline, the audio clip's word timings are made explicit in the shared timebase, take picking keeps the best take of every beat and drops the flubs, each camera is graded to match, Muse Spark picks the angle for every spoken line and renders the horizontal master `cut.mp4` to publish, finishing cleans and masters its audio, the same shots export as `timeline.fcpxml` for Final Cut Pro and `timeline.otio.json` for OTIO/Resolve tools, SAM 3.1 follows the speaker for the 9:16 `vertical.mp4`, burned-in captions in the house style (plus a cinematic title hook) are laid onto the vertical, and a whole-cut check verifies the result. `cut.json` records what ran, what it cost and what QC found. `director cut --no-muse --no-sam` runs fully offline (rule picks, centred vertical, local finish, mechanical QC only), and re-running the same command resumes: stages whose inputs did not change are skipped.
 
 ```bash
 director cut /path/to/card-dump --out-dir job1 --pause-limit 0.8 --target 3:00
@@ -58,6 +58,13 @@ director reframe cut.mp4 --out reframe.json --shots angles.json --render vertica
 ```
 
 Reframes the finished 16:9 cut to 9:16: shot cuts come from `angles.json` or scene detection, SAM 3.1 tracks the speaker, and a smoothed per-shot crop path is written to `reframe.json`.
+
+```bash
+director captions --job job1 --title "Why this cut took one pass"
+director captions --job job1 --title auto --captions-horizontal
+```
+
+Burns karaoke captions into `vertical.mp4` (house style: Poppins SemiBold sentence case, champagne active word, soft halo that holds on white walls; `--preset bold` for ExtraBold caps promos) and lays a serif title hook over the first 3.5 seconds. `--title auto` has Muse Spark propose a 5–8 word hook from the first minute of the transcript, kept only if every word was spoken. `captions.srt` imports into Final Cut and Resolve; the un-captioned files stay as `*.clean.mp4`.
 
 ## Connecting keys and finishing
 
@@ -138,6 +145,7 @@ From [docs/muse-code/BUILD-LOG.md](docs/muse-code/BUILD-LOG.md) and the git log,
 | Voice notes and the app opening cut jobs | Designed by Muse Code on muse-wonder-1.0, built by Muse Code on muse-spark-1.3 |
 | Outside-service connections (`director connect`, the app's Connections panel) | Designed by Muse Code on muse-wonder-1.0, built by Muse Code on muse-spark-1.3 |
 | Finishing (`director finish`, the `finish` stage of `director cut`) | Designed by Muse Code on muse-wonder-1.0, built by Muse Code on muse-spark-1.3 |
+| Burned-in captions and the cinematic title (`director captions`, the `captions` stage of `director cut`) | Built by Muse Code on muse-spark-1.3 straight from the brief (no separate design) |
 
 Sync and reframe were first built earlier in the event by Claude Code, inside GhostCut, where they are still public. The versions here are Muse Code's rewrites: it got only the briefs, never that code, and its run logs show no reads outside this repository and its installed packages. Both were checked against the same real recordings and cut ([BUILD-LOG](docs/muse-code/BUILD-LOG.md), Live test).
 

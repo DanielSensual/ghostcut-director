@@ -436,3 +436,55 @@ Live test: TBD (the owner fills this from the real-footage run).
   master, -14.0 LUFS (target -14), 0 assets, $0.00 provider`; an
   independent loudnorm re-measure of the remuxed `cut.mp4` read
   −14.02 LUFS integrated, −12.92 dBTP, picture untouched.
+
+# Build log: burned-in captions + cinematic title (`captions`) (2026-11-03)
+
+| Step | By | What |
+|---|---|---|
+| Brief | Project owner, with Claude Code | `CAPTIONS-BRIEF.md`: karaoke captions in the house style, the serif title hook, the `captions` stage. |
+| Build | Meta **Muse Code** on **`muse-spark-1.3`** | `src/director/captions.py`, the `captions` stage in `cut.py`, `director captions` in `cli.py`, `tests/test_captions.py` (41 tests), `assets/fonts/` committed. Small enough to build straight from the brief; no separate design. |
+| Code review and live test | Claude Code, piloted by the owner | Real footage, below. |
+
+Muse Code token use: TBD (the owner fills this from the run log).
+Live test: TBD (the owner fills this from the real-footage run).
+
+## Build notes (Muse Code)
+
+- `cut.run` keeps `no_captions=True` as its default so existing callers
+  (and `tests/test_cut.py`, including the 7-stage end-to-end run) behave
+  unchanged; the CLI passes `no_captions=False` unless `--no-captions`,
+  so `director cut` captions by default exactly as briefed.
+- The output timeline follows `finish`/`export`: tighten-mapped when a
+  `tighten.json` is present (identity otherwise), shifted by the first
+  shot's start, clamped to the cut length. Muse-only and disfluency
+  words drop before mapping; a word straddling a kept edge drops whole.
+- Lines are 2–4 words (`bold`: 3–4, caps) with hard breaks at kept-span
+  joins, shot cuts in an inter-word gap and pauses over 0.6 s. A
+  remainder below the minimum joins back (5 words split 2+3, never
+  4+1); a run that cannot split cleanly (5 words at 3–4) stays one
+  over-long line rather than strand a tail, and is the only way a line
+  leaves its word-count range.
+- The vertical house style line is the brief's line byte-for-byte
+  (asserted); horizontal scales every size by frame height, and the
+  horizontal burn reads its own `captions-horizontal.ass`.
+- A requested title renders as a PNG card (vertical, plus a scaled
+  card when the horizontal master burns); `--title auto` degrades to
+  no title with a warning on any failure, like the finish design call.
+  Playfair is searched but never shipped; Georgia Bold, then the
+  shipped Poppins, are the fallbacks.
+- libass reads a job-local `caption-fonts` staging dir (shipped Poppins
+  plus `--fonts-dir`), never `assets/fonts` directly: the shipped
+  folder also holds the OFL text, which libass otherwise tries to open
+  as a font. A verbose burn confirms it loads the staged Poppins file.
+- The captions fingerprint is stored post-run (the stage rewrites the
+  mp4s, as finish does), and re-runs burn from the kept `*.clean.mp4`,
+  never from captioned.
+- Full suite: 621 tests (41 new), green except the same 11 pre-existing
+  `ps`-sandbox errors in `tests/test_engine_render.py` and
+  `tests/test_render_runner.py`.
+- By hand: `director captions` on a 6 s white 1080x1920 lavfi job with
+  an explicit title burned `vertical.mp4` (clean kept, durations
+  equal); the t=1 s frame shows the serif title over its gradient and
+  the caption with the champagne word, both readable on white, inside
+  the safe zone; at t=5 s the title is gone and captions continue; a
+  `--captions-horizontal` re-run burned `cut.mp4` from clean too.
