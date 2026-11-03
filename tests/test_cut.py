@@ -1144,3 +1144,20 @@ class MatchLutsTests(unittest.TestCase):
                 match_luts([f"DJI_*={Path(tmp) / 'missing.cube'}"], [drone])
             with self.assertRaisesRegex(CutError, "want PATTERN=CUBE"):
                 match_luts(["DJI_*"], [drone])
+
+
+class CameraCoverageTests(unittest.TestCase):
+    def test_words_outside_every_camera_are_dropped(self) -> None:
+        # Live 2026-11-03: an 11.5-minute lav, cameras rolling only 143-305 s of it.
+        from director.cut import camera_coverage, words_on_camera
+        sync = {"clips": [
+            {"label": "A", "offset_s": 0.0, "camera": {"duration_s": 692.0, "width": 0}},
+            {"label": "B", "offset_s": 151.6, "camera": {"duration_s": 152.1, "width": 3840}},
+            {"label": "C", "offset_s": 143.5, "camera": {"duration_s": 162.0, "width": 5120}},
+            {"label": "D", "offset_s": None, "camera": {"duration_s": 10.0, "width": 1920}}]}
+        spans = camera_coverage(sync)
+        self.assertEqual(spans, [(143.5, 305.5)])
+        words = [TimedWord("early", 10.0, 10.4), TimedWord("hello", 150.0, 150.3),
+                 TimedWord("late", 400.0, 400.5)]
+        self.assertEqual([w.text for w in words_on_camera(words, spans)], ["hello"])
+        self.assertEqual(len(words_on_camera(words, [])), 3)

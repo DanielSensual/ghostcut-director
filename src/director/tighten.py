@@ -680,7 +680,9 @@ def window_prompt(window: Window, utterances: list[Utterance],
                 note += f", {utterance.disfluency_count} {noun}"
             line += f" ({note})"
         lines.append(line)
-    lines.append(f"The video starts 1.0s before U{core[0].id}; utterance "
+    lead = max(0.0, core[0].start_s - window.start_s)
+    lines.append(f"The video starts {lead:.1f}s before U{core[0].id} (at "
+                 f"{window.start_s:.1f} on the recording's timeline); utterance "
                  f"times are on the recording's timeline, not the video's.")
     return "\n".join(lines)
 
@@ -908,13 +910,14 @@ def run(*, sync_path: Path, words_path: Path, out_path: Path,
     utterances = build_utterances(words)
     windows = build_windows(utterances)
     reference_clip = next((c for c in clips if c.path == reference), None)
+    placed = sorted((c for c in clips
+                     if c.offset_s is not None and c.width > 0),
+                    key=lambda c: c.label)
     if reference_clip is not None and reference_clip.width > 0:
-        video = reference_clip
+        videos = [reference_clip] + [c for c in placed if c is not reference_clip]
     else:
-        placed = sorted((c for c in clips
-                         if c.offset_s is not None and c.width > 0),
-                        key=lambda c: c.label)
-        video = placed[0] if placed else None
+        videos = placed
+    video = videos[0] if videos else None
     taste = _load_taste(taste_path)
 
     warnings: list[str] = []
@@ -945,15 +948,20 @@ def run(*, sync_path: Path, words_path: Path, out_path: Path,
             # Coverage is judged on the words in the window, not its 1 s pads: speech
             # that runs to the end of a clip would otherwise never reach Spark. The
             # window is then clipped to the video so picture and sound start together.
+            # Any camera that saw these words will do: the preferred one first.
             covered = False
-            if (video is not None and video.offset_s is not None and owned):
-                video_end = video.offset_s + video.duration_s
-                covered = (video.offset_s <= owned[0].start_s + 1e-9
-                           and max(u.end_s for u in owned) <= video_end + 1e-9)
-                if covered:
+            video = None
+            for candidate in videos:
+                if not owned:
+                    break
+                candidate_end = candidate.offset_s + candidate.duration_s
+                if (candidate.offset_s <= owned[0].start_s + 1e-9
+                        and max(u.end_s for u in owned) <= candidate_end + 1e-9):
+                    video, covered = candidate, True
                     window = replace(window,
-                                     start_s=max(window.start_s, video.offset_s),
-                                     end_s=min(window.end_s, video_end))
+                                     start_s=max(window.start_s, candidate.offset_s),
+                                     end_s=min(window.end_s, candidate_end))
+                    break
             if muse_dead or video is None or not covered:
                 _use_rule()
                 any_rule = True

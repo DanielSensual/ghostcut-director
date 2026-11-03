@@ -238,6 +238,35 @@ def match_luts(patterns: list[str], clips: list[Path]) -> dict[str, Path]:
     return out
 
 
+def camera_coverage(sync_payload: dict) -> list[tuple[float, float]]:
+    """Merged timeline spans where at least one placed clip with picture is rolling. Pure."""
+    spans = sorted(
+        (float(clip["offset_s"]),
+         float(clip["offset_s"]) + float((clip.get("camera") or {}).get("duration_s") or 0.0))
+        for clip in sync_payload.get("clips", [])
+        if clip.get("offset_s") is not None
+        and float((clip.get("camera") or {}).get("width") or 0) > 0)
+    merged: list[tuple[float, float]] = []
+    for start, end in spans:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def words_on_camera(words: list, spans: list[tuple[float, float]]) -> list:
+    """The words spoken while some camera was rolling (by each word's midpoint). Pure.
+
+    A lav recorder usually rolls before and after the cameras; a cut can only show what a
+    camera saw. With no camera coverage at all every word is kept.
+    """
+    if not spans:
+        return list(words)
+    return [word for word in words
+            if any(start <= (word.start_s + word.end_s) / 2 <= end for start, end in spans)]
+
+
 def resolve_audio(sync_payload: dict, audio_path: Path | None) -> tuple[str, dict]:
     """(label, sync clip dict) of the clip angles will lay under the cut."""
     clips = sync_payload.get("clips", [])
@@ -1183,6 +1212,13 @@ def run(*, clips: list[Path], out_dir: Path,
                         "speakers": [], "chunks": 0, "matched_share": None,
                         "muse_only": 0, "whisper_only": 0}
                 stage_warnings.extend(transcribed.warnings)
+            if source != "explicit":
+                kept_words = words_on_camera(validated, camera_coverage(sync_payload))
+                if 0 < len(kept_words) < len(validated):
+                    stage_warnings.append(
+                        f"words_outside_cameras_dropped:{len(validated) - len(kept_words)}")
+                    validated = kept_words
+                    write_json(out_dir / "words.json", words_file_payload(validated))
             spent_usd += words_spend
             audio_section = {
                 "label": label,

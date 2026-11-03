@@ -187,8 +187,12 @@ class UtteranceTests(unittest.TestCase):
         self.assertIn("Editor preference: Keep it punchy", prompt)
         self.assertIn("U1 [2.5-3.5] welcome back.", prompt)
         self.assertTrue(prompt.endswith(
-            "The video starts 1.0s before U0; utterance times are on the "
-            "recording's timeline, not the video's."))
+            "The video starts 1.0s before U0 (at 0.0 on the recording's "
+            "timeline); utterance times are on the recording's timeline, "
+            "not the video's."))
+        clipped = Window(0, [0, 1, 2], 0.6, 6.0)
+        self.assertIn("The video starts 0.4s before U0 (at 0.6",
+                      tighten_mod.window_prompt(clipped, utterances, prev, []))
         self.assertIn("never leave an utterance out", tighten_mod.DEVELOPER)
 
 
