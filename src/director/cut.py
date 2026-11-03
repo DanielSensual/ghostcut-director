@@ -2,7 +2,8 @@
 
 `director cut` runs the whole Director pipeline in one output directory:
 `sync` puts every clip on one timeline, the words bridge makes the audio
-clip's word timings explicit in the shared timebase, `grade` matches the
+clip's word timings explicit in the shared timebase, `tighten` picks the
+take to keep for every beat (unless --no-tighten), `grade` matches the
 cameras, `angles` picks and renders the horizontal master, the timelines
 export to FCPXML and OTIO, `reframe` renders the 9:16 vertical, and a
 whole-cut check (mechanical, then one Muse Spark pass over a proxy of the
@@ -36,6 +37,7 @@ from . import angles as angles_mod
 from . import grade as grade_mod
 from . import reframe as reframe_mod
 from . import sync as sync_mod
+from . import tighten as tighten_mod
 from .export import ExportError, export_timelines
 
 MEDIA_EXTENSIONS = {".mov", ".mp4", ".m4v", ".mp3", ".wav", ".m4a"}
@@ -43,7 +45,8 @@ DEFAULT_OUT_DIR = "director-cut"
 DEFAULT_MODEL = "muse-spark-1.3"
 DEFAULT_MIN_SHOT_S = 2.0
 DEFAULT_MAX_USD = 5.0
-STAGES = ("sync", "words", "grade", "angles", "export", "reframe", "qc")
+STAGES = ("sync", "words", "tighten", "grade", "angles", "export",
+          "reframe", "qc")
 WHISPER_TIMEOUT_S = 3600
 DURATION_TOLERANCE_S = 0.10
 BLACK_SHARE_WARN = 0.20
@@ -118,6 +121,12 @@ class JobOptions:
     max_usd: float
     force: bool
     project_name: str
+    # Take picking (TIGHTEN-DESIGN.md §11). no_tighten defaults True so
+    # existing programmatic callers keep their 7-stage job; the CLI passes
+    # False unless --no-tighten, so `director cut` tightens by default.
+    no_tighten: bool = True
+    pause_limit_s: float = 0.8
+    target_s: float | None = None
 
 
 @dataclass(slots=True)
@@ -642,6 +651,25 @@ def _spend_of(payload: dict) -> float:
     return float(payload.get("spend_usd") or 0.0)
 
 
+def _tighten_section(tighten_payload: dict) -> dict:
+    """The cut.json tighten section from a tighten.json payload."""
+    kept = [s for s in tighten_payload.get("kept_spans", []) or []]
+    removed = [s for s in tighten_payload.get("removed_spans", []) or []]
+    return {
+        "file": "tighten.json",
+        "beats": len(tighten_payload.get("beats", []) or []),
+        "kept_s": round(sum(float(s.get("end_s", 0.0))
+                            - float(s.get("start_s", 0.0)) for s in kept), 3),
+        "removed_s": round(sum(float(s.get("end_s", 0.0))
+                               - float(s.get("start_s", 0.0))
+                               for s in removed), 3),
+        "duration_in_s": tighten_payload.get("duration_in_s", 0.0),
+        "duration_out_s": tighten_payload.get("duration_out_s", 0.0),
+        "method": tighten_payload.get("method", ""),
+        "target": tighten_payload.get("target"),
+    }
+
+
 def run(*, clips: list[Path], out_dir: Path,
         reference_path: Path | None, audio_path: Path | None,
         words_path: Path | None, transcripts_dir: Path | None,
@@ -649,10 +677,14 @@ def run(*, clips: list[Path], out_dir: Path,
         no_muse: bool, model: str, min_shot_s: float,
         no_vertical: bool, no_sam: bool, no_export: bool,
         no_qc: bool, max_usd: float, force: bool,
-        project_name: str) -> dict:
-    """One job: discover → sync → words → grade → angles → export → reframe → qc.
+        project_name: str, no_tighten: bool = True,
+        pause_limit_s: float = 0.8,
+        target_s: float | None = None) -> dict:
+    """One job: discover → sync → words → tighten → grade → angles → … → qc.
 
-    Returns the cut.json payload (also written, incrementally, to out_dir).
+    The tighten stage runs unless no_tighten (the CLI enables it unless
+    --no-tighten). Returns the cut.json payload (also written,
+    incrementally, to out_dir).
     """
     if max_usd < 0:
         raise ValueError("--max-usd must be >= 0")
@@ -669,8 +701,11 @@ def run(*, clips: list[Path], out_dir: Path,
         methods=list(methods), no_grade=no_grade, grade_check=grade_check,
         no_muse=no_muse, model=model, min_shot_s=min_shot_s,
         no_vertical=no_vertical, no_sam=no_sam, no_export=no_export,
-        no_qc=no_qc, max_usd=max_usd, force=force, project_name=project_name)
+        no_qc=no_qc, max_usd=max_usd, force=force, project_name=project_name,
+        no_tighten=no_tighten, pause_limit_s=pause_limit_s,
+        target_s=target_s)
     graded = not no_grade
+    tightened = not no_tighten
 
     top_warnings: list[str] = []
     prev: dict | None = None
@@ -687,6 +722,8 @@ def run(*, clips: list[Path], out_dir: Path,
     prev_stages: dict = prev.get("stages", {}) if prev else {}
 
     enabled = ["sync", "words"]
+    if tightened:
+        enabled.append("tighten")
     if graded:
         enabled.append("grade")
     enabled.append("angles")
@@ -704,6 +741,7 @@ def run(*, clips: list[Path], out_dir: Path,
     sync_payload: dict | None = None
     audio_section: dict | None = None
     words_file_current: Path | None = None
+    tighten_section: dict | None = None
     grade_payload: dict | None = None
     angles_payload: dict | None = None
     export_section: dict | None = None
@@ -735,6 +773,7 @@ def run(*, clips: list[Path], out_dir: Path,
             "inputs": [Path(clip).name for clip in options.clips],
             "stages": stages_dict,
             "audio": audio_section,
+            "tighten": tighten_section,
             "export": export_section,
             "qc": qc_section,
         }
@@ -767,6 +806,15 @@ def run(*, clips: list[Path], out_dir: Path,
                 stem = Path(str(cam.get("path") or "")).stem
                 files.append(Path(options.transcripts_dir) / f"{stem}.json")
             return stage_fingerprint("words", {"audio": label}, files)
+        if stage == "tighten":
+            assert audio_section is not None and words_file_current is not None
+            return stage_fingerprint(
+                "tighten",
+                {"audio": audio_section["label"],
+                 "pause_limit_s": options.pause_limit_s,
+                 "target_s": options.target_s, "model": options.model,
+                 "no_muse": options.no_muse},
+                [words_file_current, out_dir / "sync.json"])
         if stage == "grade":
             return stage_fingerprint(
                 "grade",
@@ -777,6 +825,8 @@ def run(*, clips: list[Path], out_dir: Path,
         if stage == "angles":
             assert audio_section is not None and words_file_current is not None
             files = [words_file_current, out_dir / "sync.json"]
+            if tightened:
+                files.append(out_dir / "tighten.json")
             if graded:
                 files.append(out_dir / "grade.json")
             return stage_fingerprint(
@@ -806,7 +856,7 @@ def run(*, clips: list[Path], out_dir: Path,
         """Reload a skipped stage's state; ValueError/OSError re-executes it."""
         nonlocal sync_payload, audio_section, words_file_current, grade_payload
         nonlocal angles_payload, export_section, reframe_payload
-        nonlocal qc_section, final_checks
+        nonlocal qc_section, final_checks, tighten_section
         if stage == "sync":
             loaded = read_json(out_dir / "sync.json")
             if not isinstance(loaded, dict):
@@ -824,6 +874,12 @@ def run(*, clips: list[Path], out_dir: Path,
             audio_section = dict(previous_audio)
             audio_section["words"] = len(recount)
             words_file_current = words_file
+        elif stage == "tighten":
+            loaded = read_json(out_dir / "tighten.json")
+            if not isinstance(loaded, dict):
+                raise ValueError(
+                    f"Not a tighten.json: {out_dir / 'tighten.json'}")
+            tighten_section = _tighten_section(loaded)
         elif stage == "grade":
             loaded = read_json(out_dir / "grade.json")
             if not isinstance(loaded, dict):
@@ -867,7 +923,7 @@ def run(*, clips: list[Path], out_dir: Path,
     def _execute(stage: str, fingerprint: str) -> None:
         nonlocal sync_payload, audio_section, words_file_current, grade_payload
         nonlocal angles_payload, export_section, reframe_payload
-        nonlocal qc_section, final_checks, spent_usd
+        nonlocal qc_section, final_checks, spent_usd, tighten_section
         if stage == "sync":
             payload = sync_mod.run(
                 clip_paths=list(options.clips), reference_path=options.reference_path,
@@ -901,6 +957,30 @@ def run(*, clips: list[Path], out_dir: Path,
             outputs = [] if source == "explicit" else ["words.json"]
             records["words"] = StageRecord("words", "done", fingerprint, outputs,
                                            0.0, stage_warnings, None)
+        elif stage == "tighten":
+            assert audio_section is not None and words_file_current is not None
+            try:
+                payload = tighten_mod.run(
+                    sync_path=out_dir / "sync.json",
+                    words_path=words_file_current,
+                    out_path=out_dir / "tighten.json",
+                    audio_label=audio_section["label"],
+                    pause_limit_s=options.pause_limit_s,
+                    target_s=options.target_s, model=options.model,
+                    no_muse=options.no_muse,
+                    max_usd=max(0.0, options.max_usd - spent_usd))
+            except Exception as exc:
+                if isinstance(exc, tighten_mod.TightenError):
+                    # Already stage-prefixed; CutError carries it through
+                    # _fail unchanged.
+                    raise CutError(str(exc)) from exc
+                raise CutError(f"tighten: {exc}") from exc
+            spend = _spend_of(payload)
+            spent_usd += spend
+            tighten_section = _tighten_section(payload)
+            records["tighten"] = StageRecord(
+                "tighten", "done", fingerprint, ["tighten.json"],
+                spend, list(payload.get("warnings", [])), None)
         elif stage == "grade":
             do_check = bool(options.grade_check and not options.no_muse)
             if do_check:
@@ -920,14 +1000,20 @@ def run(*, clips: list[Path], out_dir: Path,
         elif stage == "angles":
             _trailing_gate("angles")
             assert audio_section is not None and words_file_current is not None
+            angles_kwargs: dict = {
+                "sync_path": out_dir / "sync.json",
+                "words_path": words_file_current,
+                "out_path": out_dir / "angles.json",
+                "audio_label": audio_section["label"],
+                "render_path": out_dir / "cut.mp4",
+                "min_shot_s": options.min_shot_s, "model": options.model,
+                "no_muse": options.no_muse,
+                "grade_path": out_dir / "grade.json" if graded else None,
+            }
+            if tightened:
+                angles_kwargs["tighten_path"] = out_dir / "tighten.json"
             try:
-                payload = angles_mod.run(
-                    sync_path=out_dir / "sync.json", words_path=words_file_current,
-                    out_path=out_dir / "angles.json",
-                    audio_label=audio_section["label"],
-                    render_path=out_dir / "cut.mp4", min_shot_s=options.min_shot_s,
-                    model=options.model, no_muse=options.no_muse,
-                    grade_path=out_dir / "grade.json" if graded else None)
+                payload = angles_mod.run(**angles_kwargs)
             except Exception as exc:
                 if str(exc) == "nothing to render":
                     raise CutError(

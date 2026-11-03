@@ -53,12 +53,77 @@ def command_angles(args: argparse.Namespace) -> dict:
         model=args.model,
         no_muse=bool(args.no_muse),
         grade_path=Path(args.grade) if getattr(args, "grade", None) else None,
+        tighten_path=Path(args.tighten) if getattr(args, "tighten", None) else None,
     )
     for shot in payload.get("shots", []):
         for overrule in shot.get("overrules", []):
             print(f"  shot {shot['id']} {shot['camera']}: {overrule}")
     n_lines, n_shots = len(payload.get("lines", [])), len(payload.get("shots", []))
-    print(f"{n_lines} lines → {n_shots} shots ({payload.get('method')}, ${payload.get('spend_usd', 0.0):.4f})")
+    summary = (f"{n_lines} lines → {n_shots} shots ({payload.get('method')}, "
+               f"${payload.get('spend_usd', 0.0):.4f})")
+    if payload.get("tighten"):
+        section = payload["tighten"]
+        shots = payload.get("shots", [])
+        if shots:
+            out_s = float(shots[-1].get("end_s", 0.0)) - float(shots[0].get("start_s", 0.0))
+        else:
+            out_s = 0.0
+        in_s = float(section.get("kept_s", 0.0)) + float(section.get("removed_s", 0.0))
+        summary += f" tightened {in_s:.1f}s → {out_s:.1f}s"
+    print(summary)
+    return payload
+
+
+def command_tighten(args: argparse.Namespace) -> dict:
+    from .tighten import parse_target, run as run_tighten
+
+    require_ffmpeg_binaries()
+    payload = run_tighten(
+        sync_path=Path(args.sync),
+        words_path=Path(args.words),
+        out_path=Path(args.out),
+        audio_label=args.audio,
+        pause_limit_s=float(args.pause_limit),
+        target_s=parse_target(args.target) if args.target else None,
+        model=args.model,
+        no_muse=bool(args.no_muse),
+        max_usd=float(args.max_usd),
+    )
+    for beat in payload.get("beats", []):
+        attempts = beat.get("attempts", [])
+        pick = beat.get("pick_attempt", -1)
+        if beat.get("status") == "kept" and 0 <= pick < len(attempts):
+            chosen = attempts[pick]
+            duration = float(chosen.get("end_s", 0.0)) - float(chosen.get("start_s", 0.0))
+            n_alternates = sum(1 for attempt in attempts
+                               if attempt.get("verdict") == "alternate")
+            if n_alternates == 1:
+                suffix = " (+1 alternate)"
+            elif n_alternates:
+                suffix = f" (+{n_alternates} alternates)"
+            else:
+                suffix = ""
+            print(f"B{beat.get('id')} {beat.get('topic', '')}: "
+                  f"kept A{chosen.get('id')} ({duration:.1f}s) — "
+                  f"{chosen.get('reason', '')}{suffix}")
+        else:
+            if 0 <= pick < len(attempts):
+                best = attempts[pick]
+            elif attempts:
+                best = max(attempts,
+                           key=lambda a: (float(a.get("confidence", 0.0) or 0.0),
+                                          -int(a.get("id", 0))))
+            else:
+                best = {}
+            print(f"B{beat.get('id')} {beat.get('topic', '')}: "
+                  f"dropped ({best.get('kind', '')})")
+    print(f"{float(payload.get('duration_in_s', 0.0)):.1f}s → "
+          f"{float(payload.get('duration_out_s', 0.0)):.1f}s, "
+          f"{len(payload.get('beats', []))} beats, "
+          f"{len(payload.get('removed_spans', []))} removed spans "
+          f"(${float(payload.get('spend_usd', 0.0)):.4f}, "
+          f"{payload.get('method')})")
+    print(f"Wrote {args.out}")
     return payload
 
 
@@ -144,6 +209,24 @@ def _cut_stage_line(name: str, record: dict, payload: dict) -> str:
                 extra = f", shifted {float(audio['words_shifted_s']):+.3f}s"
             line += (f" ({audio.get('words', 0)} words, "
                      f"{audio.get('words_source')}{extra})")
+    elif name == "tighten":
+        section = payload.get("tighten") or {}
+        if section:
+            method = section.get("method", "")
+            prefix = f"{method}, " if method and method != "muse" else ""
+            line += (f" ({prefix}{section.get('beats', 0)} beats, kept "
+                     f"{float(section.get('duration_in_s', 0.0)):.1f}s → "
+                     f"{float(section.get('duration_out_s', 0.0)):.1f}s")
+            target = section.get("target") or None
+            if target:
+                requested = float(target.get("requested_s", 0.0))
+                stamp = f"{int(requested // 60)}:{int(requested % 60):02d}"
+                if target.get("met"):
+                    line += f", target {stamp} met"
+                else:
+                    over = float(target.get("after_s", 0.0)) - requested
+                    line += f", target {stamp} missed by {over:.1f}s"
+            line += ")"
     elif name == "export":
         section = payload.get("export") or {}
         if section:
@@ -216,6 +299,7 @@ def _cut_manifest_mtime_ns(out_dir: Path) -> int | None:
 def command_cut(args: argparse.Namespace) -> dict:
     from . import cut as cut_mod
     from .sync import parse_methods
+    from .tighten import parse_target
 
     require_ffmpeg_binaries()
     methods = parse_methods(args.methods)
@@ -242,6 +326,9 @@ def command_cut(args: argparse.Namespace) -> dict:
             max_usd=float(args.max_usd),
             force=bool(args.force),
             project_name=args.name,
+            no_tighten=bool(args.no_tighten),
+            pause_limit_s=float(args.pause_limit),
+            target_s=parse_target(args.target) if args.target else None,
         )
     except Exception:
         # The stage lines are the progress log: on failure, show the stages
@@ -276,7 +363,23 @@ def build_parser() -> argparse.ArgumentParser:
     angles_parser.add_argument("--model", default="muse-spark-1.3")
     angles_parser.add_argument("--no-muse", action="store_true", help="Use the deterministic rule fallback")
     angles_parser.add_argument("--grade", default=None, help="grade.json from director grade")
+    angles_parser.add_argument("--tighten", default=None, help="tighten.json from director tighten")
     angles_parser.set_defaults(func=command_angles)
+
+    tighten_parser = sub.add_parser("tighten", help="Pick the takes, lose the flubs")
+    tighten_parser.add_argument("--sync", required=True, help="sync.json from director sync")
+    tighten_parser.add_argument("--words", required=True, help="Word-timed Whisper JSON for the audio clip")
+    tighten_parser.add_argument("--out", required=True, help="Where to write tighten.json")
+    tighten_parser.add_argument("--audio", default=None, help="Audio clip label (default: the reference clip)")
+    tighten_parser.add_argument("--pause-limit", type=float, default=0.8,
+                                help="Pauses longer than this inside a kept attempt are shortened to 0.35 s")
+    tighten_parser.add_argument("--target", default=None,
+                                help="Target kept length, M:SS or seconds (whole beats only)")
+    tighten_parser.add_argument("--model", default="muse-spark-1.3")
+    tighten_parser.add_argument("--no-muse", action="store_true", help="Keep the last full pass of each beat")
+    tighten_parser.add_argument("--max-usd", type=float, default=5.0,
+                                help="Refuse above this estimated Spark spend")
+    tighten_parser.set_defaults(func=command_tighten)
 
     grade_parser = sub.add_parser("grade", help="Grade each camera to Rec.709 and match to a reference")
     grade_parser.add_argument("--sync", required=True, help="sync.json from director sync")
@@ -340,6 +443,12 @@ def build_parser() -> argparse.ArgumentParser:
     cut_parser.add_argument("--no-export", action="store_true",
                             help="Skip the FCPXML/OTIO timeline export")
     cut_parser.add_argument("--no-qc", action="store_true", help="Skip the whole-cut check")
+    cut_parser.add_argument("--no-tighten", action="store_true",
+                            help="Skip take picking; keep the whole recording")
+    cut_parser.add_argument("--pause-limit", type=float, default=0.8,
+                            help="Pauses longer than this inside a kept attempt are shortened to 0.35 s")
+    cut_parser.add_argument("--target", default=None,
+                            help="Target kept length, M:SS or seconds (whole beats only)")
     cut_parser.add_argument("--max-usd", type=float, default=5.0,
                             help="Refuse above this estimated Meta spend")
     cut_parser.add_argument("--force", action="store_true",

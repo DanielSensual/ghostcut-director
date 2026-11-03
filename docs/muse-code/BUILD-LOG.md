@@ -178,3 +178,52 @@ Live test: TBD (the owner fills this from the real-footage run).
 - Full suite: 376 tests, green except the same 11 pre-existing `ps`-sandbox errors in
   `tests/test_engine_render.py` and `tests/test_render_runner.py` that fail identically on the untouched
   tree (verified before and after this build).
+
+# Build log: take picking (`tighten`) (2026-11-03)
+
+| Step | By | What |
+|---|---|---|
+| Brief | Project owner, with Claude Code | `TIGHTEN-BRIEF.md`: take picking, pause trim, `tighten.json`. |
+| Design | Meta **Muse Code** on **`muse-wonder-1.0`** | `TIGHTEN-DESIGN.md`: `cutlist.py` contract, windowed Spark picks, rule fallback, tightened render. |
+| Build | Meta **Muse Code** on **`muse-spark-1.3`** | `src/director/tighten.py`, `src/director/cutlist.py`, the `angles`/`cut` changes, `tests/test_tighten.py`, `tests/test_cutlist.py`. |
+| Code review and live test | Claude Code, piloted by the owner | Real footage, below. |
+
+Muse Code token use: TBD (the owner fills this from the run log).
+Live test: TBD (the owner fills this from the real-footage run).
+
+## Build notes (Muse Code)
+
+- `cut.run` keeps `no_tighten=True` as its default so existing callers (and
+  `tests/test_cut.py`, which pins the 7-stage manifest) run unchanged; the CLI
+  passes `no_tighten=False` unless `--no-tighten`, so `director cut` tightens
+  by default exactly as designed. `cut` passes `tighten_path` to `angles.run`
+  only when the stage is enabled, for the same reason.
+- The five span-building constants (§8) live in `cutlist.py`, re-exported
+  from `tighten.py` under the same names: `recompute_spans` needs them and
+  `cutlist` must not import `tighten` back (the no-cycle rule).
+- Repair carriage on attempts: `notes` (the §7.4 overrule notes) and
+  `excluded_utterance_ids` (unclaimed utterances folded into an attempt's
+  span but excluded from its kept words) ride on the attempt dicts, omitted
+  when empty so a clean pick matches the §5 shape exactly.
+- `verify_window_reply` takes an optional `beat_id_offset` (default 0) so
+  the `tighten_beat_below_min:B<id>` warning names the payload-level beat.
+- Re-run preservation (§11.2): span exclusions carry over verbatim (they are
+  range-keyed; stale ranges drop aloud via `span_exclusion_stale`), with
+  their history entries, while beat/attempt ops re-apply through
+  `apply_operations` — re-applying `drop_span` by its old span id would drop
+  the wrong span after a re-pick renumbers everything.
+- Window-boundary beats with equal topics are not structurally merged (the
+  design specifies no merge mechanics): no-merge never drops speech, and the
+  retreat rule makes straddling rare.
+- Render (§10): shots are split at kept-span boundaries and edge parts
+  extend to the span edges they cover, so no shot crosses removed material
+  and output shots tile contiguously from 0; audio parts clip to the
+  rendered shot range (trailing lines with no camera are dropped from the
+  picture, as in an un-tightened cut) and snap to the same grid, so audio
+  and video agree frame-for-frame. In the normal case this is exactly the
+  designed per-span audio.
+- Midpoint edges make consecutive kept spans abut, so a word-free gap can
+  only reach the `dead_air` branch in degenerate inputs; the branch stays
+  as the specified safety net and is covered directly.
+- Full suite: 407 tests, green except the same 11 pre-existing `ps`-sandbox
+  errors in `tests/test_engine_render.py` and `tests/test_render_runner.py`.

@@ -21,6 +21,11 @@ skips is normal.
 - `src/director/` — the command line (`director …`, `cli.py`):
   - `angles.py`: lines from the audio clip's words → covering cameras per line → Muse Spark picks from one frame
     per camera (guestlist, optional) → mechanical checks overrule → shot-by-shot render under the uncut audio.
+    Consumes `tighten.json` when given (`--tighten`): lines per kept span, shots on the output timeline.
+  - `cutlist.py`: the shared "what stays" contract: `tighten.json` load/write, span recomputation, source/output
+    time mapping, and `apply_operations`, the one edit path.
+  - `tighten.py`: words → utterances → windows → Muse Spark take picks (guestlist, optional) or the rule fallback
+    (last full pass per beat) → `tighten.json` with kept spans, removed spans with reasons, beats and alternates.
   - `grade.py`: per-camera `.cube` from published curves (S-Log3, HLG) → probed decode range → exposure and white
     balance matched to a reference → optional Muse check.
   - `sync.py`: timecode, capture-clock, waveform and Whisper offsets per clip → checked against each other →

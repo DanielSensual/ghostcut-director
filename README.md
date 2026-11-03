@@ -10,7 +10,14 @@ director cut /path/to/card-dump --out-dir job1
 director cut cam-a.mp4 cam-b.mp4 lav.wav --out-dir job1
 ```
 
-That runs the whole job in one output directory: sync puts every clip on one timeline, the audio clip's word timings are made explicit in the shared timebase, each camera is graded to match, Muse Spark picks the angle for every spoken line and renders the horizontal master `cut.mp4` to publish, the same shots export as `timeline.fcpxml` for Final Cut Pro and `timeline.otio.json` for OTIO/Resolve tools, SAM 3.1 follows the speaker for the 9:16 `vertical.mp4`, and a whole-cut check verifies the result. `cut.json` records what ran, what it cost and what QC found. `director cut --no-muse --no-sam` runs fully offline (rule picks, centred vertical, mechanical QC only), and re-running the same command resumes: stages whose inputs did not change are skipped.
+That runs the whole job in one output directory: sync puts every clip on one timeline, the audio clip's word timings are made explicit in the shared timebase, take picking keeps the best take of every beat and drops the flubs, each camera is graded to match, Muse Spark picks the angle for every spoken line and renders the horizontal master `cut.mp4` to publish, the same shots export as `timeline.fcpxml` for Final Cut Pro and `timeline.otio.json` for OTIO/Resolve tools, SAM 3.1 follows the speaker for the 9:16 `vertical.mp4`, and a whole-cut check verifies the result. `cut.json` records what ran, what it cost and what QC found. `director cut --no-muse --no-sam` runs fully offline (rule picks, centred vertical, mechanical QC only), and re-running the same command resumes: stages whose inputs did not change are skipped.
+
+```bash
+director cut /path/to/card-dump --out-dir job1 --pause-limit 0.8 --target 3:00
+director cut /path/to/card-dump --out-dir job1 --no-tighten   # keep the whole recording
+```
+
+`--target` shortens the kept cut to a length by dropping whole beats only, never mid-sentence; `--pause-limit` shortens pauses inside kept takes to 0.35 s.
 
 Two things to know before finishing in an NLE: the timelines reference the camera originals, so they open showing log/HLG picture — the per-camera `.cube` files `grade` wrote sit beside them in the job directory (`cut.json` names which cube belongs to which camera). And each timeline clip carries its own camera's audio; the rendered `cut.mp4`/`vertical.mp4` remain the masters with the production audio laid under them, so an editor rebuilding the mix re-lays the audio clip at the offset recorded in `angles.json`/`cut.json` (`audio.offset_s`).
 
@@ -29,6 +36,12 @@ director grade --sync sync.json --out grade.json
 ```
 
 Writes a per-camera `.cube` from published curves (S-Log3, HLG) and matches exposure and white balance to a reference camera.
+
+```bash
+director tighten --sync sync.json --words words.json --out tighten.json
+```
+
+Director keeps one take per beat, lists every removed span with its reason in `tighten.json`, shortens pauses over the limit to 0.35 s, and both picture and sound are cut at word boundaries with a short fade so joins do not click. Muse Spark picks the takes by watching a proxy beside the numbered transcript (the rule fallback with `--no-muse` keeps the last full pass of each beat); pass the result to `angles` with `--tighten tighten.json`.
 
 ```bash
 director angles --sync sync.json --words words.json --out angles.json --grade grade.json --render cut.mp4
@@ -73,6 +86,7 @@ From [docs/muse-code/BUILD-LOG.md](docs/muse-code/BUILD-LOG.md) and the git log,
 | The Director app, Render and the test-run scripts | Built by Claude Code with the owner (imported) |
 | The briefs | The owner with Claude Code |
 | One-step multicam cut (`director cut`) | Designed by Muse Code on muse-wonder-1.0, built by Muse Code on muse-spark-1.3 |
+| Take picking (`director tighten`, the `tighten` stage of `director cut`) | Designed by Muse Code on muse-wonder-1.0, built by Muse Code on muse-spark-1.3 |
 
 Sync and reframe were first built earlier in the event by Claude Code, inside GhostCut, where they are still public. The versions here are Muse Code's rewrites: it got only the briefs, never that code, and its run logs show no reads outside this repository and its installed packages. Both were checked against the same real recordings and cut ([BUILD-LOG](docs/muse-code/BUILD-LOG.md), Live test).
 
