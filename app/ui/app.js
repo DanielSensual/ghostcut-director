@@ -82,6 +82,21 @@
   $("#engineDot").classList.toggle("live", LIVE);
   $("#engineDot").title = LIVE ? "Engine connected: Muse runs on Spark" : "Static demo: Muse replies are scripted";
 
+  // Cut-job mode: the project is a director cut job, so voice notes, taste and re-render apply.
+  const isCutJob = () => !!(P && P.cutJob);
+  const micBtn = $("#micBtn");
+  micBtn.hidden = !(LIVE && isCutJob());
+  function micBanner() {
+    const url = `${location.origin}/app/ui/`;
+    $("#micBanner").replaceChildren(
+      "The microphone is not available in this window. Open this page in your browser at ",
+      h("code", {}, url),
+      " to record by voice, or drop a voice memo file here.");
+    $("#micBanner").hidden = false;
+    micBtn.disabled = true;
+  }
+  if (LIVE && isCutJob() && !(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)) micBanner();
+
   // ---------- views ----------
   const rendered = {};
   const show = (v) => {
@@ -354,6 +369,231 @@
     try { applyResult(await api("/api/undo", {})); } catch (e) { $("#pendingN").textContent = e.message; }
   };
 
+  // ---------- voice notes (cut-job mode): hold to talk, drop a memo, accept, re-render ----------
+  const BEAT_OPS = new Set(["swap_take", "drop_beat", "restore_beat", "set_angle", "clear_angle"]);
+  let recorder = null, recChunks = [], recAt = 0, recTimer = 0;
+  const recMime = () => (typeof MediaRecorder !== "undefined" &&
+    MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? "audio/webm;codecs=opus" : "");
+  async function startTalk() {
+    if (!LIVE || !isCutJob() || micBtn.disabled || recorder) return;
+    if (!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)) { micBanner(); return; }
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (e) { micBanner(); return; }
+    recAt = video.currentTime || 0;
+    recChunks = [];
+    const mime = recMime();
+    recorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
+    recorder.ondataavailable = (e) => { if (e.data.size) recChunks.push(e.data); };
+    recorder.start();
+    recorder._stream = stream;
+    micBtn.classList.add("rec");
+    const t0 = Date.now();
+    micBtn.textContent = "● 0:00";
+    recTimer = setInterval(() => {
+      const s = Math.floor((Date.now() - t0) / 1000);
+      micBtn.textContent = `● ${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+    }, 500);
+  }
+  async function stopTalk() {
+    if (!recorder) return;
+    const done = recorder, mime = recorder.mimeType || "";
+    recorder = null;
+    clearInterval(recTimer);
+    micBtn.classList.remove("rec");
+    micBtn.textContent = "🎙";
+    const blob = await new Promise((resolve) => {
+      done.onstop = () => resolve(new Blob(recChunks, { type: mime }));
+      done.stop();
+    });
+    (done._stream.getTracks() || []).forEach((t) => t.stop());
+    await uploadVoice(blob, mime, recAt, null);
+  }
+  micBtn.addEventListener("pointerdown", (e) => { e.preventDefault(); startTalk(); });
+  ["pointerup", "pointerleave", "pointercancel"].forEach((ev) => micBtn.addEventListener(ev, stopTalk));
+  document.addEventListener("keydown", (e) => {
+    if (e.code !== "KeyV" || e.repeat) return;
+    if (!$("#renderDlg").hidden || !$("#confirmDlg").hidden) return;
+    if (/TEXTAREA|INPUT|SELECT/.test(document.activeElement.tagName)) return;
+    startTalk();
+  });
+  document.addEventListener("keyup", (e) => { if (e.code === "KeyV") stopTalk(); });
+
+  function voicePending(head) {
+    const el = h("div", { class: "msg muse voice" }, h("div", { class: "who" }, head),
+      h("div", { class: "thinking" }, "Transcribing…"));
+    $("#voiceList").append(el);
+    el.scrollIntoView({ block: "nearest" });
+    return el;
+  }
+  async function uploadVoice(blob, mime, at, name) {
+    const buf = await blob.arrayBuffer();
+    const bytes = new Uint8Array(buf);
+    let bin = "";
+    for (let i = 0; i < bytes.length; i += 8192) bin += String.fromCharCode(...bytes.subarray(i, i + 8192));
+    const card = voicePending(name ? `Voice memo · ${name}` : `Voice note · ${fmt(at)}`);
+    try {
+      const first = name
+        ? await api("/api/voice/file", { name, audio_b64: btoa(bin) })
+        : await api("/api/voice/record", { audio_b64: btoa(bin), mime, at_s: at });
+      if (first.needs_confirm) {
+        const ok = await confirmVoice(first.duration_s, first.estimate_usd);
+        if (!ok) { card.remove(); return; }
+        card.querySelector(".thinking").textContent = "Transcribing…";
+        fillVoice(card, await api("/api/voice/file", { name, audio_b64: btoa(bin), confirm: true }), name);
+      } else fillVoice(card, first, name);
+    } catch (e) {
+      card.replaceChildren(h("div", { class: "who" }, name ? `Voice memo · ${name}` : "Voice note"),
+        h("div", {}, `That didn't go through: ${e.message}`));
+    }
+  }
+  function confirmVoice(durationS, estimateUsd) {
+    return new Promise((resolve) => {
+      $("#confirmMsg").textContent = `This note is ${fmt(durationS)}. Transcribing and resolving it costs about $${(+estimateUsd).toFixed(2)}. Continue?`;
+      $("#confirmDlg").hidden = false;
+      $("#confirmYes").onclick = () => { $("#confirmDlg").hidden = true; resolve(true); };
+      $("#confirmNo").onclick = () => { $("#confirmDlg").hidden = true; resolve(false); };
+    });
+  }
+  $("#confirmDlg").addEventListener("click", (e) => {
+    if (e.target.id === "confirmDlg") { $("#confirmDlg").hidden = true; }
+  });
+  function fillVoice(card, r, name) {
+    const notes = r.notes || [];
+    let base = 0;
+    const cards = notes.map((n) => {
+      const c = voiceNoteCard(r, n, base);
+      base += (n.ops || []).length;
+      return c;
+    });
+    if (r.error) cards.push(h("div", { class: "msg muse voice" },
+      h("div", { class: "who" }, name ? `Voice memo · ${name}` : "Voice note"),
+      h("div", {}, r.error)));
+    if (name) {
+      card.replaceWith(h("div", { class: "memo" }, h("div", { class: "memohead" }, `Voice memo · ${name}`), ...cards));
+    } else if (cards.length) {
+      card.replaceWith(...cards);
+    } else {
+      card.replaceChildren(h("div", { class: "who" }, "Voice note"), h("div", {}, "Nothing to resolve."));
+    }
+    if (cards.length) cards[cards.length - 1].scrollIntoView({ block: "nearest" });
+  }
+  function voiceNoteCard(r, note, base) {
+    const eng = note.engine === "whisper" ? "local Whisper" : "Meta transcription";
+    const el = h("div", { class: "msg muse voice" },
+      h("div", { class: "who" }, `Voice note · ${fmt(note.at_s || 0)} · ${eng}`),
+      h("div", { class: "heard" }, `I heard: ${note.heard || note.raw_text}`));
+    if (note.message) el.append(h("div", { class: "note" }, note.message));
+    const picks = [];
+    if (note.ops?.length) {
+      el.append(h("div", { class: "ops" }, note.ops.map((op, i) => {
+        const amb = note.status === "ambiguous" && BEAT_OPS.has(op.op);
+        const cb = h("input", { type: "checkbox", checked: (!op.blocked || amb) ? true : null, disabled: (op.blocked && !amb) || null });
+        picks.push(cb);
+        return h("label", { class: `op${op.blocked && !amb ? " blocked" : ""}${amb ? " amb" : ""}`, "data-i": base + i },
+          cb,
+          h("div", {},
+            h("b", {}, op.label),
+            note.at_s != null ? h("a", { class: "go", onclick: (e) => { e.preventDefault(); seek(note.at_s); } }, fmt(note.at_s)) : null,
+            op.why ? h("div", { class: "why" }, op.why) : null,
+            h("ul", { class: "opchecks" }, op.checks.map((c) => h("li", { class: c.ok ? "ok" : c.hard ? "bad" : "warn" }, c.text)))));
+      })));
+    }
+    if (note.status === "ambiguous" && note.candidates?.length) {
+      const radios = note.candidates.map((c) => {
+        const radio = h("input", { type: "radio", name: `cand-${r.id}-${note.id}`, value: c.beat_id });
+        radio.onchange = () => $$(".op.amb input", el).forEach((cb) => { cb.disabled = false; cb.checked = true; });
+        return h("label", { class: "cand" }, radio, h("span", {}, `B${c.beat_id} · ${c.label}`),
+          h("a", { class: "go", onclick: (e) => { e.preventDefault(); seek(c.at_s); } }, fmt(c.at_s)));
+      });
+      el.append(h("div", { class: "cands" }, ...radios));
+    }
+    el.append(h("div", { class: "meta" }, `◆ ${r.model} · $${(r.usd || 0).toFixed(3)} · checks are measured`));
+    const acts = h("div", { class: "acts" });
+    const someOpen = note.ops?.some((o) => !o.blocked) || note.status === "ambiguous";
+    if (someOpen) {
+      const ok = h("button", { class: "ok" }, "Accept");
+      const all = h("button", {}, "Accept all");
+      const no = h("button", {}, "Reject");
+      const send = async (which) => {
+        const idx = [...el.querySelectorAll(".op")].map((lab) => +lab.dataset.i);
+        const cands = {};
+        const sel = el.querySelector(".cands input:checked");
+        if (sel) cands[note.id] = +sel.value;
+        ok.disabled = all.disabled = true;
+        try {
+          const j = await api("/api/voice/apply", { id: r.id, pick: which === "all" ? idx : picks.map((c, i) => (c.checked ? idx[i] : -1)).filter((i) => i >= 0), candidates: cands });
+          applyResult(j);
+          loadTaste();
+          picks.forEach((c) => (c.disabled = true));
+          acts.replaceChildren(h("span", { class: "applied" }, "✓ Applied · re-render to watch it"));
+        } catch (e) { ok.disabled = all.disabled = false; acts.append(h("span", { class: "err" }, e.message)); }
+      };
+      ok.onclick = () => send("checked");
+      all.onclick = () => send("all");
+      no.onclick = () => { picks.forEach((c) => (c.disabled = true)); acts.replaceChildren(h("span", { class: "applied", style: "color:var(--dim)" }, "Rejected · kept as is")); };
+      acts.append(ok, all, no);
+    } else if (note.ops?.length) {
+      acts.append(h("span", { class: "applied", style: "color:var(--red)" }, "Every change was blocked by a check"));
+    }
+    if (acts.children.length) el.append(acts);
+    return el;
+  }
+
+  // Drop a memo anywhere onto the Edit view.
+  let dragN = 0;
+  $("#view-edit").addEventListener("dragover", (e) => {
+    if (!LIVE || !isCutJob()) return;
+    e.preventDefault();
+    $("#dropOverlay").hidden = false;
+  });
+  $("#view-edit").addEventListener("dragenter", (e) => {
+    if (!LIVE || !isCutJob()) return;
+    e.preventDefault();
+    dragN++;
+  });
+  $("#view-edit").addEventListener("dragleave", () => {
+    if (--dragN <= 0) { dragN = 0; $("#dropOverlay").hidden = true; }
+  });
+  $("#view-edit").addEventListener("drop", (e) => {
+    if (!LIVE || !isCutJob()) return;
+    e.preventDefault();
+    dragN = 0;
+    $("#dropOverlay").hidden = true;
+    const f = (e.dataTransfer.files || [])[0];
+    if (f) uploadVoice(f, f.type, 0, f.name);
+  });
+
+  // Taste: the standing preferences, shown and removable.
+  async function loadTaste() {
+    if (!LIVE || !isCutJob()) return;
+    try {
+      renderTaste((await api("/api/taste")).entries || []);
+    } catch (e) { /* the panel stays hidden when taste cannot load */ }
+  }
+  function renderTaste(entries) {
+    $("#tastePanel").hidden = false;
+    $("#tasteList").replaceChildren(...entries.map((e) => h("li", {},
+      h("span", {}, e.text),
+      h("button", {
+        class: "x", title: "Remove", onclick: async () => {
+          try { renderTaste((await api("/api/taste/remove", { id: e.id })).entries || []); }
+          catch (err) { $("#tasteList").append(h("li", { class: "err" }, err.message)); }
+        },
+      }, "×"))));
+    if (!entries.length) $("#tasteList").append(h("li", { class: "muted" }, "None yet — say “always…” or “never…” in a note."));
+  }
+  $("#tasteForm").onsubmit = async (e) => {
+    e.preventDefault();
+    const v = $("#tasteInput").value.trim();
+    if (!v) return;
+    $("#tasteInput").value = "";
+    try { renderTaste((await api("/api/taste/add", { text: v })).entries || []); }
+    catch (err) { $("#tasteList").append(h("li", { class: "err" }, err.message)); }
+  };
+  loadTaste();
+
   // Review
   let filter = "all";
   const SRC = { measured: "Measured", spark: "Spark", you: "You", reshoot: "Reshoot", render: "Render" };
@@ -426,9 +666,31 @@
       const rows = (P.takes || []).filter((t) => t.topic === c.topic);
       if (rows.length) {
         const pick = rows.find((t) => t.kind === "keeper_take") || rows[0];
-        why.append(h("div", { class: "reason" }, h("small", {}, `Spark · ${pick.kind.replace(/_/g, " ")} · confidence ${pick.conf ?? "–"}`), pick.reason));
+        if (isCutJob()) {
+          why.append(h("div", { class: "reason" },
+            h("small", {}, `Director · keeper take · confidence ${pick.conf ?? "–"}`),
+            `Director kept A${pick.aid ?? "?"} — “${pick.reason}”`));
+        } else {
+          why.append(h("div", { class: "reason" }, h("small", {}, `Spark · ${pick.kind.replace(/_/g, " ")} · confidence ${pick.conf ?? "–"}`), pick.reason));
+        }
         why.append(h("h4", {}, `Takes of this moment (${rows.length})`));
-        rows.forEach((t) => why.append(h("div", { class: `alt${t.kind === "keeper_take" ? " pick" : ""}` }, `${t.clip} @ ${fmt(t.in)} · ${t.kind.replace(/_/g, " ")} — ${t.reason}`)));
+        rows.forEach((t) => {
+          const row = h("div", { class: `alt${t.kind === "keeper_take" ? " pick" : ""}` }, `${t.clip} @ ${fmt(t.in)} · ${t.kind.replace(/_/g, " ")} — ${t.reason}`);
+          if (isCutJob() && LIVE && !t.pick && t.kind === "alternate" && t.aid != null) {
+            const use = h("button", { class: "link use-take" }, "Use this take");
+            const bid = parseInt(String(t.group || "").replace(/^B/, ""), 10);
+            if (!Number.isInteger(bid)) use.disabled = true;
+            use.onclick = async () => {
+              use.disabled = true;
+              try {
+                applyResult(await api("/api/voice/apply", { ops: [{ op: "swap_take", beat_id: bid, attempt_id: t.aid, span_id: "", camera: "", pause_limit_s: -1, target_s: -1, text: "", why: "Use this take" }] }));
+                use.replaceWith(h("span", { class: "applied" }, "✓ Kept · re-render to watch it"));
+              } catch (e) { use.disabled = false; row.append(h("span", { class: "err" }, e.message)); }
+            };
+            row.append(" ", use);
+          }
+          why.append(row);
+        });
       } else {
         why.append(h("div", { class: "reason" }, h("small", {}, "Measured"), "Cut points set from the 20 ms loudness envelope, in silences; Whisper on the render confirms no clipped words."));
       }
@@ -465,8 +727,22 @@
   const say = (x) => (typeof x === "string" ? x : x?.label || x?.title || x?.text || x?.message || x?.reason || JSON.stringify(x));
   let mode = "", pollTimer = 0, polling = false, watchV = null, since = 0;
 
+  let cutjobRunning = false, cutjobTimer = 0;
   function renderButton() {
-    const btn = $("#renderBtn"), n = P.pending || 0;
+    const btn = $("#renderBtn");
+    if (isCutJob()) {
+      btn.textContent = "Re-render cut";
+      const dirty = !!(P.cutJob && P.cutJob.renderDirty);
+      const why = !LIVE ? "Re-render needs the engine: run app/main.py --job <dir>"
+        : cutjobRunning ? "Re-rendering…"
+        : !dirty ? "Nothing waiting to re-render"
+        : "";
+      btn.disabled = !!why;
+      btn.title = why || "Re-render the cut with the accepted voice edits";
+      renderVersion();
+      return;
+    }
+    const n = P.pending || 0;
     const what = [n && `${n} change${n === 1 ? "" : "s"}`, !P.version && "fixes"].filter(Boolean);
     btn.textContent = what.length ? `Render · ${what.join(" + ")}` : "Render";
     const why = !LIVE ? "Render needs the engine: run app/main.py or app/engine.py"
@@ -649,7 +925,55 @@
     };
     barActs(yes, h("button", { onclick: closeBar }, "Keep"));
   }
-  $("#renderBtn").onclick = () => { if (!$("#renderBtn").disabled) openPlan(); };
+  $("#renderBtn").onclick = () => {
+    if ($("#renderBtn").disabled) return;
+    if (isCutJob()) startCutjobRerender();
+    else openPlan();
+  };
+  async function startCutjobRerender() {
+    try {
+      await api("/api/cutjob/rerender", {});
+    } catch (e) {
+      bar.hidden = false;
+      bar.className = "renderbar bad";
+      $("#renderFill").style.width = "0";
+      barText(`Couldn't start the re-render · ${e.message}`);
+      barActs(h("button", { title: "Dismiss", onclick: closeBar }, "×"));
+      return;
+    }
+    cutjobRunning = true;
+    lockEdits();
+    renderButton();
+    bar.hidden = false;
+    bar.className = "renderbar";
+    $("#renderFill").style.width = "50%";
+    barText("Re-rendering cut.mp4…");
+    barActs();
+    clearInterval(cutjobTimer);
+    cutjobTimer = setInterval(pollCutjob, 1000);
+    pollCutjob();
+  }
+  async function pollCutjob() {
+    try {
+      const st = await api("/api/cutjob/rerender");
+      if (st.state === "running") return;
+      clearInterval(cutjobTimer);
+      cutjobTimer = 0;
+      cutjobRunning = false;
+      if (st.state === "done") {
+        bar.className = "renderbar ok";
+        $("#renderFill").style.width = "100%";
+        barText(`${st.message} · loading the new cut…`);
+        setTimeout(() => location.reload(), 1500);
+      } else {
+        bar.className = "renderbar bad";
+        $("#renderFill").style.width = "0";
+        barText(st.message || "Re-render failed");
+        barActs(h("button", { title: "Dismiss", onclick: closeBar }, "×"));
+        renderButton();
+      }
+    } catch (e) { barText(`Can't read the re-render's progress · ${e.message}`); }
+  }
 
   // ---------- pages ----------
   const stat = (n, label) => h("div", { class: "stat" }, h("b", {}, n), h("span", {}, label));

@@ -279,3 +279,54 @@ Live test: TBD (the owner fills this from the real-footage run).
   as a slip).
 - Full suite: 437 tests, green except the same 11 pre-existing `ps`-sandbox
   errors in `tests/test_engine_render.py` and `tests/test_render_runner.py`.
+
+# Build log: voice notes (`voice`) (2026-11-03)
+
+| Step | By | What |
+|---|---|---|
+| Brief | Project owner, with Claude Code | `VOICE-BRIEF.md`: talk back to the cut — voice notes that become checked edits, the app opening a `director cut` job. |
+| Design | Meta **Muse Code** on **`muse-wonder-1.0`** | `VOICE-DESIGN.md`: transcription, anchoring, Spark resolution, verification, the taste file, cut-job app mode. |
+| Build | Meta **Muse Code** on **`muse-spark-1.3`** | `src/director/voice.py`, `director voice`, `app/cutjob.py`, the engine/UI cut-job mode, `tests/test_voice.py`, `tests/test_cutjob.py`. |
+| Code review and live test | Claude Code, piloted by the owner | Real footage, below. |
+
+Muse Code token use: TBD (the owner fills this from the run log).
+Live test: TBD (the owner fills this from the real-footage run).
+
+## Build notes (Muse Code)
+
+- `VOICE-DESIGN.md` predates `transcribe.py`, so per the task brief and
+  `TRANSCRIBE-DESIGN.md` §10 the WAV extraction (`extract_wav_command`),
+  long-note chunking (`plan_chunks`, `chunk_wav_command`) and the
+  diarizer wrapper (`diarize_chunk`, with its `(result, spend, cached)`
+  spend labelling) are reused from `transcribe.py` — `voice.py` adds no
+  second copy. `extract_audio_command` delegates, so the §4.1 command is
+  byte-identical to transcribe's.
+- `JobContext` carries `tighten_path`/`angles_path` alongside `job_dir`
+  so `--apply` in the explicit-file CLI form writes the files it was
+  given, not `./tighten.json`.
+- Untightened `set_angle` applies to the anchored shot in `angles.json`
+  (method `editor`), and untightened `rerender` re-renders the current
+  shots as they stand through `angles.render` rather than re-picking —
+  the design's §9.5 re-run only describes the tightened path, and a
+  re-pick would silently drop the editor's angle choices.
+- The visual confirmation's camera labels ride in the image prompt as
+  text (still times with the camera on screen), not burned into the
+  frames: the stills come from the finished cut, which has no labels to
+  burn.
+- The engine's cut-job Re-render button compares a
+  `(edits_applied, angles mtime)` cookie taken at open and after each
+  re-render; the apply-time project rebuild deliberately does not reset
+  it, or the button could never enable.
+- `cut.json` records no project name (it goes to the export timelines
+  instead), so cut-job titles use the designed `Director cut` default
+  until one is stored.
+- Voice cards render through a dedicated renderer sharing the proposal
+  markup and CSS rather than calling `proposalMsg` — grouping,
+  candidate radios and the heard line differ per note.
+- `tests/test_cutjob.py` drives the engine through the real HTTP
+  dispatch (`do_GET`/`do_POST`/`_call`/`_post`) with captured responses
+  instead of TCP sockets, which this sandbox forbids; the socket-based
+  engine tests fail here either way (below).
+- Full suite: 496 tests (46 new), green except the same 11 pre-existing
+  `ps`-sandbox errors in `tests/test_engine_render.py` and
+  `tests/test_render_runner.py`.

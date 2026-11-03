@@ -67,6 +67,31 @@ python app/main.py
 
 That starts the local engine on a free port and opens the UI in a native window (see [app/main.py](app/main.py); it needs `pywebview`). The app needs a project made by the Director test run (`scripts/`), and this repo does not ship one.
 
+A finished `director cut` job opens directly:
+
+```bash
+python app/main.py --job demo-job
+```
+
+Beats become sections, shots become talk clips, take picks fill the Why panel, and kept words become the Words tab — reviewing takes and notes works even before the job has rendered.
+
+## Voice notes
+
+Watch the cut and talk back: hold the mic button (or hold `V`) and say "use the other take here", "go to the wide", "tighten every pause". The note is transcribed, anchored to the timeline from the playhead time, any spoken timecode ("at a minute twenty") or the words quoted, and resolved into checked edit proposals — the same checks, the same apply path, the same render. A note Director cannot do says so plainly. Standing preferences ("always open on the wide") persist per job in `taste.json` and are read on the next pick or note.
+
+From the app, open a finished job (`python app/main.py --job demo-job`), hold the mic button or `V` to record at the playhead, or drop a voice memo file anywhere onto the Edit view; long files show their cost before transcribing. Accept proposals on their cards, then Re-render cut. The Mac window cannot reach the microphone, so recording there shows a banner pointing at the same page in the browser.
+
+From the command line, a memo file resolves against a job or a hand-run pipeline:
+
+```bash
+director voice memo.m4a --job demo-job
+director voice memo.m4a --job demo-job --apply
+director voice memo.m4a --job demo-job --apply --render
+director voice memo.m4a --sync sync.json --words words.json --angles angles.json --tighten tighten.json
+```
+
+The estimate prints before anything is transcribed; notes over a minute ask first (`--yes` skips), and over `--max-usd` (default $2.00) refuse. Without the Meta client, a local Whisper transcribes instead (`--no-whisper` disables the fallback); notes that only Muse can resolve come back heard-but-unresolved.
+
 ## Meta AI used
 
 - Muse Spark: take picks, proposed timeline edits, the angle choice for every line, and the grade-match check.
@@ -90,6 +115,7 @@ From [docs/muse-code/BUILD-LOG.md](docs/muse-code/BUILD-LOG.md) and the git log,
 | One-step multicam cut (`director cut`) | Designed by Muse Code on muse-wonder-1.0, built by Muse Code on muse-spark-1.3 |
 | Take picking (`director tighten`, the `tighten` stage of `director cut`) | Designed by Muse Code on muse-wonder-1.0, built by Muse Code on muse-spark-1.3 |
 | Voice Transcribe transcript (`director transcribe`, the transcribe step of `director cut`) | Designed by Muse Code on muse-wonder-1.0, built by Muse Code on muse-spark-1.3 |
+| Voice notes and the app opening cut jobs | Designed by Muse Code on muse-wonder-1.0, built by Muse Code on muse-spark-1.3 |
 
 Sync and reframe were first built earlier in the event by Claude Code, inside GhostCut, where they are still public. The versions here are Muse Code's rewrites: it got only the briefs, never that code, and its run logs show no reads outside this repository and its installed packages. Both were checked against the same real recordings and cut ([BUILD-LOG](docs/muse-code/BUILD-LOG.md), Live test).
 

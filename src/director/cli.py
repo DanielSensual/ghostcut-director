@@ -394,6 +394,130 @@ def command_transcribe(args: argparse.Namespace) -> dict:
     return payload
 
 
+def command_voice(args: argparse.Namespace) -> dict:
+    import json as _json
+
+    from . import voice as voice_mod
+
+    require_ffmpeg_binaries()
+    note = Path(args.note)
+    job_dir = Path(args.job) if args.job else None
+    duration = voice_mod.probe_note_duration(note)
+    estimate = voice_mod.estimate_note_usd(duration)
+    print(f"voice: ≈${estimate:.2f} to transcribe and resolve "
+          f"({duration / 60:.1f} min)", file=sys.stderr)
+    if duration > voice_mod.ESTIMATE_CONFIRM_S and not bool(args.yes):
+        print(f"Transcribe and resolve for ≈${estimate:.2f}? [y/N]",
+              file=sys.stderr, end=" ")
+        try:
+            answer = "" if not sys.stdin.isatty() else sys.stdin.readline()
+        except (OSError, ValueError):
+            answer = ""
+        if answer.strip().lower() not in ("y", "yes"):
+            return {}
+    payload = voice_mod.run(
+        note_path=note,
+        job_dir=job_dir,
+        model=args.model,
+        max_usd=float(args.max_usd),
+        apply=bool(args.apply or args.render),
+        allow_whisper=not bool(args.no_whisper),
+        sync_path=Path(args.sync) if args.sync else None,
+        words_path=Path(args.words) if args.words else None,
+        tighten_path=Path(args.tighten) if args.tighten else None,
+        angles_path=Path(args.angles) if args.angles else None,
+    )
+    topics: dict[int, str] = {}
+    tighten_file = (job_dir / "tighten.json" if job_dir
+                    else (Path(args.tighten) if args.tighten else None))
+    if tighten_file is not None and tighten_file.exists():
+        try:
+            saved = _json.loads(tighten_file.read_text(encoding="utf-8"))
+            topics = {b.get("id"): str(b.get("topic", ""))
+                      for b in saved.get("beats", []) or []
+                      if isinstance(b, dict)}
+        except (OSError, ValueError):
+            pass
+    for pos, item in enumerate(payload.get("notes", []), 1):
+        engine = item.get("engine", "")
+        if engine == "whisper":
+            tag = "engine whisper (local — nothing uploaded)"
+        else:
+            tag = f"engine {engine or 'meta'}"
+        print(f"N{pos} [{tag}] \"{item.get('raw_text', '')}\"")
+        heard = item.get("heard", "")
+        if heard and heard != item.get("raw_text", ""):
+            print(f"  I heard: {heard}")
+        for op in item.get("ops", []) or []:
+            bid = op.get("beat_id", -1)
+            if isinstance(bid, int) and bid >= 0 and bid in topics:
+                where = f"B{bid} \"{topics[bid]}\": "
+            elif isinstance(bid, int) and bid >= 0:
+                where = f"B{bid}: "
+            else:
+                where = ""
+            why = f" — {op['why']}" if op.get("why") else ""
+            if op.get("blocked"):
+                failing = next((c.get("text", "") for c in
+                                op.get("checks", []) or []
+                                if not c.get("ok")), "blocked")
+                print(f"  ✗ {where}{op.get('label', op.get('op'))}: "
+                      f"{failing}")
+            else:
+                print(f"  → {where}{op.get('label', op.get('op'))}{why}")
+        if item.get("status") == "ambiguous":
+            print(f"  ? {item.get('message', '')}")
+            for cand in item.get("candidates", []) or []:
+                print(f"    • B{cand.get('beat_id')}: "
+                      f"{cand.get('label', '')}")
+        elif item.get("status") == "unresolved":
+            print(f"  … {item.get('message', '')}")
+    for warning in payload.get("warnings", []):
+        print(f"! {warning}", file=sys.stderr)
+    if payload.get("error"):
+        raise voice_mod.VoiceError(str(payload["error"]))
+    if args.apply or args.render:
+        applied = payload.get("applied", [])
+        if job_dir is not None:
+            inputs = ""
+            cut_file = job_dir / "cut.json"
+            if cut_file.exists():
+                try:
+                    saved = _json.loads(
+                        cut_file.read_text(encoding="utf-8"))
+                    names = [str(n) for n in saved.get("inputs", []) or []]
+                    inputs = (" ".join(names)) if names else "<inputs>"
+                except (OSError, ValueError):
+                    inputs = "<inputs>"
+            else:
+                inputs = "<inputs>"
+            print(f"Applied {len(applied)} op(s); re-render with: "
+                  f"director cut {inputs} --out-dir {job_dir}")
+        elif args.tighten:
+            print(f"Applied {len(applied)} op(s) to {args.tighten}; "
+                  f"re-run director angles --tighten {args.tighten} "
+                  f"to re-render")
+        else:
+            print(f"Applied {len(applied)} op(s) to {args.angles}")
+        if args.render:
+            if job_dir is None:
+                raise voice_mod.VoiceError(
+                    "voice: --render needs --job DIR")
+            import sys as _sys
+
+            app_dir = str(Path(__file__).resolve().parents[2] / "app")
+            if app_dir not in _sys.path:
+                _sys.path.insert(0, app_dir)
+            import cutjob
+
+            result = cutjob.rerender(job_dir, None)
+            print(f"Re-rendered cut.mp4 ({float(result['duration_s']):.1f}s)")
+        need = payload.get("need_decision", 0)
+        if need:
+            print(f"{need} proposal(s) need a decision in the app")
+    return payload
+
+
 def build_parser() -> argparse.ArgumentParser:
     from .sync import WHISPER_MODEL
 
@@ -528,6 +652,26 @@ def build_parser() -> argparse.ArgumentParser:
     transcribe_parser.add_argument("--max-usd", type=float, default=2.0,
                                    help="Refuse above this estimated transcribe spend")
     transcribe_parser.set_defaults(func=command_transcribe)
+
+    voice_parser = sub.add_parser("voice", help="Talk through the cut: a voice note becomes checked edit proposals")
+    voice_parser.add_argument("note", help="Voice memo or phone video talking through the cut")
+    voice_parser.add_argument("--job", default=None, help="A director cut job directory")
+    voice_parser.add_argument("--sync", default=None, help="sync.json (hand-run pipeline, with --words/--angles)")
+    voice_parser.add_argument("--words", default=None, help="words.json (hand-run pipeline)")
+    voice_parser.add_argument("--tighten", default=None, help="tighten.json (hand-run pipeline, optional)")
+    voice_parser.add_argument("--angles", default=None, help="angles.json (hand-run pipeline)")
+    voice_parser.add_argument("--apply", action="store_true",
+                              help="Apply every unblocked proposal through cutlist.apply_operations")
+    voice_parser.add_argument("--render", action="store_true",
+                              help="With --job: apply, then re-render cut.mp4 (implies --apply)")
+    voice_parser.add_argument("--model", default="muse-spark-1.3")
+    voice_parser.add_argument("--max-usd", type=float, default=2.00,
+                              help="Refuse above this estimated transcribe + resolve spend")
+    voice_parser.add_argument("--yes", action="store_true",
+                              help="Skip the over-a-minute confirmation")
+    voice_parser.add_argument("--no-whisper", action="store_true",
+                              help="No local Whisper fallback when the Meta client is unavailable")
+    voice_parser.set_defaults(func=command_voice)
 
     return parser
 

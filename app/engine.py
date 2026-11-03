@@ -24,6 +24,8 @@ API takes JSON bodies only, so other pages in a browser can't read files or spen
 """
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 import re
@@ -39,14 +41,19 @@ from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import muse  # noqa: E402
+import cutjob  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 DEMO = ROOT / "app" / "ui" / "demo"
 STATIC = ("/app/ui/", "/docs/brand/")
 NO_PROJECT = "No project yet: build one with app/make_demo.py from a finished Director job (see docs/APP-DESIGN.md)."
 NO_MUSE = "Muse needs the Meta client: run the engine with the venv that has guestlist.meta installed."
+NO_JOB = "No cut job is open: open one with POST /api/job/open or python app/engine.py --job DIR."
 BUSY = "Rendering — {} after it finishes"
+CUTJOB_BUSY = "Re-rendering — {} after it finishes"
 LOG_TAIL = 256_000
+VOICE_MODEL = "muse-spark-1.3"
+VOICE_MAX_USD = 2.00
 
 
 class Busy(Exception):
@@ -65,7 +72,7 @@ def _brief(st: dict) -> dict:
 
 
 class Engine:
-    def __init__(self, demo: Path = DEMO, render=None):
+    def __init__(self, demo: Path = DEMO, render=None, job_dir: Path | str | None = None):
         self.demo = demo
         self.edits_file = demo / "edits.json"
         self.spend_file = demo / "muse_spend.json"
@@ -75,8 +82,15 @@ class Engine:
         self._render = render
         self._stop = threading.Event()
         self.render_state: dict = {"state": "idle", "version": None}
+        self.job_dir = Path(job_dir) if job_dir else None
+        self._cutjob_state: dict = {"state": "idle", "message": ""}
+        self._cutjob_thread: threading.Thread | None = None
+        self._render_cookie: tuple = ()
+        if self.job_dir is not None:
+            cutjob.build_project(self.job_dir, self.demo)
         self._load()
         self.render_state = _brief(self._status())
+        self._render_cookie = self._cookie()
 
     def _load(self) -> None:
         """Read the cut and its edit list (again after a render promotes or reverts). Edits the current version
@@ -115,6 +129,14 @@ class Engine:
         if self.base is None:
             raise FileNotFoundError(NO_PROJECT)
         p = muse.apply(self.base, self.edits)
+        if self.job_dir is not None and isinstance(p.get("cutJob"), dict):
+            try:
+                cookie = self._cookie()
+            except OSError:
+                cookie = self._render_cookie
+            count = cookie[0] if cookie else 0
+            p["cutJob"] = {**p["cutJob"], "editsApplied": count,
+                           "renderDirty": bool(cookie) and cookie != self._render_cookie}
         return {"project": p, "edits": [{k: e[k] for k in ("id", "request", "labels", "usd")} for e in self.edits],
                 "engine": {"live": True, "museSpent": round(self.spend["usd"], 4), "museCalls": self.spend["calls"],
                            "render": dict(self.render_state)}}
@@ -162,6 +184,236 @@ class Engine:
                 self.edits.pop(idx)
                 self._save()
         return self.project()
+
+    # ---------- cut jobs: open a director cut, talk back, re-render ----------
+
+    def _voice(self):
+        """director.voice, with src/ put on the path here (503 without it)."""
+        src = str(ROOT / "src")
+        if src not in sys.path:
+            sys.path.insert(0, src)
+        try:
+            from director import voice as voice_mod
+        except ImportError as e:
+            raise Unavailable(f"Voice needs the Director package: {e}") from e
+        return voice_mod
+
+    def _need_job(self) -> Path:
+        if self.job_dir is None:
+            raise ValueError(NO_JOB)
+        return self.job_dir
+
+    def _cookie(self) -> tuple:
+        """What the Re-render button compares: tighten edits + angles mtime."""
+        if self.job_dir is None:
+            return ()
+        count = 0
+        try:
+            saved = json.loads((self.job_dir / "tighten.json").read_text())
+            count = len(saved.get("edits_applied", []) or [])
+        except (OSError, ValueError):
+            pass
+        try:
+            mtime = (self.job_dir / "angles.json").stat().st_mtime_ns
+        except OSError:
+            mtime = -1
+        return (count, mtime)
+
+    def _tighten_sha(self) -> str:
+        try:
+            return hashlib.sha256((self._need_job() / "tighten.json").read_bytes()).hexdigest()
+        except OSError:
+            return ""
+
+    def _cutjob_idle(self, what: str) -> None:
+        if self._cutjob_state.get("state") == "running":
+            raise Busy(CUTJOB_BUSY.format(what))
+
+    def open_job(self, path: str) -> dict:
+        job = Path(path or "")
+        cutjob.build_project(job, self.demo)
+        self.job_dir = job
+        self._cutjob_state = {"state": "idle", "message": ""}
+        self._cutjob_thread = None
+        self._load()
+        self._render_cookie = self._cookie()
+        return self.project()
+
+    def _store_voice(self, payload: dict, request: str) -> dict:
+        pid = uuid.uuid4().hex[:8]
+        flat = []
+        for note in payload.get("notes", []):
+            for op in note.get("ops", []) or []:
+                flat.append({**op, "note_id": note.get("id")})
+        self.proposals[pid] = {"kind": "voice", "request": request, "ops": flat,
+                               "notes": payload.get("notes", []), "usd": payload.get("spend_usd", 0.0),
+                               "gen": self.gen, "tighten_sha": self._tighten_sha()}
+        cached = any("cache" in str(w) for w in payload.get("warnings", []))
+        out = {"id": pid, "reply": f"Heard {len(payload.get('notes', []))} note(s)", "answers": [],
+               "ops": flat, "notes": payload.get("notes", []), "engine": payload.get("engine", ""),
+               "usd": payload.get("spend_usd", 0.0), "cached": cached, "model": VOICE_MODEL}
+        # Heard-but-unresolvable: the card shows the heard text with the error.
+        if payload.get("error"):
+            out["error"] = str(payload["error"])
+        return out
+
+    def voice_record(self, audio_b64: str, mime: str, at_s: float) -> dict:
+        vm = self._voice()
+        job = self._need_job()
+        try:
+            raw = base64.b64decode(audio_b64 or "", validate=True)
+        except Exception as e:
+            raise ValueError("Bad audio upload") from e
+        if not raw:
+            raise ValueError("Bad audio upload")
+        ext = {"audio/webm": "webm", "audio/mp4": "m4a", "audio/mpeg": "mp3", "audio/wav": "wav",
+               "audio/x-wav": "wav", "video/mp4": "mp4", "video/quicktime": "mov"}.get((mime or "").split(";")[0], "webm")
+        dest = self.demo / "voice"
+        dest.mkdir(parents=True, exist_ok=True)
+        saved = dest / f"rec-{int(time.time() * 1000) % 10**9}.{ext}"
+        saved.write_bytes(raw)
+        try:
+            payload = vm.run(note_path=saved, job_dir=job, model=VOICE_MODEL, max_usd=VOICE_MAX_USD,
+                             apply=False, anchors=[float(at_s)], source="live")
+        except vm.VoiceError as e:
+            raise ValueError(str(e)) from e
+        return self._store_voice(payload, f"voice:live:{saved.name}")
+
+    def voice_file(self, name: str, audio_b64: str, confirm: bool = False) -> dict:
+        vm = self._voice()
+        job = self._need_job()
+        try:
+            raw = base64.b64decode(audio_b64 or "", validate=True)
+        except Exception as e:
+            raise ValueError("Bad audio upload") from e
+        if not raw:
+            raise ValueError("Bad audio upload")
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(name or "note").name).strip("._") or "note.m4a"
+        dest = self.demo / "voice"
+        dest.mkdir(parents=True, exist_ok=True)
+        saved = dest / f"{int(time.time() * 1000) % 10**9}-{safe}"
+        saved.write_bytes(raw)
+        try:
+            duration = vm.probe_note_duration(saved)
+        except vm.VoiceError as e:
+            raise ValueError(str(e)) from e
+        estimate = vm.estimate_note_usd(duration)
+        if duration > vm.ESTIMATE_CONFIRM_S and not confirm:
+            return {"needs_confirm": True, "estimate_usd": round(estimate, 4),
+                    "duration_s": round(duration, 3)}
+        try:
+            payload = vm.run(note_path=saved, job_dir=job, model=VOICE_MODEL, max_usd=VOICE_MAX_USD,
+                             apply=False, source="file")
+        except vm.VoiceError as e:
+            raise ValueError(str(e)) from e
+        return self._store_voice(payload, f"voice:file:{safe}")
+
+    def voice_apply(self, pid: str | None = None, pick: list[int] | None = None,
+                    candidates: dict | None = None, ops: list[dict] | None = None) -> dict:
+        vm = self._voice()
+        job = self._need_job()
+        self._cutjob_idle("apply")
+        if ops is not None:
+            context = vm.build_job_context(job)
+            checked = vm._check_ops(context, [dict(op) for op in ops], None)
+            notes = [{"id": "n0", "status": "resolved", "at_s": None, "beat_id": -1,
+                      "ops": checked, "candidates": []}]
+            result = vm.apply_notes(job=context, notes=notes, pick=None, source="voice")
+            cutjob.build_project(job, self.demo)
+            self._load()
+            return self.project()
+        prop = self.proposals.get(pid or "")
+        if not prop or prop.get("kind") != "voice":
+            raise KeyError("That proposal is gone (the engine restarted?). Ask again.")
+        if prop.get("gen", self.gen) != self.gen:
+            raise KeyError("That proposal was made on the previous version of the cut. Ask again.")
+        if prop.get("tighten_sha", "") != self._tighten_sha():
+            raise ValueError(vm.STALE_MESSAGE)
+        with self.lock:
+            self._cutjob_idle("apply")
+            context = vm.build_job_context(job)
+            try:
+                result = vm.apply_notes(job=context, notes=prop["notes"], pick=pick,
+                                        candidates={k: int(v) for k, v in (candidates or {}).items()},
+                                        source="voice")
+            except vm.VoiceError as e:
+                raise ValueError(str(e)) from e
+            self._record_voice_applied(result["applied"])
+            cutjob.build_project(job, self.demo)
+            self.proposals.pop(pid or "", None)
+            self._load()
+        return self.project()
+
+    def _record_voice_applied(self, applied: list[str]) -> None:
+        if not applied:
+            return
+        path = self._need_job() / "voice.json"
+        try:
+            payload = json.loads(path.read_text())
+        except (OSError, ValueError):
+            return
+        if not isinstance(payload, dict):
+            return
+        payload["applied"] = list(payload.get("applied", []) or []) + list(applied)
+        try:
+            path.write_text(json.dumps(payload))
+        except OSError:
+            pass
+
+    def taste_list(self) -> dict:
+        vm = self._voice()
+        self._need_job()
+        payload, warnings = vm.load_taste_with_warnings(self.job_dir or Path("."))
+        return {"entries": payload.get("entries", []), "warnings": warnings}
+
+    def taste_add(self, text: str) -> dict:
+        vm = self._voice()
+        job = self._need_job()
+        try:
+            payload = vm.add_taste(job, text, source="typed")
+        except vm.VoiceError as e:
+            raise ValueError(str(e)) from e
+        return {"entries": payload.get("entries", [])}
+
+    def taste_remove(self, entry_id: str) -> dict:
+        vm = self._voice()
+        job = self._need_job()
+        try:
+            payload = vm.remove_taste(job, entry_id)
+        except vm.VoiceError as e:
+            raise ValueError(str(e)) from e
+        return {"entries": payload.get("entries", [])}
+
+    def cutjob_status(self) -> dict:
+        return dict(self._cutjob_state)
+
+    def start_cutjob_rerender(self) -> dict:
+        job = self._need_job()
+        try:
+            cutjob.require_director_angles()
+        except cutjob.CutJobError as e:
+            raise Unavailable(str(e)) from e
+        with self.lock:
+            if self._cutjob_state.get("state") == "running":
+                raise Busy(CUTJOB_BUSY.format("re-render"))
+            self._cutjob_state = {"state": "running", "message": "Re-rendering cut.mp4"}
+            th = threading.Thread(target=self._rerender_worker, args=(job,), name="cutjob-rerender",
+                                  daemon=True)
+            self._cutjob_thread = th
+            th.start()
+        return {"state": "running"}
+
+    def _rerender_worker(self, job: Path) -> None:
+        try:
+            result = cutjob.rerender(job, self.demo)
+            message = f"Re-rendered cut.mp4 ({float(result['duration_s']):.1f}s)"
+            with self.lock:
+                self._load()
+                self._render_cookie = self._cookie()
+                self._cutjob_state = {"state": "done", "message": message}
+        except Exception as e:  # noqa: BLE001 - the status endpoint reports it, cut.mp4 is untouched
+            with self.lock:
+                self._cutjob_state = {"state": "failed", "message": f"{type(e).__name__}: {e}"}
 
     def _save(self) -> None:
         tmp = self.edits_file.with_suffix(".tmp")
@@ -363,6 +615,10 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if url.path == "/api/project":
             return self._call(self._project)
+        if url.path == "/api/taste":
+            return self._call(self.engine.taste_list)
+        if url.path == "/api/cutjob/rerender":
+            return self._call(self.engine.cutjob_status)
         if url.path == "/api/render":
             return self._call(self.engine.render_status)
         if url.path == "/api/render/plan":
@@ -419,6 +675,27 @@ class Handler(SimpleHTTPRequestHandler):
             return e.cancel_render()
         if path == "/api/render/revert":
             return e.revert_render()
+        if path == "/api/job/open":
+            if not str(body.get("path") or ""):
+                raise ValueError("Missing path")
+            return e.open_job(str(body["path"]))
+        if path == "/api/voice/record":
+            return e.voice_record(body.get("audio_b64", ""), body.get("mime", ""),
+                                  float(body.get("at_s") or 0))
+        if path == "/api/voice/file":
+            return e.voice_file(body.get("name", ""), body.get("audio_b64", ""),
+                                bool(body.get("confirm")))
+        if path == "/api/voice/apply":
+            return e.voice_apply(body.get("id"), body.get("pick"), body.get("candidates"),
+                                 body.get("ops"))
+        if path == "/api/taste/add":
+            if not str(body.get("text") or "").strip():
+                raise ValueError("Empty preference")
+            return e.taste_add(str(body["text"]))
+        if path == "/api/taste/remove":
+            return e.taste_remove(str(body.get("id", "")))
+        if path == "/api/cutjob/rerender":
+            return e.start_cutjob_rerender()
         raise FileNotFoundError("unknown endpoint")
 
     # HTTP Range, so the video player can seek (Safari/WKWebView will not play without it).
@@ -456,15 +733,24 @@ class Handler(SimpleHTTPRequestHandler):
             left -= len(chunk)
 
 
-def serve(port: int = 7791, demo: Path = DEMO, render=None) -> ThreadingHTTPServer:
-    engine = Engine(demo, render)
+def serve(port: int = 7791, demo: Path = DEMO, render=None,
+          job: Path | str | None = None) -> ThreadingHTTPServer:
+    engine = Engine(demo, render, job_dir=job)
     engine.watch()
     handler = type("BoundHandler", (Handler,), {"engine": engine})
     return ThreadingHTTPServer(("127.0.0.1", port), partial(handler, directory=str(ROOT)))
 
 
 if __name__ == "__main__":
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 7791
-    httpd = serve(port)
+    rest = list(sys.argv[1:])
+    job = None
+    if "--job" in rest:
+        at = rest.index("--job")
+        job = rest[at + 1] if at + 1 < len(rest) else None
+        del rest[at:at + 2]
+        if not job:
+            raise SystemExit("engine: --job needs a directory")
+    port = int(rest[0]) if rest else 7791
+    httpd = serve(port, job=job)
     print(f"GhostCut engine on http://127.0.0.1:{port}/app/ui/", flush=True)
     httpd.serve_forever()

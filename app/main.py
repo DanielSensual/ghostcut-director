@@ -41,11 +41,19 @@ def brand_the_process() -> None:
 def main() -> None:
     import webview
 
+    rest = list(sys.argv[1:])
+    job = None
+    if "--job" in rest:
+        at = rest.index("--job")
+        job = rest[at + 1] if at + 1 < len(rest) else None
+        if not job:
+            raise SystemExit("main: --job needs a directory")
     port = free_port()
-    httpd = engine.serve(port)
+    httpd = engine.serve(port, job=job)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     brand_the_process()
-    webview.create_window("GhostCut Director", f"http://127.0.0.1:{port}/app/ui/", width=1440, height=900,
+    title = f"GhostCut Director — {Path(job).name}" if job else "GhostCut Director"
+    webview.create_window(title, f"http://127.0.0.1:{port}/app/ui/", width=1440, height=900,
                           min_size=(1000, 680), background_color="#0b0d12")
     webview.start()
     httpd.shutdown()

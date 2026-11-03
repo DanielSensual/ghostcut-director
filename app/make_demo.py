@@ -376,10 +376,19 @@ def main() -> None:
     ap.add_argument("--poster-at", type=float, default=0.0, help="seconds into the video for the poster frame")
     ap.add_argument("--timeline", help="a Render timeline.json: build the project from it instead of FCPXML")
     ap.add_argument("--carry", help="with --timeline: the project.json whose client, library, findings, chat… carry over")
+    ap.add_argument("--cut-job", default=None, help="a director cut job directory: build the project from it")
     ap.add_argument("--out", default=str(OUT), help="where the project is written (default app/ui/demo)")
     args = ap.parse_args()
     out = Path(args.out)
 
+    if args.cut_job:
+        import cutjob
+
+        p = cutjob.build_project(Path(args.cut_job), out)
+        print(json.dumps({"title": p["title"], "duration": round(p["duration"], 1),
+                          "sections": len(p["sections"]), "talk": len(p["talk"]),
+                          "takes": len(p["takes"]), "tightened": bool(p["cutJob"]["tightened"])}))
+        return
     if args.timeline:
         tl_file = Path(args.timeline)
         tl = json.loads(tl_file.read_text())

@@ -34,8 +34,9 @@ skips is normal.
     (guestlist, optional) → smoothed per-shot crop path → 9:16 `reframe.json` + optional render.
   - `cut.py`: one command from files or a folder to the whole job (`sync` → words → `grade` → `angles` → timeline export → `reframe` → whole-cut QC) in one output directory, resumable via `cut.json` fingerprints. The words stage enriches with Voice Transcribe when available.
 - `transcribe.py`: the production-audio clip → Voice Transcribe turns (16 kHz WAV, silence chunks, speakers reconciled) aligned onto Whisper word times → enriched `words.json` + `transcript.json` (`director transcribe`, the words stage of `director cut`).
+- `voice.py`: a spoken note → Meta transcription (local Whisper fallback) → notes anchored by playhead, spoken timecode or quoted words → Muse Spark resolves each to checked `cutlist` operations → `voice.json`, applied with `--apply` (`director voice`, the app's mic and memo drop).
   - `export.py`: `angles.json` shots → FCPXML and OTIO timelines through the installed `ghostcut` exporters.
-- `app/` — the Director Mac app: `main.py` (pywebview window), `engine.py` (local server), `muse.py` (Muse edits),
+- `app/` — the Director Mac app: `main.py` (pywebview window), `engine.py` (local server), `muse.py` (Muse edits), `cutjob.py` (opens a `director cut` job as a project, re-renders it),
   `render*.py` (re-render accepted edits, verify, promote, revert), `make_demo.py` (timeline from a cut).
 - `scripts/` — the first end-to-end Director test run and the day-1 take-picking spike.
 - `docs/` — design docs, Muse Code briefs and build logs, outside reviews.

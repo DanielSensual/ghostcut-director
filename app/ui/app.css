@@ -156,6 +156,34 @@ code { font-family: var(--mono); font-size: 12px; }
 .suggest { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 14px 8px; }
 .suggest button { font-size: 11.5px; padding: 4px 9px; border-radius: 999px; border: 1px solid var(--line2); color: var(--muted); }
 .suggest button:hover { color: var(--text); border-color: var(--ghost); }
+
+/* voice notes (cut-job mode) */
+.icon.mic { font-size: 15px; }
+.icon.mic.rec { color: #fff; background: var(--red); border-color: var(--red); min-width: 64px; font-size: 12px; font-variant-numeric: tabular-nums; }
+.icon.mic:disabled { opacity: .45; }
+.micbanner { font-size: 12px; color: var(--warn); border: 1px solid var(--warn); border-radius: 8px; padding: 8px 10px; margin-bottom: 8px; }
+.micbanner code { color: var(--text); font-size: 11px; word-break: break-all; }
+.voices { display: flex; flex-direction: column; gap: 8px; margin-bottom: 8px; }
+.voices:empty { display: none; }
+.memo { border: 1px solid var(--line); border-radius: 10px; padding: 8px; display: flex; flex-direction: column; gap: 8px; background: rgba(255,255,255,.015); }
+.memohead { font-size: 12px; color: var(--dim); }
+.msg.voice { border-left: 2px solid var(--blue); }
+.msg.voice .heard { color: var(--violet); font-size: 12px; margin: 2px 0 4px; }
+.msg.voice .note { font-size: 12px; color: var(--dim); margin-bottom: 4px; }
+.op.amb { border-style: dashed; }
+.cands { display: flex; flex-direction: column; gap: 4px; margin: 6px 0 2px; }
+.cand { display: flex; gap: 8px; align-items: baseline; font-size: 12px; cursor: pointer; }
+.taste { border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; margin-top: 8px; }
+.taste h4 { margin: 0 0 6px; font-size: 12px; color: var(--dim); font-weight: 600; }
+.tastelist { list-style: none; margin: 0 0 8px; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.tastelist li { display: flex; gap: 8px; align-items: baseline; font-size: 13px; }
+.tastelist li span { flex: 1; }
+.tastelist .x { padding: 0 6px; font-size: 12px; }
+.tastelist .muted { color: var(--dim); font-size: 12px; }
+.tasteadd { display: flex; gap: 6px; }
+.tasteadd input { flex: 1; }
+.dlg.drop { border-style: dashed; text-align: center; }
+.use-take { margin-left: 6px; }
 .ask { display: flex; gap: 8px; padding: 10px 14px 14px; border-top: 1px solid var(--line); }
 .ask textarea { flex: 1; resize: none; background: var(--bg); color: var(--text); border: 1px solid var(--line2); border-radius: 8px; padding: 8px; font: inherit; }
 .ask textarea:focus { outline: none; border-color: var(--ghost); }

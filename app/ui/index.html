@@ -45,6 +45,7 @@
     </div>
     <div class="transport">
       <button class="icon" id="playBtn" title="Play (space)">▶</button>
+      <button class="icon mic" id="micBtn" title="Hold to talk (V)" hidden>🎙</button>
       <span class="tc"><b id="tcNow">00:00</b> / <span id="tcDur">00:00</span></span>
       <span class="where" id="where"></span>
       <span class="grow"></span>
@@ -94,12 +95,22 @@
       <button data-tab="why">Why</button>
     </div>
     <div class="tab" id="tab-muse">
+      <div class="micbanner" id="micBanner" hidden></div>
+      <div class="voices" id="voiceList"></div>
       <div class="chat" id="chat"></div>
       <div class="suggest" id="suggest"></div>
       <form class="ask" id="askForm">
         <textarea id="askInput" rows="2" placeholder="Ask Muse to change the edit…"></textarea>
         <button class="primary" type="submit">Send</button>
       </form>
+      <div class="taste" id="tastePanel" hidden>
+        <h4>Standing preferences — read by Director on the next pick or note</h4>
+        <ul class="tastelist" id="tasteList"></ul>
+        <form class="tasteadd" id="tasteForm">
+          <input id="tasteInput" type="text" placeholder="Always open on the wide…" maxlength="200">
+          <button type="submit">Add</button>
+        </form>
+      </div>
     </div>
     <div class="tab" id="tab-review" hidden>
       <div class="filters" id="filters">
@@ -128,6 +139,20 @@
     <h3 id="renderDlgTitle">Render</h3>
     <div id="renderDlgBody"></div>
     <div class="dlg-acts"><button id="renderDlgClose">Close</button><button class="primary" id="renderStart" disabled>Start</button></div>
+  </div>
+</div>
+
+<div class="modal" id="dropOverlay" hidden>
+  <div class="dlg drop" role="dialog" aria-modal="true">
+    <h3>Drop the voice note — Director will transcribe and resolve it</h3>
+  </div>
+</div>
+
+<div class="modal" id="confirmDlg" hidden>
+  <div class="dlg" role="dialog" aria-modal="true">
+    <h3>Voice note</h3>
+    <p id="confirmMsg"></p>
+    <div class="dlg-acts"><button id="confirmNo">Cancel</button><button class="primary" id="confirmYes">Continue</button></div>
   </div>
 </div>
 
