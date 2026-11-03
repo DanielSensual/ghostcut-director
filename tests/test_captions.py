@@ -534,6 +534,9 @@ class RunTests(unittest.TestCase):
             job = self._job(Path(tmp))
             (job / "vertical.mp4").write_text("captioned", encoding="utf-8")
             (job / "vertical.clean.mp4").write_text("clean", encoding="utf-8")
+            # the marker the last burn left: vertical.mp4 is our captioned output
+            captions_mod._burn_marker(job / "vertical.mp4").write_text(
+                captions_mod._stamp(job / "vertical.mp4"), encoding="utf-8")
             seen: list[list[str]] = []
             with mock.patch.object(
                     captions_mod, "run_command",
@@ -550,6 +553,25 @@ class RunTests(unittest.TestCase):
             self.assertIn(str(job / "vertical.clean.mp4"), seen[0])
             self.assertEqual((job / "vertical.clean.mp4").read_text(
                 encoding="utf-8"), "clean")
+
+    def test_fresh_render_replaces_a_stale_clean_copy(self) -> None:
+        # Live 2026-11-03: angles re-rendered cut.mp4, captions burned the OLD clean copy
+        # over it, and QC failed duration_match (131.9 s rendered vs 124.8 s of shots).
+        with tempfile.TemporaryDirectory() as tmp:
+            job = self._job(Path(tmp))
+            (job / "vertical.clean.mp4").write_text("old cut", encoding="utf-8")
+            (job / "vertical.mp4").write_text("captioned old cut", encoding="utf-8")
+            captions_mod._burn_marker(job / "vertical.mp4").write_text(
+                captions_mod._stamp(job / "vertical.mp4"), encoding="utf-8")
+            (job / "vertical.mp4").write_text("fresh render, longer", encoding="utf-8")
+            with mock.patch.object(captions_mod, "run_command"), \
+                    mock.patch.object(captions_mod, "_probe_size",
+                                      return_value=(1080, 1920)):
+                captions_mod.run(words_path=job / "words.json",
+                                 angles_path=job / "angles.json",
+                                 tighten_path=None, out_dir=job)
+            self.assertEqual((job / "vertical.clean.mp4").read_text(encoding="utf-8"),
+                             "fresh render, longer")
 
     def test_run_rejects_bad_preset_and_budget(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

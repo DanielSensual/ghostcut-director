@@ -23,6 +23,7 @@ Built by Muse Code on muse-spark-1.3 from docs/muse-code/CAPTIONS-BRIEF.md.
 from __future__ import annotations
 
 import math
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -820,19 +821,33 @@ def _probe_size(path: Path) -> tuple[int, int] | None:
     return (width, height) if width > 0 and height > 0 else None
 
 
+def _burn_marker(target: Path) -> Path:
+    return target.with_name(f".{target.name}.captioned")
+
+
+def _stamp(path: Path) -> str:
+    info = path.stat()
+    return f"{info.st_size}:{info.st_mtime_ns}"
+
+
 def _clean_source(target: Path) -> Path | None:
     """The un-captioned source for a burn target, else None.
 
-    A re-run burns from the kept `*.clean.mp4`, never from captioned;
-    the first run renames the target aside (keeping an existing clean).
+    A re-run burns from the kept `*.clean.mp4`, never from captioned. But
+    when the target is not the file this stage burned last (its stamp
+    differs from the marker), it is a fresh render from an earlier stage
+    and replaces the old clean copy: the final take's re-render was
+    otherwise overwritten by captions burned onto the previous cut.
     """
     clean = target.with_name(f"{target.stem}.clean{target.suffix}")
-    if clean.exists():
-        return clean
+    marker = _burn_marker(target)
     if target.exists():
-        target.rename(clean)
+        ours = (clean.exists() and marker.exists()
+                and marker.read_text(encoding="utf-8").strip() == _stamp(target))
+        if not ours:
+            os.replace(target, clean)
         return clean
-    return None
+    return clean if clean.exists() else None
 
 
 def run(*, words_path: Path, angles_path: Path,
@@ -1000,6 +1015,8 @@ def run(*, words_path: Path, angles_path: Path,
         run_command(burn_command(clean_path=clean, ass_path=ass_path,
                                  fonts_dir=fontsdir, out_path=target,
                                  title_png=per_target_title))
+        if target.exists():
+            _burn_marker(target).write_text(_stamp(target), encoding="utf-8")
         burned.append(target.name)
         clean_kept.append(clean.name)
 
