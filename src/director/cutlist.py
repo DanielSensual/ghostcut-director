@@ -31,6 +31,10 @@ from ghostcut.config import read_json, write_json
 PAUSE_KEEP_S = 0.35
 HEAD_PAD_S = 0.10
 TAIL_PAD_S = 0.15
+# A kept span's edge sits mid-way through the silence next to it, but never more than this
+# far from its words: the final take opened on 6.8 s of the speaker leaning over before his
+# first word, because the gap to the removed restart before it was 13.6 s long.
+EDGE_SILENCE_MAX_S = 0.5
 MIN_KEPT_SPAN_S = 0.35
 DEAD_AIR_S = 2.0
 
@@ -291,7 +295,8 @@ def recompute_spans(payload: dict, words: Sequence[WordLike], *,
                 if prev_a is None:
                     start = max(0.0, first.start_s - HEAD_PAD_S)
                 else:
-                    start = (words[prev_a].end_s + first.start_s) / 2
+                    start = max((words[prev_a].end_s + first.start_s) / 2,
+                                first.start_s - EDGE_SILENCE_MAX_S)
             if number < len(runs) - 1:
                 end = bounds[number][0]
             else:
@@ -300,7 +305,8 @@ def recompute_spans(payload: dict, words: Sequence[WordLike], *,
                 if next_a is None:
                     end = last.end_s + TAIL_PAD_S
                 else:
-                    end = (last.end_s + words[next_a].start_s) / 2
+                    end = min((last.end_s + words[next_a].start_s) / 2,
+                              last.end_s + EDGE_SILENCE_MAX_S)
             assert start is not None and end is not None
             run_utts = sorted({word_to_utt[i] for i in run
                                if i in word_to_utt})

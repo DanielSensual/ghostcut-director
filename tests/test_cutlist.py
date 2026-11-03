@@ -66,9 +66,11 @@ class RecomputeTests(unittest.TestCase):
         cutlist.recompute_spans(payload, words, pause_limit_s=3.0)
         kept = payload["kept_spans"]
         self.assertEqual(len(kept), 2)
-        # Exact inter-word midpoints around the removed attempt.
+        # Inter-word midpoints around the removed attempt, but never more than
+        # EDGE_SILENCE_MAX_S of silence beside the kept words.
         self.assertAlmostEqual(kept[0]["end_s"], (11.0 + 12.0) / 2)
-        self.assertAlmostEqual(kept[1]["start_s"], (12.8 + 20.0) / 2)
+        self.assertAlmostEqual(kept[1]["start_s"],
+                               max((12.8 + 20.0) / 2, 20.0 - cutlist.EDGE_SILENCE_MAX_S))
         # No kept span contains any part of a removed word's [start, end].
         for span in kept:
             for word in (words[2], words[3]):
@@ -131,9 +133,11 @@ class RecomputeTests(unittest.TestCase):
         # One removed span per inter-kept gap: the flub words, then the
         # trimmed pause inside the second pick. The 3 s pause leaves a
         # 2.65 s word-free middle, yet it classifies pause_trim rather
-        # than dead_air: trimmed pauses outrank word-free gaps.
+        # than dead_air: trimmed pauses outrank word-free gaps. The 6.2 s
+        # silence before "five." is not kept whole any more: its middle is
+        # removed as dead_air, leaving at most EDGE_SILENCE_MAX_S either side.
         self.assertEqual([s["kind"] for s in removed],
-                         ["flub", "pause_trim"])
+                         ["flub", "pause_trim", "dead_air"])
         trim = removed[1]
         self.assertGreater(trim["end_s"] - trim["start_s"], 2.0)
         flub = removed[0]
@@ -146,7 +150,7 @@ class RecomputeTests(unittest.TestCase):
             self.assertAlmostEqual(span["start_s"], prev["end_s"])
             self.assertLess(span["start_s"], span["end_s"])
         self.assertEqual([s["id"] for s in kept], ["K0", "K1", "K2", "K3"])
-        self.assertEqual([s["id"] for s in removed], ["R0", "R1"])
+        self.assertEqual([s["id"] for s in removed], ["R0", "R1", "R2"])
         # The word-free branches, below and above the dead-air line.
         dead = cutlist._classify_gap(10.0, 13.5, {}, [], [], {}, {}, [])
         assert dead is not None
