@@ -377,16 +377,22 @@ class Engine:
 
     # Deliverables a director cut job already wrote, for the Deliver page.
     JOB_FILES = (("cut.dressed.mp4", "Dressed cut", "cards, music bed and ghost pops"),
-                 ("cut.mp4", "Master · horizontal", "captioned, finished, −14 LUFS"),
+                 ("cut.mp4", "Master · horizontal", "the finished cut"),
                  ("cut.clean.mp4", "Clean master", "no captions or title, for your editor"),
-                 ("vertical.mp4", "Vertical 9:16", "SAM 3.1 reframe, captioned"),
+                 ("vertical.mp4", "Vertical 9:16", "reframed for phones"),
                  ("timeline.fcpxml", "Final Cut Pro / Resolve", "FCPXML, every cut editable"),
                  ("timeline.otio.json", "OpenTimelineIO", "for Premiere and other editors"))
 
     def job_files(self) -> dict:
         if self.job_dir is None:
             return {"files": []}
-        files = [{"name": n, "label": a, "note": b,
+        method = ""
+        try:  # say how the vertical was framed: SAM tracking or the centred fallback
+            method = str(json.loads((self.job_dir / "reframe.json").read_text()).get("method") or "")
+        except Exception:  # noqa: BLE001 - no or unreadable reframe.json: keep the neutral note
+            pass
+        notes = {"vertical.mp4": {"sam": "SAM 3.1 tracking the speaker", "centre": "centred crop (SAM unavailable)"}.get(method)}
+        files = [{"name": n, "label": a, "note": notes.get(n) or b,
                   "size": _human_size((self.job_dir / n).stat().st_size)}
                  for n, a, b in self.JOB_FILES if (self.job_dir / n).is_file()]
         return {"dir": str(self.job_dir), "files": files}

@@ -1284,3 +1284,27 @@ Built by Claude Code with the owner in `9def8b9` (commit author DanielSensual, w
 QC's measured loudness into the project; `app/ui/app.js` shows those files, sizes and measurements instead of the
 prototype export controls for cut jobs. `tests/test_deliver.py` covers the real file list, no-job state and reveal allow-list.
 The current release still needs an independent check before promising that every malformed QC object opens successfully.
+
+# Build log: MUSE KEY in Connections, and fixes after the independent verification (2026-11-04, Claude Code)
+
+The owner's intake: a new user opens the app, the tour asks for the key of the agent that will run the edit (Muse),
+they paste it, then import the cards and talk to Ghost. Until now the Meta key came only from `MODEL_API_KEY`.
+
+- `connect.py`: a `meta` provider ("Meta (Muse)", `MODEL_API_KEY`, Keychain account `meta-model-api`), first in the
+  registry. `metaapi.test_connection` checks a key with one `GET /v1/models` (nothing generated, no cost; 401 says
+  rejected, 402 says the team has no billing). The Meta client reads only the environment, so
+  `export_keychain_key("meta")` copies a saved key into this process's `MODEL_API_KEY` (only when it is unset; an
+  environment key always wins). A copied key still reports as a Keychain key, and removing it clears the copy.
+- `app/engine.py`: `export_saved_keys()` runs at the two entry points (`engine.py`, `app/main.py`), never in `serve()`,
+  so tests never touch the real Keychain; adding the Muse key in Connections exports it at once. Single-key providers
+  are handled generically (engine and `director connect add`).
+- `onboard.js`: tour step 2 is now "Connect Muse": Muse's status first (amber until connected), an "Add your Muse key"
+  button that opens Connections and re-checks when the dialog closes, and ElevenLabs as the optional extra.
+- Verification fixes from the same afternoon (Astra report): the offline resolver no longer shrinks a quote that is
+  mostly absent from the cut into a different cut (a shorter run must keep 60% of the quoted words; F13); Story's
+  intro on a cut job no longer describes a house walkthrough and says who picked the takes, and its cost tile no
+  longer shows "NaN s" (F16); Deliver's file notes are neutral and the vertical's note follows `reframe.json`
+  (SAM tracking or the centred fallback; F16); the README examples' output folders are git-ignored (F12).
+- Tests: `tests/test_connect.py` (+6: registry, test call incl. 401/402/network with the key never echoed, Keychain
+  export and refresh and removal, environment wins, engine add/remove, CLI add), `tests/test_voice_offline.py` (+1,
+  Astra's Neptune case). No test makes a network call.

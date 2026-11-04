@@ -1122,10 +1122,12 @@
       const TK = P.takes || [];
       const count = (k) => TK.filter((t) => t.kind === k).length;
       el.append(h("h2", {}, "Story"),
-        h("p", { class: "lede" }, "Spark watched the house walkthrough with numbered transcript lines beside it and sorted every moment. Whisper keeps the clock. (The other sections' takes were picked by hand, and reclassifying here is not saved yet.)"),
+        h("p", { class: "lede" }, isCutJob()
+          ? `Every moment of the shoot, sorted: the take Director kept for each beat, the alternates, the flubs and false starts, and the asides. ${P.takeMeta?.method === "muse" ? "Muse Spark picked the takes from the transcript and the footage" : "Director's rules picked the takes (the last full pass of each beat)"}; Whisper keeps the clock.`
+          : "Spark watched the house walkthrough with numbered transcript lines beside it and sorted every moment. Whisper keeps the clock. (The other sections' takes were picked by hand, and reclassifying here is not saved yet.)"),
         h("div", { class: "stats" }, stat(TK.length, "moments"), stat(count("keeper_take"), "keepers"), stat(count("alternate_take"), "alternates"),
           stat(count("flub_or_false_start"), "flubs"), stat(count("aside_to_editor"), "asides to the editor"), stat(count("setup_or_technical") + count("off_camera_or_pause"), "setup & pauses"),
-          P.takeMeta?.model && stat(`$${(+P.takeMeta.usd).toFixed(2)}`, `${P.takeMeta.model} · ${Math.round(P.takeMeta.seconds)} s`)));
+          P.takeMeta?.model && stat(`$${(+P.takeMeta.usd || 0).toFixed(2)}`, Number.isFinite(+P.takeMeta.seconds) && P.takeMeta.seconds !== null && P.takeMeta.seconds !== "" ? `${P.takeMeta.model} · ${Math.round(+P.takeMeta.seconds)} s` : P.takeMeta.model)));
       const groups = [];
       TK.forEach((t) => { let g = groups.find((x) => x.topic === t.topic); if (!g) groups.push((g = { topic: t.topic, rows: [] })); g.rows.push(t); });
       const KINDS = ["keeper_take", "alternate_take", "flub_or_false_start", "aside_to_editor", "setup_or_technical", "off_camera_or_pause"];

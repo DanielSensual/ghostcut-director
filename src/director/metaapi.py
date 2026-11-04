@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 
-from .elevenlabs import http_request
+from . import elevenlabs as _http  # the shared stdlib HTTP helper (tests patch it there)
 
 META_BASE = "https://api.meta.ai/v1"
 HTTP_TIMEOUT_S = 20
@@ -27,7 +27,7 @@ def _redact_key(message: str, key: str) -> str:
 def test_connection(key: str, *, transport=None) -> dict:
     """GET /v1/models. Returns {"ok", "message", "detail"}; never raises."""
     if transport is None:
-        transport = http_request
+        transport = _http.http_request
     unreachable = ("meta: could not reach the Meta Model API "
                    "(network or provider error) — try again")
     try:

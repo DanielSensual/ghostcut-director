@@ -2098,12 +2098,15 @@ def _spoken_phrase(text: str) -> str:
     return ""
 
 
-def _best_quote(job: JobContext, phrase: str, *, unique: bool = False
-                ) -> str:
+def _best_quote(job: JobContext, phrase: str, *, unique: bool = False,
+                min_cover: float = 0.0) -> str:
     """The phrase itself when it matches the cut's words, else the longest
     run of its words that does (a misheard edge or a stutter in the note
     should not lose the cut). `unique` prefers a run matching once (an
-    anchor); otherwise any match. Returns "" when nothing matches. Pure."""
+    anchor); otherwise any match. `min_cover` is the smallest share of the
+    phrase's words a shorter run must keep: a cut asks for 0.6, so "my drone
+    flies to Neptune" never shrinks to cutting "my drone". Returns "" when
+    nothing matches. Pure."""
     tokens = [t for t in re.split(r"\s+", phrase.strip()) if t]
     if not tokens:
         return ""
@@ -2112,6 +2115,8 @@ def _best_quote(job: JobContext, phrase: str, *, unique: bool = False
             return phrase
     fallback = ""
     for size in range(len(tokens) - 1, 0, -1):
+        if size < min_cover * len(tokens):
+            break
         for start in range(0, len(tokens) - size + 1):
             window = " ".join(tokens[start:start + size])
             ranges = match_kept_ranges(job, window)
@@ -2218,7 +2223,7 @@ def _offline_clause(job: JobContext, index: int, clause: str
         # "both/all/every" outside the quoted words ("all the things" is
         # a phrase, not a request for every match).
         take_all = bool(TAKE_ALL_RE.search(clause.replace(phrase, " ")))
-        quote = _best_quote(job, phrase) or phrase
+        quote = _best_quote(job, phrase, min_cover=0.6) or phrase
         every = " (every mention)" if take_all else ""
         op = _offline_op("drop_words", why=f"offline rules: “{clause[:80]}”")
         return _offline_note(index, heard=f"Cut “{quote}”{every}",

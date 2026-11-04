@@ -224,6 +224,12 @@ class PhrasingTests(OfflineFixture):
         (note,) = self.typed("remove captions and all the stuff")
         self.assertEqual(self.drops(note), ["captions and all the"])
 
+    def test_a_quote_mostly_absent_from_the_cut_is_not_shrunk_into_a_cut(self) -> None:
+        # Astra F13: "my drone flies to Neptune" must not become "cut my drone".
+        (note,) = self.typed("cut where I say my drone flies to Neptune")
+        self.assertEqual(self.drops(note), [])
+        self.assertTrue(all(op["blocked"] for op in note.ops if op["op"] == "drop_words"))
+
     def test_typed_quotes(self) -> None:
         (note,) = self.typed('cut "ready for edit"')
         self.assertEqual(self.drops(note), ["ready for edit."])

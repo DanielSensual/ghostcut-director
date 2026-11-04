@@ -75,8 +75,10 @@ def clean_env(test: unittest.TestCase, **extra: str):
     patcher = mock.patch.dict(os.environ, {}, clear=False)
     patcher.start()
     test.addCleanup(patcher.stop)
-    for var in ("ELEVENLABS_API_KEY", "HF_API_KEY_ID", "HF_API_KEY_SECRET"):
+    for var in ("MODEL_API_KEY", "ELEVENLABS_API_KEY", "HF_API_KEY_ID", "HF_API_KEY_SECRET"):
         os.environ.pop(var, None)
+    connect_mod._EXPORTED.clear()
+    test.addCleanup(connect_mod._EXPORTED.clear)
     os.environ.update(extra)
 
 
@@ -123,7 +125,7 @@ class RegistryTests(unittest.TestCase):
     """Item 1: registry shape."""
 
     def test_registry_shape(self) -> None:
-        self.assertEqual(list(connect_mod.PROVIDERS), ["elevenlabs", "higgsfield"])
+        self.assertEqual(list(connect_mod.PROVIDERS), ["meta", "elevenlabs", "higgsfield"])
         eleven = connect_mod.PROVIDERS["elevenlabs"]
         self.assertEqual(eleven.capabilities, ("sfx", "music", "isolation"))
         self.assertTrue(eleven.available)
@@ -136,7 +138,7 @@ class RegistryTests(unittest.TestCase):
             connect_mod.provider_info("nope")
         self.assertEqual(str(raised.exception),
                          "connect: unknown provider 'nope' "
-                         "(known: elevenlabs, higgsfield)")
+                         "(known: meta, elevenlabs, higgsfield)")
 
 
 class KeyStorageTests(unittest.TestCase):
@@ -363,7 +365,7 @@ class ConnectCliTests(unittest.TestCase):
             self.assertEqual(code, 0)
             payload = json.loads(out)
             self.assertEqual([entry["id"] for entry in payload["providers"]],
-                             ["elevenlabs", "higgsfield"])
+                             ["meta", "elevenlabs", "higgsfield"])
             self.assertNotIn(ELEVEN_KEY, out)
 
 
@@ -412,7 +414,7 @@ class EngineTests(unittest.TestCase):
             code, payload = ctx.get("/api/connections")
             self.assertEqual(code, 200)
             self.assertEqual([entry["id"] for entry in payload["providers"]],
-                             ["elevenlabs", "higgsfield"])
+                             ["meta", "elevenlabs", "higgsfield"])
             code, payload = ctx.post("/api/connections/add",
                                      {"provider": "elevenlabs",
                                       "key": ELEVEN_KEY})
@@ -440,7 +442,7 @@ class EngineTests(unittest.TestCase):
             self.assertEqual(code, 400)
             self.assertEqual(payload["error"],
                              "connect: unknown provider 'nope' "
-                             "(known: elevenlabs, higgsfield)")
+                             "(known: meta, elevenlabs, higgsfield)")
             self.assertNotIn(ELEVEN_KEY, json.dumps(ctx.answered))
 
 
@@ -493,6 +495,102 @@ class ProviderShapeTests(unittest.TestCase):
         self.assertEqual(elevenlabs_mod.estimate_sfx_usd(0), 0.0)
         self.assertEqual(elevenlabs_mod.estimate_music_usd(-5), 0.0)
         self.assertEqual(elevenlabs_mod.estimate_isolation_usd(-1), 0.0)
+
+
+META_KEY = "test-key-meta-xyz789"
+
+
+class MetaKeyTests(unittest.TestCase):
+    """The Muse (Meta) key in Connections: registry, test call, Keychain export."""
+
+    def test_registry_entry(self) -> None:
+        meta = connect_mod.PROVIDERS["meta"]
+        self.assertEqual(meta.env_vars, ("MODEL_API_KEY",))
+        self.assertEqual(meta.keychain_accounts, ("meta-model-api",))
+        self.assertEqual(meta.capabilities, ("muse", "sam"))
+        self.assertTrue(meta.available)
+
+    def test_connection_call(self) -> None:
+        from director import metaapi as meta_mod
+
+        models = {"data": [{"id": "muse-spark-1.3"}, {"id": "muse-wonder-1.0"}, {"id": "sam-3.1"}]}
+        transport = FakeTransport([(200, {}, json.dumps(models).encode())])
+        result = meta_mod.test_connection(META_KEY, transport=transport)
+        self.assertTrue(result["ok"])
+        self.assertIn("3 models visible, 2 Muse", result["message"])
+        method, url, headers, body, _timeout = transport.calls[0]
+        self.assertEqual((method, url, body), ("GET", "https://api.meta.ai/v1/models", None))
+        self.assertEqual(headers["Authorization"], f"Bearer {META_KEY}")
+        denied = meta_mod.test_connection(META_KEY, transport=FakeTransport([(401, {}, b"")]))
+        self.assertFalse(denied["ok"])
+        self.assertIn("rejected this key", denied["message"])
+        unpaid = meta_mod.test_connection(META_KEY, transport=FakeTransport([(402, {}, b"")]))
+        self.assertFalse(unpaid["ok"])
+        self.assertIn("billing", unpaid["message"])
+
+        def down(*_args, **_kwargs):
+            raise OSError(f"connection reset while sending {META_KEY}")
+
+        broke = meta_mod.test_connection(META_KEY, transport=down)
+        self.assertFalse(broke["ok"])
+        self.assertNotIn(META_KEY, json.dumps(broke))
+
+    def test_export_copies_a_keychain_key_and_reports_it_as_keychain(self) -> None:
+        clean_env(self)
+        ring = make_keyring({("ghostcut-director", "meta-model-api"): META_KEY})
+        with mock.patch.dict(sys.modules, {"keyring": ring}):
+            self.assertEqual(connect_mod.export_keychain_key("meta"), "keychain")
+            self.assertEqual(os.environ["MODEL_API_KEY"], META_KEY)
+            self.assertEqual(connect_mod.key_status("meta").source, "keychain")
+            # a new saved key refreshes the copy
+            connect_mod.set_provider_key("meta", ("test-key-meta-new-2",))
+            self.assertEqual(connect_mod.export_keychain_key("meta"), "keychain")
+            self.assertEqual(os.environ["MODEL_API_KEY"], "test-key-meta-new-2")
+            # removing it takes the copy out of the environment too
+            status = connect_mod.remove_provider_key("meta")
+            self.assertFalse(status.connected)
+            self.assertNotIn("MODEL_API_KEY", os.environ)
+            self.assertEqual(connect_mod.export_keychain_key("meta"), "none")
+
+    def test_an_environment_key_always_wins(self) -> None:
+        clean_env(self, MODEL_API_KEY="test-key-meta-env-3")
+        ring = make_keyring({("ghostcut-director", "meta-model-api"): META_KEY})
+        with mock.patch.dict(sys.modules, {"keyring": ring}):
+            self.assertEqual(connect_mod.export_keychain_key("meta"), "env")
+            self.assertEqual(os.environ["MODEL_API_KEY"], "test-key-meta-env-3")
+            self.assertEqual(connect_mod.key_status("meta").source, "env")
+
+    def test_engine_add_hands_the_key_to_the_meta_client(self) -> None:
+        clean_env(self)
+        ring = make_keyring()
+        with mock.patch.dict(sys.modules, {"keyring": ring}):
+            ctx = Ctx(self)
+            code, payload = ctx.post("/api/connections/add",
+                                     {"provider": "meta", "key": META_KEY})
+            self.assertEqual(code, 200)
+            entry = {e["id"]: e for e in payload["providers"]}["meta"]
+            self.assertTrue(entry["connected"])
+            self.assertEqual(entry["source"], "keychain")
+            self.assertEqual(os.environ.get("MODEL_API_KEY"), META_KEY)
+            self.assertNotIn(META_KEY, json.dumps(payload))
+            code, payload = ctx.post("/api/connections/remove", {"provider": "meta"})
+            self.assertEqual(code, 200)
+            self.assertNotIn("MODEL_API_KEY", os.environ)
+
+    def test_cli_add_meta_takes_one_key(self) -> None:
+        clean_env(self)
+        ring = make_keyring()
+        models = {"data": [{"id": "muse-spark-1.3"}]}
+        transport = FakeTransport([(200, {}, json.dumps(models).encode())])
+        with (mock.patch.dict(sys.modules, {"keyring": ring}),
+              mock.patch.object(elevenlabs_mod, "http_request", transport)):
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = cli_mod.main(["connect", "add", "meta", "--key", META_KEY])
+            self.assertEqual(code, 0, err.getvalue())
+            self.assertEqual(ring._store[("ghostcut-director", "meta-model-api")], META_KEY)
+            self.assertNotIn(META_KEY, out.getvalue() + err.getvalue())
+            self.assertEqual(transport.calls[0][1], "https://api.meta.ai/v1/models")
 
 
 if __name__ == "__main__":

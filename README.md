@@ -112,6 +112,7 @@ From [docs/muse-code/BUILD-LOG.md](docs/muse-code/BUILD-LOG.md) and the git log,
 | Deliver: existing job files, Finder reveal and measured QC loudness | Built by Claude Code with me (`9def8b9`); `app/engine.py`, `app/cutjob.py`, `app/ui/app.js`, `tests/test_deliver.py` |
 | The briefs in `docs/muse-code/` | Me, with Claude Code |
 | Dress the cut: title cards, ElevenLabs music and SFX, ghost pop-up (`director dress`) | Muse Code (partial) + Claude Code: Muse Code on muse-wonder-1.0 built the core from `DRESS-BRIEF.md` (after my review of the app on submission day) and was cut off when its Meta API credit ran out; Claude Code finished, fixed and tested it, and added the built-in card planner used when Muse is unavailable. Music and SFX generated with ElevenLabs during the event; the ghost sprite is the owner's own brand art |
+| Muse key in Connections and the tour's "Connect Muse" step (`director connect add meta`) | Built by Claude Code (Opus) on submission day, at the owner's request after his review of the onboarding |
 
 ## The Director app
 
@@ -193,7 +194,7 @@ director captions --job job1 --title "Why this cut took one pass"
 
 Keys come from environment variables or from `director connect`, never from files in a job or in this repository, and no screen, log, or error message ever shows a saved key back.
 
-- Meta models: `MODEL_API_KEY` (with `pip install -e ".[muse]"`). Without it, the offline paths above still run.
+- Meta models (Muse and SAM): paste your Meta API key in the app's first-run tour ("Connect Muse") or the Connections panel, or run `director connect add meta`; it is saved in the macOS Keychain (with `pip install -e ".[connect]"`) and the app hands it to the Meta client for its own process. `MODEL_API_KEY` in the environment wins, and the command line reads only the environment (with `pip install -e ".[muse]"`). Without a key, the offline paths above still run.
 - ElevenLabs: `ELEVENLABS_API_KEY`, or `director connect add elevenlabs` (with `pip install -e ".[connect]"` for macOS Keychain storage). Environment variables win over saved keys.
 - Higgsfield: `HF_API_KEY_ID` and `HF_API_KEY_SECRET`, or `director connect add higgsfield`. See the limitation below: connecting it changes nothing yet.
 - xAI: `XAI_API_KEY` is read from the environment only (no screen shows a saved key, and it is not in `director connect`).

@@ -29,3 +29,9 @@ audio/
 .env.*
 *.meta-api.env
 app/ui/demo/
+
+# Output folders the README examples create inside the repo (media, never committed)
+/director-demo/
+/job/
+/job[0-9]*/
+/launch-job/
