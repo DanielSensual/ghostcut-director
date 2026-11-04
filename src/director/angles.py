@@ -1196,6 +1196,11 @@ def render_commands(shots: list[Shot], clips_by_label: dict[str, SyncClip], audi
                 if vf.count(needle) != 1:
                     raise ValueError("cannot place the push-in: unexpected filter chain")
                 vf = vf.replace(needle, f"{needle}{segment},", 1)
+        if shot.camera != "black":
+            # When a camera's clip ends a few frames before the shot does (the final take's
+            # last drone shot rendered 80 of 83 frames), hold its last frame so every part is
+            # exactly `frames` long and picture and audio end together.
+            vf = f"{vf},tpad=stop_mode=clone:stop_duration=2"
         cmd += ["-map", "0:v:0", "-vf", vf, "-frames:v", str(frames), "-an",
                 "-c:v", "libx264", "-preset", "medium", "-crf", "16"]
         if grade is not None:

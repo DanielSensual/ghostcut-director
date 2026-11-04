@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+import shutil
 import tempfile
 import types
 import unittest
@@ -395,3 +396,27 @@ class TimelineRateTests(unittest.TestCase):
         self.assertNotIn("fps=30", joined)
         frames = [int(cmd[cmd.index("-frames:v") + 1]) for cmd in parts[:2]]
         self.assertEqual(frames, [120, 120])  # 5 s at 23.976 fps
+
+
+@unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "needs ffmpeg")
+class ShortClipRenderTests(unittest.TestCase):
+    def test_a_shot_longer_than_its_clip_still_renders_every_frame(self) -> None:
+        # Live 2026-11-03: the last drone shot asked for 83 frames and got 80 (the clip ended),
+        # so the picture finished 0.13 s before the audio.
+        import subprocess
+        from director.angles import Shot, SyncClip, render_commands
+        with tempfile.TemporaryDirectory() as tmp:
+            clip = Path(tmp) / "b.mp4"
+            subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+                            "testsrc2=size=320x180:rate=30:duration=2", "-c:v", "libx264",
+                            "-pix_fmt", "yuv420p", str(clip)], check=True)
+            cam = SyncClip("B", str(clip), 0.0, fps=30.0, width=320, height=180, duration_s=2.0)
+            shots = [Shot(0, 0.0, 2.2, "B", str(clip), 0.0, 2.2, [0], "medium", "ok", "rule")]
+            parts, _, _ = render_commands(shots, {"B": cam}, cam, Path(tmp) / "cut.mp4")
+            Path(parts[0][-1]).parent.mkdir(parents=True, exist_ok=True)
+            subprocess.run(parts[0], check=True)
+            out = parts[0][-1]
+            n = subprocess.run(["ffprobe", "-v", "error", "-count_packets", "-select_streams", "v:0",
+                                "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", out],
+                               capture_output=True, text=True).stdout.strip()
+            self.assertEqual(int(n), 66)
