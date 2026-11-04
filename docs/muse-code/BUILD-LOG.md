@@ -849,3 +849,12 @@ Live test: TBD (the owner fills this from the real-footage run).
   pre-existing `ps`/socket-sandbox errors in
   `tests/test_engine_render.py` and `tests/test_render_runner.py`
   (758 on the tree before this build, same 11).
+
+### Live check (owner's agent, Claude Code, 2026-11-04)
+
+Run outside the sandbox with the real Vision helper on a copy of the job (`director angles`, Muse picks on, no
+render): 29 lines → 22 shots, $0.073. The dense samples for line 1 ("my drone has no microphone but this software lined
+it up here.", 8 samples per camera) give continuous yaw C ≈ 10–14° and B ≈ 19–37° for the first four samples, then the
+reverse; the held-turn segments are C 160.62–162.51 and B 162.51–164.40, and the shot list opens C 0.00–3.69 ("My mic,
+my drone has no microphone") then B — the cut the owner asked for. Every shot carries one reason. Full suite outside
+the sandbox: 771 tests, OK.
