@@ -402,7 +402,7 @@ class Engine:
         return {"ok": True, "path": str(target)}
 
     def open_job(self, path: str) -> dict:
-        job = Path(path or "")
+        job = self._allowed_path(path)
         cutjob.build_project(job, self.demo)
         self.job_dir = job
         self._cutjob_state = {"state": "idle", "message": ""}

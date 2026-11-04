@@ -344,6 +344,17 @@ class OpenTests(unittest.TestCase):
         self.assertEqual(len(project["talk"]), 2)
         self.assertTrue((ctx.demo / "project.json").exists())
 
+    def test_open_rejects_paths_outside_allowed_roots(self) -> None:
+        ctx = Ctx(self)
+        link = ctx.root / "outside"
+        link.symlink_to("/etc", target_is_directory=True)
+        for path in ("/etc", str(link)):
+            with self.subTest(path=path), mock.patch.object(cutjob, "build_project") as build:
+                status, body = ctx.post("/api/job/open", {"path": path})
+                self.assertEqual(status, 400)
+                self.assertIn("outside the allowed folders", body["error"])
+                build.assert_not_called()
+
     def test_open_bad_directory_is_a_400(self) -> None:
         ctx = Ctx(self)
         empty = ctx.root / "empty"
