@@ -73,6 +73,9 @@ def _brief(st: dict) -> dict:
     return out
 
 
+MUSE_UNAVAILABLE = "Muse unavailable, using the built-in planner."  # ONBOARD
+
+
 class Engine:
     def __init__(self, demo: Path = DEMO, render=None, job_dir: Path | str | None = None, settings_path: Path | str | None = None):  # ONBOARD
         self._settings_path: Path | None = Path(settings_path) if settings_path is not None else None  # ONBOARD: lazy, never read here
@@ -600,6 +603,11 @@ class Engine:
                      "total": s.get("total", 0),
                      "clip_count": s.get("clip_count", 0),
                      "total_bytes": s.get("total_bytes", 0),
+                     # ONBOARD: tile facts from the scan
+                     "camera_labels": list(s.get("camera_labels") or []),
+                     "date_start": s.get("date_start"),
+                     "date_end": s.get("date_end"),
+                     "sample": s.get("sample"),
                      "message": s.get("message", "")}
                     for s in self._scan_states.values()]
 
@@ -658,10 +666,18 @@ class Engine:
             with self._scan_lock:
                 state = self._scan_states.get(key) or {
                     "volume": key, "name": Path(key).name}
+                try:  # ONBOARD: tile facts (never fail a ready scan over them)
+                    lo, hi = scan.date_range
+                except Exception:  # noqa: BLE001
+                    lo = hi = None
                 state.update({"state": "ready", "done": len(scan.clips),
                               "total": len(scan.clips),
                               "clip_count": len(scan.clips),
                               "total_bytes": scan.total_bytes,
+                              "camera_labels": sorted({c.camera_label for c in scan.clips if c.camera_label}),
+                              "date_start": lo.isoformat() if lo else None,
+                              "date_end": hi.isoformat() if hi else None,
+                              "sample": scan.clips[0].name if scan.clips else None,
                               "message": "", "_fingerprint": fingerprint})
                 self._scan_states[key] = state
         except Exception as e:  # noqa: BLE001 - scans endpoint reports it
@@ -924,6 +940,16 @@ class Engine:
             intent = mod.parse_intent(str(text or ""), vols)
         except Exception:
             intent = mod.parse_intent_rule(str(text or ""), vols)
+        res = self._offload_ask_intent(intent, vols)
+        # ONBOARD: say honestly which planner read the request (Muse can be
+        # unavailable, e.g. a 402 when the Meta API credit runs out).
+        if isinstance(res, dict):
+            res.setdefault("planner", "muse" if intent.method == "spark" else "rules")
+            if intent.method != "spark" and os.environ.get("MODEL_API_KEY"):
+                res.setdefault("note", MUSE_UNAVAILABLE)
+        return res
+
+    def _offload_ask_intent(self, intent, vols) -> dict:  # ONBOARD: body of offload_ask, unchanged
         data = intent.as_dict()
         if intent.confirm:
             if self._offload_plan is None:

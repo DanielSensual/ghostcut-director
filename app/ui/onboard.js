@@ -65,6 +65,7 @@
       try { if (prevFocus && prevFocus.focus) prevFocus.focus(); } catch (e) { /* noop */ }
     }
     function onKey(e) {
+      if (document.querySelector(".modal:not([hidden])")) return; // Connections (opened from step 2) handles its own keys
       if (e.key === "Escape") { e.preventDefault(); close(true); return; }
       if (e.key !== "Tab") return;
       var focusables = Array.prototype.slice.call(card.querySelectorAll("button, [href], input, textarea, select, [tabindex]")).filter(function (n) { return !n.disabled && n.offsetParent !== null; });
@@ -101,7 +102,7 @@
           h("p", {}, "Keys stay on this Mac. Nothing is required to import."), box);
         (async function () {
           var eleven = "ElevenLabs not connected — music and sound effects (optional).";
-          var museLine = "Ghost is running on rules — Muse reading is off until a key is set.";
+          var museLine = "Ghost is running on rules — its built-in planner reads every request, offline.";
           try {
             var j = await api("/api/connections");
             var list = (j && j.providers) || [];
@@ -110,7 +111,7 @@
           } catch (e) { eleven = "Connections unavailable offline — connect later if you want music and sound effects."; }
           try {
             var s = await api("/api/settings");
-            if (s && s.meta_key) museLine = "Muse connected — Ghost reads requests with Spark.";
+            if (s && s.meta_key) museLine = "A Muse key is set — Ghost reads requests with Spark, and uses the built-in planner whenever Muse is unavailable.";
           } catch (e) { /* keep rules line */ }
           var openBtn = h("button", { type: "button", class: "gc-tour-btn" }, "Open Connections");
           openBtn.onclick = function () { try { if (ctx.openConn) ctx.openConn(); } catch (e) { /* dialog unavailable */ } };
@@ -155,7 +156,7 @@
               status.className = "gc-tour-found";
               status.textContent = "Found a " + detail + " card, " + count + " clips";
               stopPoll();
-              setTimeout(function () { if (overlay.isConnected) go(step + 1); }, 700);
+              var at = step; setTimeout(function () { if (overlay.isConnected && step === at) go(at + 1); }, 700);
             }
           } catch (e) { /* keep waiting */ }
         };
@@ -171,12 +172,14 @@
             h("p", { class: "muted" }, "A full cut takes about half an hour, so Resume is the fast path in a demo."));
           return;
         }
+        var chatTa = document.querySelector("#view-import textarea");
+        if (chatTa && !chatTa.value) chatTa.value = PREFILL; // pre-filled; Try it sends it
         var tryBtn = h("button", { type: "button", class: "gc-tour-btn primary" }, "Try it");
         tryBtn.onclick = function () {
           var view = document.querySelector("#view-import");
           var done = false;
           try {
-            if (view && typeof view.__gcAsk === "function") { view.__gcAsk(PREFILL); done = true; }
+            if (view && typeof view.__gcAsk === "function") { if (chatTa && chatTa.value === PREFILL) chatTa.value = ""; view.__gcAsk(PREFILL); done = true; }
           } catch (e) { /* fall through to form */ }
           if (!done) {
             var ta = view ? view.querySelector("textarea") : null;
@@ -225,5 +228,8 @@
     go(0);
   }
   window.GCTour = { open: open };
+  // The ? Help button in the top bar reopens the tour any time (scripts load at the end of <body>).
+  var helpBtn = document.getElementById("helpBtn");
+  if (helpBtn) helpBtn.addEventListener("click", function () { open(window.GC); });
 })();
 

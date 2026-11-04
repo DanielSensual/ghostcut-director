@@ -955,3 +955,71 @@ it up here.", 8 samples per camera) give continuous yaw C ≈ 10–14° and B �
 reverse; the held-turn segments are C 160.62–162.51 and B 162.51–164.40, and the shot list opens C 0.00–3.69 ("My mic,
 my drone has no microphone") then B — the cut the owner asked for. Every shot carries one reason. Full suite outside
 the sandbox: 771 tests, OK.
+
+# Build log: ONBOARD — first-run tour, the Import page and Ghost's face (2026-11-04)
+
+| Step | By | What |
+|---|---|---|
+| Brief | Project owner, with Claude Code | `ONBOARD-BRIEF.md`: a first-run tutorial and a finished-looking Import page, after the owner's review of the app on submission day. |
+| Build (partial) | Meta **Muse Code** on **`muse-wonder-1.0`** | Commit `d108cab`, untested: the settings file and `GET`/`POST /api/settings` (`settings_get` / `settings_post`, lazy, atomic write, `Engine(settings_path=…)` / `GHOSTCUT_SETTINGS`), the live briefing (`offload_briefing`, `GET /api/offload/briefing`) and the help branch at the top of `offload_ask`, `app/ui/ghost.css` (tokens, glass surfaces, colour wash, motion), the mascot (`app/ui/ghost/mascot.js` `window.GhostMark(size, mood)`, `app/ui/ghost/ghost.svg`) and the six-step tour (`app/ui/onboard.js` `window.GCTour.open(ctx)`). The run stopped with Meta API error 402 (credit exhausted) before `is_help`, the Import page, the app.js hooks, the scan enrichment, tests or docs. |
+| Finish | **Claude Code** (Opus) | Kept Muse's files and fixed them in place; built the rest (below). |
+
+Muse Code token use: TBD (the owner fills this from the run log).
+
+## What Claude Code finished or fixed after the credit ran out
+
+- `src/director/offload.py`: `GHOST_BRIEFING` (the workflow, what Ghost understands, what it never does), appended to
+  `GHOST_DEVELOPER`; `is_help(text)`. `INTENT_SCHEMA` unchanged. Muse's help branch called `is_help` through
+  `getattr`, so until this it silently never fired.
+- `app/engine.py`: scan entries carry `camera_labels`, `date_start`, `date_end` and `sample` (file name only), copied
+  through `_scan_public`; `offload_ask` now reports `planner` (`muse` or `rules`) and, when a key is set but Spark did not
+  answer, `note: "Muse unavailable, using the built-in planner."` (`MUSE_UNAVAILABLE`). The old body of `offload_ask`
+  moved unchanged into `_offload_ask_intent`.
+- `app/ui/import.js` + `app/ui/import.css` (new): the Import view moved out of `app.js` and rebuilt —
+  `window.GCImport.mount(el, ctx)`, two columns above 1100 px, pipeline strip, card tiles (SVG glyph by camera,
+  clips, GB, mini scan bar, Ready chip, camera and date range, select to plan by click), destination tile with a
+  free-space meter and a "to copy" segment (red when short), Ghost panel (mascot, live status, Help, starter chips),
+  plan card (same `ghost-plan` / `.acts button.primary` classes, Include them, Transfer, Change), one persistent
+  transfer progress element (percent, file, bytes, ETA, client-side throughput), shoot bins with skeletons, duration
+  badges and `encodeURIComponent` thumb URLs, a Resume-a-job card, friendly cut-stage chips, `#edit` before the reload
+  on done, the scan poll stopped while the view is hidden (and restarted when shown), empty states (insert a card,
+  connect your SSD, scan error), resume of a finished or running transfer/cut on mount, and a Make-the-cut offer
+  after the copy when the request asked for the cut (never started automatically). Tiles redraw only when the
+  poll's data changes, so they keep focus and do not re-animate every 1.2 s.
+- `app/ui/app.js` hooks (marked `ONBOARD`): `window.GC = Object.assign(window.GC || {}, {…})` after `api()`;
+  `PAGES.import` → `window.GCImport.mount(el, window.GC)`; the start line opens on Import and starts the tour when
+  `/api/settings` says first run (an explicit view hash wins; a failed settings call counts as first run),
+  `#import/tour` forces it, `#import/notour` suppresses it.
+- `app/ui/onboard.js` fixes: the `?` Help button (`#helpBtn`) is wired; step 5 pre-fills the chat input; the card
+  step's auto-advance no longer jumps if the user already moved; the tour sits under `.modal` so Connections (opened
+  from step 2) shows above it, and its key handler steps aside while a modal is open; the Muse line says honestly that
+  Ghost falls back to the built-in planner. Tour styles live in `import.css` (Muse had left them unstyled).
+- `tests/test_onboard.py` (new, 17 tests) and `GhostUiTests` now reads `app.js` + `import.js` (assertions unchanged).
+
+## Muse unavailable
+
+The Meta API returns 402 for this account on submission day, so nothing on this page depends on it. Ghost's request
+reading tries Spark only when `MODEL_API_KEY` is set; any error (402, billing, network) returns to the rule parser,
+which handles the demo phrasings, and the reply carries the note above, shown under Ghost's answer. Help, the briefing,
+the tour, the plan, the transfer and the shoot bins never call Muse. A failed voice request that looks like a billing
+error tells the editor to type instead. The Muse path stays primary whenever a working key exists.
+
+## Build notes (Claude Code)
+
+- Hook edits in shared files only: `app/ui/app.js` (three, above), `app/engine.py` (Muse's settings/briefing/help code,
+  the scan keys, the `offload_ask` planner note), `src/director/offload.py`, `tests/test_offload.py`, `README.md`, this
+  log. `index.html` was not edited (its lines were pre-applied in `5407a3a`).
+- Not done (stretch): real card thumbnails, cheaper `offload_shoot`, recent-jobs list, per-card transfer breakdown,
+  mascot moods reacting to events, Reset tour.
+- Not verified: the page and tour were not opened in a browser or the Mac window (no servers on this machine during the
+  build), so layout, glass/backdrop rendering and motion are unchecked; no live ElevenLabs or Meta call (the 402 path is
+  tested with a mocked client raising); the background `director cut` itself was not run, and its own Muse stages'
+  behaviour on a 402 is outside this brief.
+- Full suite, run outside the Muse sandbox: 811 tests, OK, no errors (794 before this build + 17 new in
+  `tests/test_onboard.py`; the 11 `ps`/socket errors the brief names only occur inside the sandbox). After a last
+  one-line guard in `_scan_worker` (`date_range` errors never fail a ready scan) `test_offload`, `test_onboard` and
+  `test_engine_render` were re-run: 70 tests, OK.
+
+## Live test
+
+Left for the owner's agent.

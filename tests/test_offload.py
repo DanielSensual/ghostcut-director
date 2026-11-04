@@ -617,7 +617,9 @@ class GhostPlanTests(unittest.TestCase):
 
 class GhostUiTests(unittest.TestCase):
     def test_plan_card_buttons_and_scanning_line_are_wired(self) -> None:
-        js = (ROOT / "app" / "ui" / "app.js").read_text()
+        # ONBOARD: the Import view moved to import.js; read both.
+        js = ((ROOT / "app" / "ui" / "app.js").read_text()
+              + (ROOT / "app" / "ui" / "import.js").read_text())
         css = (ROOT / "app" / "ui" / "app.css").read_text()
         self.assertIn("Include them", js)
         self.assertIn("Scanning ", js)
