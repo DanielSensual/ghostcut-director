@@ -955,3 +955,94 @@ it up here.", 8 samples per camera) give continuous yaw C ≈ 10–14° and B �
 reverse; the held-turn segments are C 160.62–162.51 and B 162.51–164.40, and the shot list opens C 0.00–3.69 ("My mic,
 my drone has no microphone") then B — the cut the owner asked for. Every shot carries one reason. Full suite outside
 the sandbox: 771 tests, OK.
+
+# Build log: DRESS — dress the cut (`director dress`: title cards, music, a ghost that pops with a bing) (2026-11-04)
+
+| Step | By | What |
+|---|---|---|
+| Brief | Project owner, with Claude Code | `DRESS-BRIEF.md`: title cards, an ElevenLabs music bed and bing, and the ghost pop-up over the finished cut, plus B-roll by talking, after the owner's review of the app on submission day. |
+| Build (partial) | Meta **Muse Code** on **`muse-wonder-1.0`** | Commit `a6ca3c1`, `src/director/dress.py` only (1658 lines): `source_video`, the `dress.json` plan and its freshness stamp, output-timeline words and quote matching, the `check_card` gate, the Spark card request (`propose_cards_with_muse`), `ensure_assets` (cached ElevenLabs music/bing/pop, numpy bing/pop fallback, spend cap, 401/402/429 stops), `build_ghost_frames` (Pillow pop sequence from the brand icon), the ASS pill cards appended to the captions, `mix_commands` (duck the bed only), `encode_command` (one video pass), `render` (verify-then-replace, `-progress` into `dress/status.json`) and `plan`. The run stopped with Meta API error 402 (credit exhausted) before the grammar, CLI, engine, app or any test, and none of it had been run. |
+| Finish | **Claude Code** (Opus) | Fixed and finished Muse's module, kept its structure: the SFX-only mix graph left an unconnected `[key]` pad (ffmpeg would refuse it); wide pills ran off the frame edge at a fixed x (positions now clamp to a 60 px margin and the ghost follows the pill); the render ignored "no bing"; corners now alternate in time order; the encode pipes are closed. Added the built-in card planner (`rule_cards`), the note grammar (`parse_note`, `validate_op`, `op_label`, `apply_ops`, `set_card`, `summary`), `director dress plan\|render\|show`, the engine routes and helpers, the `build_project` link, `app/ui/dress.js` + `dress.css`, and `tests/test_dress.py` (40 tests). |
+
+Muse Code token use: TBD (the owner fills this from the run log; the run ended on a 402).
+
+## Muse unavailable: the built-in planner
+
+The Meta API returns 402 for this account and will not be available for the demo recording, so every Muse call in this
+feature has an offline path that stands on its own:
+
+- **Planning.** `dress.plan` still calls Spark first when a working key exists (`muse-spark-1.3`, one call,
+  6000 output tokens). On a 402, any other Spark error, a garbage reply, no `guestlist`, or a reply whose cards all fail
+  the gate, it falls back to `rule_cards` and adds the note **"Muse unavailable, using the built-in planner"** (shown by
+  the CLI and in the Dress panel; `design.model` reads `rules`). `--no-muse` (and the panel's Plan without a key) uses the
+  planner directly. The planner finds lexicon keywords on the output timeline (sync, captions, grade, angle, transcribe,
+  sound, Spark, crops, delivered, B-roll), tries a short house label for each ("Two cameras synced", "B-roll and
+  captions", "Color grade from log"…), and falls back to the words spoken around the keyword. Every candidate goes
+  through the same `check_card` gate as Muse's proposals (quote must be spoken, 60% of the card's words spoken within
+  ±20 s, no unspoken numbers, title window, spacing, at most 8), so it cannot invent claims. On the real job's
+  `captions.json` (read only) it plans five cards: 13.4 s "Two cameras synced", 23.3 s "B-roll and captions", 35.4 s
+  "Muse Spark sees the footage", 46.3 s "Cut angle to angle", 73.4 s "Color grade from log".
+- **Notes.** The typed and voice grammar was always deterministic (no Muse): "add B-roll where I say synced" plans a
+  card "Synced" at 14.26 s on the real job. Typed notes in the chat box are intercepted before `/api/muse`, so they work
+  with Spark down; anything the grammar does not match goes to the chat exactly as before (and then meets whatever Spark
+  does). Voice notes still need a transcription engine (Meta Voice Transcribe or local Whisper) to turn speech into text.
+- **Assets.** ElevenLabs is separate from Meta. Without an ElevenLabs key the bing and pop are synthesized locally (numpy,
+  note `dress_sfx_local`) and the render has no music bed (note `dress_music_unavailable`).
+
+## Build notes
+
+- Hook edits in shared files, each marked `DRESS`: `src/director/cli.py` (`command_dress` and the `dress` subparser);
+  `app/engine.py` (`_dress`, `_dress_checked`, `_dress_notes` called at the top of `_store_voice`,
+  `_dress_split_apply` called in `voice_apply` before `vm.apply_notes`, `_dress_split_ops` for the `ops=` path, the
+  methods `dress_get` / `dress_plan` / `dress_edit` / `dress_render` / `_dress_worker` / `dress_note`, `GET /api/dress`
+  after the `/api/cutjob/rerender` line, and `POST /api/dress/plan|render|edit|note` after the `/api/cutjob/rerender`
+  branch); `app/cutjob.py` (one `_dress_project(...)` call in `build_project`, before `project.json` is written, and the
+  helper it calls); `app/ui/app.js` (the `GCDress.mount` call after `loadTaste();`, `GCDress.refresh` in `applyResult`,
+  and the dress text in `voiceNoteCard`). `index.html` was already wired (commit `5407a3a`) and was not touched;
+  `voice.py`, `connect.py`, `captions.py` and `finish.py` were not touched.
+- `/api/dress/edit` (the panel's card toggle, Remove, and the music/ghost/bing switches) is one route beyond the brief's
+  list; it goes through the same `validate_op` / `apply_ops` checks.
+- `project["cutJob"]["dress"]` appears only once a `dress.json` exists, so a never-dressed job's project is unchanged
+  (the existing `test_cutjob` mapping test pins `cutJob` exactly).
+- `render` never writes `cut.mp4`, `cut.clean.mp4`, `finish.json` or `angles.json`; it writes `cut.dressed.next.mp4`,
+  checks duration (±0.1 s), audio and size, then `os.replace`s it to `cut.dressed.mp4`.
+- Rights: ElevenLabs outputs are licensed by the plan on the key that generated them; the owner's agent confirms that plan
+  allows commercial use of generated music and sound effects before the demo uses them. Each asset in `dress.json`
+  records provider, model, prompt and `finish._licence`'s note ("subject to the provider's terms"); nothing more is
+  claimed. The local bing/pop are synthesized in code. The ghost sprite is the owner's own brand art
+  (`docs/brand/NOTICE.md`). Generated media stays in `job/dress/`; none is committed.
+- Not built: the `--ai-video` stretch (the flag prints "not built, use DRESS stretch"; no `xai.py`).
+
+## Tests
+
+- `tests/test_dress.py`: 40 tests, offline (fake guestlist, fake ElevenLabs callers, the key helper patched to None and
+  the HTTP helper patched to fail): the gate cases, quote matching, ASS events and appending, the pill clamp, ghost frames
+  with Pillow, the encode and mix command builders (a job folder with a space, comma and colon in its name), assets
+  (cache hit makes zero calls, spend cap, 401 and 402 stop, empty body, no key), Spark pass / 402 / garbage / missing
+  guestlist / `--no-muse`, the grammar table, the engine helpers by direct call (`dress_note`, `_dress_notes`,
+  `_dress_split_apply`, the render busy guard), `build_project` fresh and stale, the CLI, and an end-to-end render of a
+  6 s synthetic `testsrc2` + `sine` cut with one card, the ghost and pre-seeded assets (duration, audio, 1920x1080,
+  `cut.mp4` byte-identical).
+- Full suite (outside the Muse sandbox, run once at the end): 834 tests, OK (794 on the tree before this build plus the 40 new ones; no `ps`/socket errors outside the sandbox).
+
+## Not verified
+
+- Nothing was rendered from the real job and no frame of a dressed cut was looked at: the pill's centring on the text
+  (`\an5` with the drawing from `m 0 …`), the ghost's place beside the pill, caption collisions at the top corners and the
+  title overlap are untested by eye. The synthetic end-to-end render checks only duration, audio and frame size.
+- No live ElevenLabs call (music bed, bing), and no live Spark call; the Spark path is tested only against a fake.
+- The Dress panel, the chat interceptor and the Kitchen hand-off were checked with `node --check` only; no browser or
+  WebGL was run.
+- Render time on the real 130 s cut is unmeasured (target 1 to 3 minutes).
+
+## Live test (left for the owner's agent)
+
+1. Restart the engine with `ELEVENLABS_API_KEY` (and `XAI_API_KEY` if used) in the process environment only.
+2. `director connect test elevenlabs`.
+3. `director dress plan --job <job>` (expect the Muse-unavailable note while the Meta credit is out); check the cards
+   against the transcript.
+4. `director dress render --job <job>` and time it.
+5. Look at frames: caption collisions at the top corners, the title overlap (0 to 3.5 s), the pill centred on its text,
+   the ghost beside the pill; listen for the bing under speech and the bed level.
+6. In the app: type "add B-roll where I say synced" (expect a card "Synced" near 14.3 s) and "turn the music down";
+   Accept, Render, switch Dressed/Plain.

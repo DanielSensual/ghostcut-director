@@ -13,7 +13,9 @@ voice (bing/pop sit beside it, never ducked).
 
 Built by Muse Code on muse-wonder-1.0 from
 docs/muse-code/DRESS-BRIEF.md, after the owner's review of the app on
-submission day.
+submission day; Muse's run stopped when its Meta API credit ran out.
+Finished, fixed and tested by Claude Code (Opus), which added the
+built-in planner used when Muse is unavailable and the note grammar.
 """
 from __future__ import annotations
 
@@ -1039,27 +1041,38 @@ def pill_path(width: float, height: float) -> str:
         f"b 0 {h:.0f} 0 {h - r:.0f} 0 {r:.0f}")
 
 
-def card_position(card: dict, index: int) -> tuple[int, int]:
-    """(x, y) for a card on 1920x1080, clear of the lower third."""
+CARD_Y = 150
+CARD_MARGIN_X = 60
+PILL_PAD_X = 56
+
+
+def card_position(card: dict, index: int,
+                  pill_width: float = 0.0) -> tuple[int, int]:
+    """(x, y) for a card on 1920x1080, clear of the lower third.
+
+    The pill is centred on x (\\an5), so a wide pill moves inward to
+    keep CARD_MARGIN_X from the frame edge.
+    """
     pos = str(card.get("pos") or "")
-    if pos == "top-right":
-        return (1590, 150)
+    if pos not in ("top-left", "top-right", "top-center"):
+        pos = "top-left" if index % 2 == 0 else "top-right"
+    half = max(0.0, float(pill_width)) / 2
     if pos == "top-center":
-        return (960, 150)
-    if pos == "top-left":
-        return (330, 150)
-    return (330, 150) if index % 2 == 0 else (1590, 150)
+        return (960, CARD_Y)
+    if pos == "top-right":
+        return (int(min(1590, 1920 - CARD_MARGIN_X - half)), CARD_Y)
+    return (int(max(330, CARD_MARGIN_X + half)), CARD_Y)
 
 
 def ghost_position(card: dict, index: int,
                    pill_width: float) -> tuple[int, int]:
     """(x, y) of the ghost sprite centre beside its pill."""
-    x, y = card_position(card, index)
-    offset = int(pill_width / 2 + 90)
+    x, y = card_position(card, index, pill_width)
+    offset = int(pill_width / 2 + 130)
     if card.get("pos") == "top-right" or (
             not card.get("pos") and index % 2 == 1):
-        return (x - offset - 40, y)
-    return (x + offset + 40, y)
+        return (x - offset, y)
+    return (x + offset, y)
 
 
 def build_ass(cards, *, base_ass: str | None = None, measurer=None,  # noqa: ANN001
@@ -1079,8 +1092,8 @@ def build_ass(cards, *, base_ass: str | None = None, measurer=None,  # noqa: ANN
         except (TypeError, ValueError):
             continue
         text = str(card.get("text", ""))
-        x, y = card_position(card, index)
-        pill_w = float(measure(text)) + 56
+        pill_w = float(measure(text)) + PILL_PAD_X
+        x, y = card_position(card, index, pill_w)
         pill_h = 84.0
         drawing = pill_path(pill_w, pill_h)
         start_s = captions_mod.format_ass_time(start)
@@ -1182,9 +1195,12 @@ def duck_command(voice: Path, bed_mix: Path | None, sfx_mix: Path | None,
                  f"[bed][key]{duck}[ducked];"
                  f"[v][ducked]amix=inputs=2:normalize=0[out]")
     else:
+        # No bed: nothing to duck, so no asplit (an unused [key] pad
+        # would fail the graph). Fixed by Claude Code.
         args = ["ffmpeg", "-v", "error", "-y", "-i", str(voice),
                 "-i", str(sfx_mix)]
-        graph = f"{head}[v][1:a]amix=inputs=2:normalize=0[out]"
+        graph = ("[0:a]pan=stereo|c0=c0|c1=c0[v];"
+                 "[v][1:a]amix=inputs=2:normalize=0[out]")
     return args + ["-filter_complex", graph, "-map", "[out]",
                    "-ac", "2", "-ar", "48000",
                    "-c:a", "pcm_s16le", str(out)]
@@ -1270,7 +1286,7 @@ def encode_command(*, source: Path, title_png: Path | None,
             at = float(card.get("t", 0.0))
         except (TypeError, ValueError):
             at = 0.0
-        pill_w = float(measure(str(card.get("text", "")))) + 56
+        pill_w = float(measure(str(card.get("text", "")))) + PILL_PAD_X
         gx, gy = ghost_position(card, pos, pill_w)
         # Overlay top-left from the sprite centre (320 canvas, sprite centred).
         ox = gx - 160
@@ -1428,6 +1444,8 @@ def render(job_dir: Path, *, measurer=None) -> dict:  # noqa: ANN001
         bing_asset = by_kind.get("bing")
         if bing_asset is not None and not bing_asset.exists():
             bing_asset = None
+        if not bool(ghost_cfg.get("sfx", True)):
+            bing_asset = None  # "no bing" / "no sound effects"
         music_gain = float(music_cfg.get("gain_db", MUSIC_GAIN_DEFAULT))
         target = _target_lufs(job)
         commands = mix_commands(
@@ -1496,6 +1514,9 @@ def render(job_dir: Path, *, measurer=None) -> dict:  # noqa: ANN001
                               "Dressing the cut")
         proc.wait()
         stderr = proc.stderr.read() if proc.stderr else ""
+        proc.stdout.close()
+        if proc.stderr:
+            proc.stderr.close()
         if proc.returncode != 0:
             try:
                 next_out.unlink(missing_ok=True)
@@ -1572,8 +1593,13 @@ def _default_plan(job: Path, source: Path, duration: float) -> dict:
 
 def plan(job_dir: Path, *, model: str = DEFAULT_MODEL,
          max_usd: float = 5.0, max_provider_usd: float = DEFAULT_MAX_PROVIDER_USD,
-         no_muse: bool = False, transport=None, key: str | None = None) -> dict:  # noqa: ANN001
-    """Write dress.json and cache assets. Returns the payload."""
+         no_muse: bool = False, transport=None, key: str | None = None,
+         propose=None) -> dict:  # noqa: ANN001
+    """Write dress.json and cache assets. Returns the payload.
+
+    `propose` (tests) replaces `propose_cards_with_muse`.
+    """
+    propose = propose or propose_cards_with_muse
     job = Path(job_dir)
     job.mkdir(parents=True, exist_ok=True)
     source = source_video(job)
@@ -1589,7 +1615,8 @@ def plan(job_dir: Path, *, model: str = DEFAULT_MODEL,
         payload["rendered"] = existing.get(
             "rendered", payload["rendered"])
     kept = [c for c in (existing.get("cards", []) or [])
-            if isinstance(c, dict) and c.get("source") != "muse"]
+            if isinstance(c, dict)
+            and c.get("source") not in ("muse", "rule")]
     words = load_output_words(job)
     lines = load_caption_lines(job, words)
     notes: list[str] = []
@@ -1597,18 +1624,16 @@ def plan(job_dir: Path, *, model: str = DEFAULT_MODEL,
     spend = 0.0
     cached = False
     auto_cards: list[dict] = []
-    if no_muse:
-        notes.append("dress_plan_no_muse:no auto cards (--no-muse)")
-    elif not lines or not words:
+    muse_failed = False
+    if not lines or not words:
         notes.append("dress_plan_no_transcript:no auto cards")
+    elif no_muse:
+        notes.append("dress_plan_no_muse:using the built-in planner")
     else:
         try:
-            raw_cards, spend, cached, plan_warnings = (
-                propose_cards_with_muse(lines=lines, model=model,
-                                        max_usd=max_usd))
+            raw_cards, spend, cached, plan_warnings = propose(
+                lines=lines, model=model, max_usd=max_usd)
             warnings.extend(plan_warnings)
-            if plan_warnings and not raw_cards:
-                notes.append(plan_warnings[0])
             accepted: list[dict] = list(kept)
             for raw in raw_cards:
                 card, reason = check_card(raw, words, duration, accepted)
@@ -1620,17 +1645,31 @@ def plan(job_dir: Path, *, model: str = DEFAULT_MODEL,
                 auto_cards.append(card)
                 if len(auto_cards) >= LIMITS["max_cards"]:
                     break
+            muse_failed = not auto_cards
+            if muse_failed and plan_warnings:
+                notes.append(plan_warnings[0])
         except DressUnavailable as error:
+            muse_failed = True
             notes.append(f"dress_plan_unavailable:{error}")
+    # Muse unavailable (402 credit, no key, network, garbage reply) or
+    # --no-muse: the deterministic transcript planner fills in, so a
+    # no-key demo still has cards. Added by Claude Code.
+    if words and lines and (no_muse or muse_failed):
+        auto_cards = rule_cards(words, duration, existing=kept)
+        if not no_muse:
+            notes.append(MUSE_FALLBACK_NOTE)
     # Renumber muse+kept together in time order, ids stable by order.
     all_cards = sorted(kept + auto_cards,
                         key=lambda c: float(c.get("t", 0.0)))
     for index, card in enumerate(all_cards, 1):
         card["id"] = f"c{index}"
-        if not card.get("pos"):
-            card["pos"] = "top-left" if index % 2 == 1 else "top-right"
+        # Alternate corners in time order (Claude Code: check_card picks
+        # by acceptance order, which is not time order).
+        card["pos"] = "top-left" if index % 2 == 1 else "top-right"
     payload["cards"] = all_cards
-    payload["design"] = {"model": model, "cached": cached,
+    used_rules = bool(words and lines and (no_muse or muse_failed))
+    payload["design"] = {"model": "rules" if used_rules else model,
+                         "cached": cached,
                          "spend_usd": round(float(spend), 4)}
     music_prompt = str((payload.get("music") or {}).get(
         "prompt") or DEFAULT_MUSIC_PROMPT)
@@ -1655,4 +1694,606 @@ def plan(job_dir: Path, *, model: str = DEFAULT_MODEL,
     return payload
 
 
+# ------------------------------------------------------------ rule planner
+# Everything below was added by Claude Code (Opus) after Muse Code's run
+# stopped on the Meta API 402: the deterministic planner that stands in
+# for Spark, the note grammar, the op checks and the plan editor.
 
+MUSE_FALLBACK_NOTE = "Muse unavailable, using the built-in planner"
+
+# Spoken keyword -> house labels to try (each must still pass
+# `check_card`: 60% of its words spoken within +-20 s). When no label
+# passes, the card shows the words spoken around the keyword.
+RULE_LEXICON: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
+    (("synced", "sync", "syncing"),
+     ("Two cameras synced", "Cameras synced", "Synced by sound")),
+    (("captions", "caption", "subtitles"),
+     ("B-roll and captions", "Captions added", "Word-by-word captions")),
+    (("grade", "graded", "grading"),
+     ("Color grade from log", "Color graded", "Color grade")),
+    (("angle", "angles"), ("Cut angle to angle", "Every angle")),
+    (("transcribe", "transcript", "whisper"),
+     ("Whisper and transcribe", "Transcribed")),
+    (("enhanced", "audio", "sound"), ("Sound enhanced", "Clean sound")),
+    (("spark",), ("Muse Spark sees the footage", "Muse Spark")),
+    (("crops", "crop", "reframe", "vertical"),
+     ("Different crops", "Reframed crops")),
+    (("delivered", "deliver"),
+     ("Completed and delivered", "Delivered to the client")),
+    (("b-roll", "broll"), ("B-roll added", "B-roll")),
+)
+_RULE_EDGE_FILLER = frozenset({
+    "the", "a", "an", "and", "or", "to", "of", "in", "on", "by", "for",
+    "with", "is", "it", "at", "as", "be", "are", "was", "so", "that",
+    "this", "them", "they", "you", "your", "we", "our", "i", "me", "my",
+    "he", "she", "his", "her", "its", "it's", "basically", "just",
+    "like", "um", "uh", "really", "very", "can", "will", "also", "all",
+    "get", "got", "there", "here", "what", "which", "who", "but", "if",
+    "then", "has", "have", "had", "do", "did", "does", "even", "being",
+    "though", "about", "some", "any", "from",
+})
+RULE_MAX_CARDS = 6
+
+
+def _clean_word(text: str) -> str:
+    return re.sub(r"^[^\w]+|[^\w]+$", "", text or "")
+
+
+def _phrase_around(words: list[OutWord], index: int,
+                   before: int = 2, after: int = 2) -> tuple[int, int]:
+    """(start, end) of a 1-4 word phrase around words[index]. Pure.
+
+    Filler words are trimmed from both edges; an immediately repeated
+    token ("B-roll, roll") is dropped by stopping before it.
+    """
+    lo = max(0, index - before)
+    hi = min(len(words), index + after + 1)
+    # Do not cross a long pause (a sentence break) on either side.
+    for j in range(index, lo, -1):
+        if words[j].start_s - words[j - 1].end_s > 0.6:
+            lo = j
+            break
+    for j in range(index + 1, hi):
+        if words[j].start_s - words[j - 1].end_s > 0.6:
+            hi = j
+            break
+    while lo < index and normalize_token(words[lo].text) in _RULE_EDGE_FILLER:
+        lo += 1
+    while hi - 1 > index and normalize_token(
+            words[hi - 1].text) in _RULE_EDGE_FILLER:
+        hi -= 1
+    # Cut at a repeated token so "b-roll, roll" stays "b-roll".
+    seen: set[str] = set()
+    for j in range(lo, hi):
+        toks = _want_tokens(words[j].text)
+        if any(t in seen for t in toks):
+            if j > index:
+                hi = j
+                break
+            lo = j + 1
+            seen = set()
+            continue
+        seen.update(toks)
+    while hi - lo > 4:
+        if index - lo > hi - 1 - index:
+            lo += 1
+        else:
+            hi -= 1
+    return lo, hi
+
+
+def _sentence_case(words: list[str]) -> str:
+    text = " ".join(w for w in (_clean_word(x) for x in words) if w)
+    if not text:
+        return ""
+    return text[0].upper() + text[1:]
+
+
+def rule_cards(words, duration_s: float, *, existing=None,  # noqa: ANN001
+               max_cards: int = RULE_MAX_CARDS) -> list[dict]:
+    """Deterministic cards from the spoken transcript (no network). Pure.
+
+    Finds lexicon keywords on the output timeline, builds a short card
+    from the words spoken around each one, and passes every candidate
+    through `check_card`, the same gate Muse's proposals face. One card
+    per topic, spread out so they do not bunch up.
+    """
+    out_words = list(words or [])
+    if out_words and not isinstance(out_words[0], OutWord):
+        out_words = _as_out_words(out_words)
+    if not out_words or duration_s <= 0:
+        return []
+    accepted: list[dict] = [dict(c) for c in (existing or [])]
+    spacing = max(6.0, float(duration_s) / (max_cards * 2.5))
+    candidates: list[tuple[int, int]] = []  # (topic, word index)
+    for index, word in enumerate(out_words):
+        toks = _want_tokens(word.text)
+        joined = "-".join(toks)
+        for topic, (keys, _labels) in enumerate(RULE_LEXICON):
+            if joined in keys or any(t in keys for t in toks):
+                candidates.append((topic, index))
+                break
+    made: list[dict] = []
+    # Walk topics in priority order; the first clean hit per topic wins.
+    for topic, (_keys, labels) in enumerate(RULE_LEXICON):
+        if len(made) >= max_cards:
+            break
+        for cand_topic, index in candidates:
+            if cand_topic != topic:
+                continue
+            lo, hi = _phrase_around(out_words, index)
+            spoken = [w.text for w in out_words[lo:hi]]
+            quote = " ".join(_clean_word(w) for w in spoken)
+            t_guess = out_words[lo].start_s - 0.10
+            if any(abs(float(c.get("t", 0.0)) - t_guess) < spacing
+                   for c in accepted if c.get("enabled", True)):
+                continue
+            keyword = _clean_word(out_words[index].text)
+            card = None
+            for text in (*labels, _sentence_case(spoken)):
+                if not text or len(text.split()) > 6:
+                    continue
+                raw = {"text": text, "quote": quote, "source": "rule",
+                       "why": f"Built-in planner: you say \u201c{keyword}\u201d here"}
+                card, _reason = check_card(raw, out_words, duration_s,
+                                           accepted)
+                if card is not None:
+                    break
+            if card is None:
+                continue
+            card["source"] = "rule"
+            accepted.append(card)
+            made.append(card)
+            break
+    made.sort(key=lambda c: c["t"])
+    return made
+
+
+# ------------------------------------------------------------ grammar
+
+_Q = r"[\"'“”‘’]?"
+_END = r"\s*[.!?]*\s*$"
+_ADD_SAYS = re.compile(
+    r"\b(?:add|put|drop in|give me|show)\s+(?:a\s+|an\s+|some\s+|the\s+)?"
+    r"(?:title\s+card|card|title|pop-?\s?up|text)\s+(?:that\s+)?"
+    r"(?:says|saying|reading|reads)\s*:?\s*" + _Q + r"(?P<x>.+?)" + _Q +
+    r"(?:\s*,?\s+(?:where|when)\s+i\s+say\s+" + _Q + r"(?P<y>.+?)" + _Q +
+    r")?(?:\s+here)?" + _END, re.IGNORECASE)
+_ADD_WHERE = re.compile(
+    r"\b(?:add|put|drop in|give me|show)\s+(?:a\s+|an\s+|some\s+|the\s+)?"
+    r"(?:b[- ]?roll|title\s+card|card|title|pop-?\s?up)\s+"
+    r"(?:where|when)\s+i\s+say\s+" + _Q + r"(?P<y>.+?)" + _Q + _END,
+    re.IGNORECASE)
+_REMOVE = re.compile(
+    r"\b(?:remove|delete|lose|drop|kill|cut)\s+(?:the|this|that)\s+"
+    r"(?:title\s+card|card|title|pop-?\s?up)"
+    r"(?:\s+(?:at|where\s+i\s+say|when\s+i\s+say)\s+" + _Q + r"(?P<y>.+?)"
+    + _Q + r"|\s+(?P<here>here|now))?" + _END, re.IGNORECASE)
+_NO_CARDS = re.compile(r"\bno\s+(?:more\s+)?(?:title\s+)?cards\b", re.I)
+_MORE_CARDS = re.compile(r"\bmore\s+(?:title\s+)?cards\b", re.I)
+_FEWER_CARDS = re.compile(r"\b(?:fewer|less)\s+(?:title\s+)?cards\b", re.I)
+_NO_MUSIC = re.compile(r"\b(?:no|kill\s+the|lose\s+the|remove\s+the)\s+music\b", re.I)
+_ADD_MUSIC = re.compile(r"\badd\s+(?:some\s+|the\s+)?music\b", re.I)
+_MUSIC_UP = re.compile(
+    r"\b(?:more\s+music|music\s+louder|louder\s+music|turn\s+(?:the\s+)?"
+    r"music\s+up|turn\s+up\s+the\s+music|raise\s+the\s+music)\b", re.I)
+_MUSIC_DOWN = re.compile(
+    r"\b(?:less\s+music|quieter\s+music|music\s+quieter|music\s+softer|"
+    r"turn\s+(?:the\s+)?music\s+down|turn\s+down\s+the\s+music|"
+    r"lower\s+the\s+music)\b", re.I)
+_MUSIC_PROMPT = re.compile(
+    r"\b(?:different\s+music\s*:?\s*|make\s+the\s+music\s+)(?P<z>.+?)" + _END,
+    re.I)
+_NO_GHOST = re.compile(r"\bno\s+(?:more\s+)?ghosts?\b", re.I)
+_NO_SFX = re.compile(r"\bno\s+(?:more\s+)?(?:bings?|sound\s+effects?|sfx)\b",
+                     re.I)
+MUSIC_STEP_DB = 4.0
+MUSIC_MIN_DB = -30.0
+MUSIC_MAX_DB = -10.0
+DEFAULT_CARD_S = 2.6
+MUSIC_REPLAN_USD = 0.375
+
+
+def _anchor(quote: str, words: list[OutWord]) -> tuple[float | None, dict]:
+    found = locate_quote(quote, words)
+    if found is None:
+        return None, {"quote": quote, "word_start": None, "word_end": None}
+    start, end = found
+    return (round(words[start].start_s - 0.10, 3),
+            {"quote": quote, "word_start": start, "word_end": end})
+
+
+def _strip_text(text: str) -> str:
+    return " ".join(str(text or "").strip().strip("\"'“”").split())
+
+
+def parse_note(text: str, *, job_dir: Path | None = None,
+               playhead_s: float | None = None,
+               words=None) -> list[dict] | None:  # noqa: ANN001
+    """A typed or spoken dress note -> dress ops, or None. Offline.
+
+    Deterministic regex plus quote matching; first match wins. Ops are
+    unchecked here (`validate_op` adds checks).
+    """
+    raw = " ".join(str(text or "").split())
+    if not raw:
+        return None
+    if words is None:
+        words = load_output_words(Path(job_dir)) if job_dir else []
+    out_words = list(words or [])
+    if out_words and not isinstance(out_words[0], OutWord):
+        out_words = _as_out_words(out_words)
+    at = None
+    if playhead_s is not None:
+        try:
+            at = round(float(playhead_s), 3)
+        except (TypeError, ValueError):
+            at = None
+
+    m = _ADD_SAYS.search(raw)
+    if m:
+        card_text = _strip_text(m.group("x"))
+        quote = _strip_text(m.group("y") or "")
+        if quote:
+            t, anchor = _anchor(quote, out_words)
+        else:
+            t, anchor = at, {"quote": "", "word_start": None,
+                             "word_end": None}
+        return [{"op": "dress_add_card", "text": card_text, "t": t,
+                 "d": DEFAULT_CARD_S, "anchor": anchor, "source": "typed"}]
+    m = _ADD_WHERE.search(raw)
+    if m:
+        quote = _strip_text(m.group("y"))
+        t, anchor = _anchor(quote, out_words)
+        tokens = [_clean_word(w) for w in quote.split()]
+        card_text = " ".join(w[:1].upper() + w[1:] for w in tokens if w)
+        card_text = " ".join(card_text.split()[:6])
+        return [{"op": "dress_add_card", "text": card_text, "t": t,
+                 "d": DEFAULT_CARD_S, "anchor": anchor, "source": "typed"}]
+    m = _REMOVE.search(raw)
+    if m:
+        quote = _strip_text(m.group("y") or "")
+        t = _anchor(quote, out_words)[0] if quote else at
+        return [{"op": "dress_remove_card", "t": t, "quote": quote}]
+    if _NO_CARDS.search(raw):
+        return [{"op": "dress_set_cards", "mode": "off"}]
+    if _FEWER_CARDS.search(raw):
+        return [{"op": "dress_set_cards", "mode": "fewer"}]
+    if _MORE_CARDS.search(raw):
+        return [{"op": "dress_set_cards", "mode": "more"}]
+    if _NO_MUSIC.search(raw):
+        return [{"op": "dress_set_music", "enabled": False}]
+    if _MUSIC_DOWN.search(raw):
+        return [{"op": "dress_set_music", "gain_delta_db": -MUSIC_STEP_DB}]
+    if _MUSIC_UP.search(raw):
+        return [{"op": "dress_set_music", "gain_delta_db": MUSIC_STEP_DB}]
+    if _ADD_MUSIC.search(raw):
+        return [{"op": "dress_set_music", "enabled": True}]
+    m = _MUSIC_PROMPT.search(raw)
+    if m:
+        prompt = _strip_text(m.group("z"))
+        if prompt:
+            return [{"op": "dress_set_music", "prompt": prompt[:300]}]
+    if _NO_GHOST.search(raw):
+        return [{"op": "dress_set_ghost", "enabled": False}]
+    if _NO_SFX.search(raw):
+        return [{"op": "dress_set_sfx", "enabled": False}]
+    return None
+
+
+def _check(ok: bool, text: str, hard: bool = True) -> dict:
+    """The voice._blocked/_passed shape {ok, text, hard}."""
+    return {"ok": bool(ok), "text": text, "hard": bool(hard and not ok)}
+
+
+def _plan_duration(job_dir: Path | None, plan_payload: dict | None) -> float:
+    try:
+        value = float(((plan_payload or {}).get("source") or {}).get(
+            "duration_s") or 0.0)
+    except (TypeError, ValueError):
+        value = 0.0
+    if value > 0 or job_dir is None:
+        return value
+    job = Path(job_dir)
+    source = source_video(job)
+    return _duration(job, source if source.exists() else None)
+
+
+def _enabled_cards(plan_payload: dict | None) -> list[dict]:
+    return [c for c in ((plan_payload or {}).get("cards") or [])
+            if isinstance(c, dict) and c.get("enabled", True)]
+
+
+def _nearest_card(cards: list[dict], t: float | None) -> dict | None:
+    if t is None or not cards:
+        return None
+    return min(cards, key=lambda c: abs(
+        float(c.get("t", 0.0)) + float(c.get("d", 0.0)) / 2 - t))
+
+
+def op_label(op: dict) -> str:
+    """The one-line label the proposal card shows. Pure."""
+    name = op.get("op", "")
+    t = op.get("t")
+    at = f" @{float(t):.1f}s" if isinstance(t, (int, float)) else ""
+    if name == "dress_add_card":
+        return f"Card: {op.get('text', '')}{at}"
+    if name == "dress_remove_card":
+        target = op.get("card_text") or op.get("quote") or "nearest card"
+        return f"Remove card: {target}{at}"
+    if name == "dress_set_cards":
+        return {"off": "Cards: off", "more": "Cards: plan more",
+                "fewer": "Cards: keep every other"}.get(
+                    op.get("mode"), "Cards")
+    if name == "dress_set_music":
+        if "prompt" in op:
+            return f"Music: {op['prompt'][:60]}"
+        if "gain_delta_db" in op:
+            delta = float(op["gain_delta_db"])
+            label = f"Music {'up' if delta > 0 else 'down'} {abs(delta):.0f} dB"
+            if "gain_db" in op:
+                label += f" (to {float(op['gain_db']):.0f} dB)"
+            return label
+        return "Music: on" if op.get("enabled") else "Music: off"
+    if name == "dress_set_ghost":
+        return "Ghost: on" if op.get("enabled") else "Ghost: off"
+    if name == "dress_set_sfx":
+        return "Bing: on" if op.get("enabled") else "Bing: off"
+    return name
+
+
+def validate_op(op: dict, *, job_dir: Path | None = None,
+                plan_payload: dict | None = None,
+                duration_s: float | None = None) -> dict:
+    """Code decides: a checked copy with checks, blocked, label, why."""
+    from .voice import UNPLACED_MESSAGE  # read-only import
+
+    out = dict(op)
+    if plan_payload is None and job_dir is not None:
+        plan_payload = load_plan(Path(job_dir))
+    duration = float(duration_s) if duration_s else _plan_duration(
+        job_dir, plan_payload)
+    cards = _enabled_cards(plan_payload)
+    checks: list[dict] = []
+    name = out.get("op", "")
+    if name == "dress_add_card":
+        text = _strip_text(out.get("text", ""))
+        out["text"] = text
+        n_words = len(text.split())
+        checks.append(_check(1 <= n_words <= 6 and not _is_pathlike(text),
+                             f"Text is {n_words} word(s), plain"
+                             if 1 <= n_words <= 6 and not _is_pathlike(text)
+                             else "Card text must be 1 to 6 plain words"))
+        t = out.get("t")
+        if t is None:
+            checks.append(_check(False, UNPLACED_MESSAGE))
+        else:
+            t = round(max(0.0, float(t)), 3)
+            d = min(LIMITS["max_card_s"], max(LIMITS["min_card_s"], float(
+                out.get("d") or DEFAULT_CARD_S)))
+            if duration and t + d > duration - 1.0:
+                d = max(LIMITS["min_card_s"], round(duration - 1.0 - t, 3))
+            out["t"], out["d"] = t, round(d, 3)
+            checks.append(_check(t >= FIRST_CARD_S - 1e-9,
+                                 f"Starts after the title ({FIRST_CARD_S:.1f}s)"
+                                 if t >= FIRST_CARD_S - 1e-9 else
+                                 f"Inside the title (cards start at {FIRST_CARD_S:.1f}s)"))
+            fits = not duration or t + d <= duration - 1.0 + 1e-9
+            checks.append(_check(fits, "Ends before the last second" if fits
+                                 else "Too close to the end of the cut"))
+            clash = None
+            for other in cards:
+                ot, od = float(other.get("t", 0.0)), float(other.get("d", 0.0))
+                if not (t >= ot + od + LIMITS["min_gap_s"] - 1e-9
+                        or ot >= t + d + LIMITS["min_gap_s"] - 1e-9):
+                    clash = other
+                    break
+            checks.append(_check(clash is None,
+                                 "Clear of the other cards" if clash is None
+                                 else f"Overlaps the card “{clash.get('text', '')}”"))
+        room = len(cards) < LIMITS["max_cards"]
+        checks.append(_check(room, f"{len(cards) + 1} of {LIMITS['max_cards']} cards"
+                             if room else f"Already {LIMITS['max_cards']} cards"))
+        anchor = out.get("anchor") or {}
+        out["why"] = (f"Anchored where you say “{anchor['quote']}”"
+                      if anchor.get("word_start") is not None
+                      else "At the playhead" if t is not None else "")
+    elif name == "dress_remove_card":
+        target = _nearest_card(cards, out.get("t"))
+        if target is None:
+            checks.append(_check(False, "No card there to remove"
+                                 if cards else "There are no cards yet"))
+        else:
+            out["card_id"] = target.get("id")
+            out["card_text"] = target.get("text", "")
+            out["t"] = target.get("t")
+            checks.append(_check(True, f"Card “{target.get('text', '')}”"))
+        out["why"] = "The card nearest to that moment"
+    elif name == "dress_set_cards":
+        mode = out.get("mode")
+        if mode == "fewer":
+            checks.append(_check(len(cards) >= 2, f"Keeps {(len(cards) + 1) // 2} of {len(cards)}"
+                                 if len(cards) >= 2 else "Fewer than two cards"))
+        elif mode == "more":
+            checks.append(_check(len(cards) < LIMITS["max_cards"],
+                                 "Adds cards with the built-in planner"
+                                 if len(cards) < LIMITS["max_cards"]
+                                 else f"Already {LIMITS['max_cards']} cards"))
+        else:
+            checks.append(_check(True, f"Hides {len(cards)} card(s)"))
+        out["why"] = "Card plan"
+    elif name == "dress_set_music":
+        music = (plan_payload or {}).get("music") or {}
+        if "gain_delta_db" in out:
+            current = float(music.get("gain_db", MUSIC_GAIN_DEFAULT))
+            target = max(MUSIC_MIN_DB, min(MUSIC_MAX_DB,
+                                           current + float(out["gain_delta_db"])))
+            out["gain_db"] = round(target, 1)
+            moved = abs(target - current) > 1e-9
+            checks.append(_check(moved, f"Bed {current:.0f} → {target:.0f} dB"
+                                 if moved else f"Already at the limit ({current:.0f} dB)"))
+        elif "prompt" in out:
+            checks.append(_check(True, "New bed prompt"))
+            checks.append({"ok": False, "hard": False,
+                           "text": f"The next dress plan regenerates it (costs about ${MUSIC_REPLAN_USD})"})
+        else:
+            checks.append(_check(True, "Music on" if out.get("enabled") else "Music off"))
+        out["why"] = "Music bed"
+    elif name in ("dress_set_ghost", "dress_set_sfx"):
+        checks.append(_check(True, op_label(out)))
+        out["why"] = "Ghost pop-up" if name == "dress_set_ghost" else "Card bing"
+    else:
+        checks.append(_check(False, "Not a dress change"))
+    out["checks"] = checks
+    out["blocked"] = any(not c["ok"] and c["hard"] for c in checks)
+    out["label"] = op_label(out)
+    return out
+
+
+def _empty_plan(job: Path) -> dict:
+    source = source_video(job)
+    duration = _duration(job, source if source.exists() else None)
+    if source.exists():
+        return _default_plan(job, source, duration)
+    payload = _default_plan(job, job / "cut.mp4", duration)
+    return payload
+
+
+def apply_ops(job_dir: Path, ops: list[dict]) -> dict:
+    """Apply checked, unblocked dress ops to dress.json. Returns it."""
+    job = Path(job_dir)
+    payload = load_plan(job) or _empty_plan(job)
+    cards = [c for c in payload.get("cards", []) or [] if isinstance(c, dict)]
+    history = list(payload.get("history", []) or [])
+    notes = list(payload.get("notes", []) or [])
+    now = datetime.now().isoformat(timespec="seconds")
+    for op in ops or []:
+        if not isinstance(op, dict) or op.get("blocked"):
+            continue
+        name = op.get("op", "")
+        if name == "dress_add_card" and op.get("t") is not None:
+            used = {str(c.get("id")) for c in cards}
+            n = len(cards) + 1
+            while f"c{n}" in used:
+                n += 1
+            enabled = [c for c in cards if c.get("enabled", True)]
+            cards.append({
+                "id": f"c{n}", "t": float(op["t"]),
+                "d": float(op.get("d") or DEFAULT_CARD_S),
+                "text": str(op.get("text", "")),
+                "pos": op.get("pos") or ("top-left" if len(enabled) % 2 == 0
+                                         else "top-right"),
+                "ghost": True,
+                "anchor": op.get("anchor") or {},
+                "source": op.get("source") or "typed",
+                "why": str(op.get("why", "")), "enabled": True})
+        elif name == "dress_remove_card":
+            cards = [c for c in cards if c.get("id") != op.get("card_id")]
+        elif name == "dress_set_cards":
+            mode = op.get("mode")
+            if mode == "off":
+                for card in cards:
+                    card["enabled"] = False
+            elif mode == "fewer":
+                on = [c for c in cards if c.get("enabled", True)]
+                for i, card in enumerate(on):
+                    if i % 2 == 1:
+                        card["enabled"] = False
+            elif mode == "more":
+                for card in cards:
+                    card["enabled"] = True
+                words = load_output_words(job)
+                duration = _plan_duration(job, payload)
+                room = LIMITS["max_cards"] - len(cards)
+                if room > 0:
+                    cards.extend(rule_cards(words, duration, existing=cards,
+                                            max_cards=room))
+        elif name == "dress_set_music":
+            music = dict(payload.get("music") or {})
+            if "enabled" in op:
+                music["enabled"] = bool(op["enabled"])
+            if "gain_db" in op:
+                music["gain_db"] = float(op["gain_db"])
+            elif "gain_delta_db" in op:
+                music["gain_db"] = max(MUSIC_MIN_DB, min(MUSIC_MAX_DB, float(
+                    music.get("gain_db", MUSIC_GAIN_DEFAULT))
+                    + float(op["gain_delta_db"])))
+            if op.get("prompt"):
+                music["prompt"] = str(op["prompt"])
+                music["asset"] = None
+                payload["assets"] = [a for a in payload.get("assets", []) or []
+                                     if a.get("kind") != "music"]
+                notes.append("dress_music_replan: run director dress plan to "
+                             f"generate the new bed (about ${MUSIC_REPLAN_USD})")
+            payload["music"] = music
+        elif name == "dress_set_ghost":
+            ghost = dict(payload.get("ghost") or {})
+            ghost["enabled"] = bool(op.get("enabled"))
+            payload["ghost"] = ghost
+        elif name == "dress_set_sfx":
+            ghost = dict(payload.get("ghost") or {})
+            ghost["sfx"] = bool(op.get("enabled"))
+            payload["ghost"] = ghost
+        else:
+            continue
+        history.append({"op": name, "note_id": op.get("note_id"), "at": now})
+    cards.sort(key=lambda c: float(c.get("t", 0.0)))
+    payload["cards"] = cards
+    payload["history"] = history
+    payload["notes"] = notes
+    save_plan(job, payload)
+    return payload
+
+
+def set_card(job_dir: Path, card_id: str, *, enabled: bool | None = None,
+             remove: bool = False) -> dict:
+    """The panel's toggle and Remove. Returns dress.json."""
+    job = Path(job_dir)
+    payload = load_plan(job)
+    if payload is None:
+        raise DressError("dress: no dress.json; plan first")
+    cards = [c for c in payload.get("cards", []) or [] if isinstance(c, dict)]
+    if not any(c.get("id") == card_id for c in cards):
+        raise DressError(f"dress: no card {card_id}")
+    if remove:
+        cards = [c for c in cards if c.get("id") != card_id]
+    elif enabled is not None:
+        for card in cards:
+            if card.get("id") == card_id:
+                card["enabled"] = bool(enabled)
+    payload["cards"] = cards
+    payload.setdefault("history", []).append({
+        "op": "dress_remove_card" if remove else "dress_toggle_card",
+        "note_id": None, "at": datetime.now().isoformat(timespec="seconds")})
+    return save_plan(job, payload)
+
+
+def summary(job_dir: Path) -> dict:
+    """The compact state the UI shows. Never raises on a broken plan."""
+    job = Path(job_dir)
+    payload = load_plan(job)
+    if payload is None:
+        return {"exists": False, "cards": [], "fresh": False,
+                "stale": False}
+    music = payload.get("music") or {}
+    ghost = payload.get("ghost") or {}
+    fresh = is_fresh(job, payload)
+    return {
+        "exists": True,
+        "cards": [{"id": c.get("id"), "t": c.get("t"), "d": c.get("d"),
+                   "text": c.get("text", ""), "enabled": c.get("enabled", True),
+                   "source": c.get("source", "")}
+                  for c in payload.get("cards", []) or [] if isinstance(c, dict)],
+        "music": {"enabled": bool(music.get("enabled", True)),
+                  "gain_db": music.get("gain_db", MUSIC_GAIN_DEFAULT),
+                  "prompt": music.get("prompt", ""),
+                  "has_asset": bool(music.get("asset"))},
+        "ghost": {"enabled": bool(ghost.get("enabled", True)),
+                  "sfx": bool(ghost.get("sfx", True))},
+        "design": payload.get("design") or {},
+        "provider_spend_usd": payload.get("provider_spend_usd", 0.0),
+        "notes": list(payload.get("notes", []) or []),
+        "warnings": list(payload.get("warnings", []) or []),
+        "fresh": fresh,
+        "stale": (job / "cut.dressed.mp4").exists() and not fresh,
+    }

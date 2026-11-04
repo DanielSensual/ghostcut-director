@@ -364,10 +364,50 @@ def build_project(job_dir: Path, out_dir: Path) -> dict:
         stale = out_dir / "video.mp4"
         if stale.is_symlink() or stale.exists():
             stale.unlink()
+    _dress_project(job_dir, out_dir, project)  # DRESS
     (out_dir / "project.json").write_text(json.dumps(project))
     (out_dir / "project.js").write_text(
         "window.PROJECT = " + json.dumps(project) + ";\n")
     return project
+
+
+def _dress_project(job_dir: Path, out_dir: Path, project: dict) -> None:
+    """DRESS: link a fresh cut.dressed.mp4 and show the dress cards.
+
+    `demo/video.mp4` stays the plain cut; a fresh dressed render is
+    linked beside it as `demo/dressed.mp4` (a stale one is ignored and
+    its old link removed). Skipped when director.dress cannot import.
+    """
+    link = out_dir / "dressed.mp4"
+    root = Path(__file__).resolve().parents[1]
+    src = str(root / "src")
+    if src not in sys.path:
+        sys.path.insert(0, src)
+    try:
+        from director import dress as dress_mod
+    except ImportError:
+        return
+    try:
+        summary = dress_mod.summary(job_dir)
+    except Exception:  # noqa: BLE001 - a broken dress.json never blocks the project
+        return
+    if summary.get("fresh"):
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        try:
+            link.symlink_to(os.path.abspath(job_dir / "cut.dressed.mp4"))
+        except OSError:
+            shutil.copy2(job_dir / "cut.dressed.mp4", link)
+        summary["video"] = "demo/dressed.mp4"
+    elif link.is_symlink() or link.exists():
+        link.unlink()
+    if not summary.get("exists"):
+        return  # never dressed: the project stays exactly as before
+    project["cutJob"]["dress"] = summary
+    project["cards"] = [
+        {"id": c["id"], "t": c["t"], "d": c["d"], "lines": [c["text"]]}
+        for c in summary.get("cards", [])
+        if c.get("enabled", True) and c.get("t") is not None]
 
 
 def require_director_angles():  # type: ignore[no-untyped-def]

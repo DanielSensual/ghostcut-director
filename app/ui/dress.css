@@ -1,0 +1,39 @@
+/* GhostCut Director — "Dress the cut" panel (DRESS). Tokens with fallbacks so it works before ghost.css merges. */
+.dress-panel {
+  position: fixed; right: 16px; top: 72px; z-index: 40; width: min(360px, calc(100vw - 32px));
+  max-height: calc(100vh - 96px); overflow: auto; padding: 12px 14px;
+  background: var(--glass, #161a23); color: var(--text, #e8e8ea);
+  border: 1px solid var(--line, #2a2f3a); border-radius: 14px; box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+  font-size: 13px;
+}
+.dress-panel[hidden] { display: none; }
+.dress-panel header { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.dress-panel header b { flex: 1; font-size: 14px; }
+.dress-panel .x { background: none; border: 0; color: var(--dim, #8a8f9c); font-size: 16px; cursor: pointer; }
+.dress-glyph { font-size: 16px; }
+.dress-meta, .dress-muted { color: var(--dim, #8a8f9c); font-size: 12px; margin: 4px 0 8px; }
+.dress-cards { list-style: none; margin: 0 0 8px; padding: 0; }
+.dress-cards li { display: flex; align-items: center; gap: 6px; padding: 4px 0; border-bottom: 1px solid var(--line, #2a2f3a); }
+.dress-cards li.off .dress-text { opacity: 0.45; text-decoration: line-through; }
+.dress-cards .go { color: var(--accent, #f3d9a4); cursor: pointer; font-variant-numeric: tabular-nums; }
+.dress-text { flex: 1; }
+.dress-src { color: var(--dim, #8a8f9c); font-size: 11px; }
+.dress-toggles { display: flex; gap: 12px; flex-wrap: wrap; margin: 6px 0; }
+.dress-notes { margin: 6px 0; padding-left: 16px; color: var(--dim, #8a8f9c); font-size: 12px; }
+.dress-actions { display: flex; gap: 8px; align-items: center; margin: 8px 0; }
+.dress-actions button { padding: 5px 12px; border-radius: 8px; border: 1px solid var(--line, #2a2f3a);
+  background: var(--panel, #1d2230); color: inherit; cursor: pointer; }
+.dress-actions button.ok { background: var(--accent, #f3d9a4); color: #1a1a1a; border-color: transparent; }
+.dress-actions button:disabled { opacity: 0.5; cursor: default; }
+.dress-switch { margin-left: auto; display: inline-flex; }
+.dress-switch[hidden] { display: none; }
+.dress-switch button { border-radius: 0; }
+.dress-switch button:first-child { border-radius: 8px 0 0 8px; }
+.dress-switch button:last-child { border-radius: 0 8px 8px 0; }
+.dress-switch button.on { background: var(--accent, #f3d9a4); color: #1a1a1a; }
+.dress-bar { height: 6px; border-radius: 3px; background: var(--line, #2a2f3a); overflow: hidden; }
+.dress-bar[hidden] { display: none; }
+.dress-fill { height: 100%; width: 2%; background: var(--accent, #f3d9a4); transition: width 0.4s; }
+.dress-status { min-height: 16px; margin: 6px 0; color: var(--dim, #8a8f9c); font-size: 12px; }
+.dress-ask input { width: 100%; box-sizing: border-box; padding: 7px 10px; border-radius: 8px;
+  border: 1px solid var(--line, #2a2f3a); background: var(--panel, #1d2230); color: inherit; }

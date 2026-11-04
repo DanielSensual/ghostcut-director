@@ -513,6 +513,67 @@ def command_connect(args: argparse.Namespace) -> dict:
         f"connect: unknown verb '{verb}' (known: list, add, test, remove)")
 
 
+# DRESS: `director dress plan|render|show` (title cards, music, ghost pop).
+def command_dress(args: argparse.Namespace) -> dict:  # DRESS
+    from . import dress as dress_mod
+
+    job = Path(args.job)
+    if not job.exists():
+        raise ValueError(f"--job must exist: {job}")
+    if float(args.max_provider_usd) < 0:
+        raise ValueError("--max-provider-usd must be >= 0")
+    if args.ai_video:
+        print("--ai-video: not built, use DRESS stretch")
+    if args.verb == "plan":
+        payload = dress_mod.plan(job, model=args.model,
+                                 max_provider_usd=float(args.max_provider_usd),
+                                 no_muse=bool(args.no_muse))
+        cards = [c for c in payload.get("cards", []) if c.get("enabled", True)]
+        design = payload.get("design") or {}
+        print(f"Planned {len(cards)} card(s) with {design.get('model')}"
+              f"{' (cached)' if design.get('cached') else ''}:")
+        for card in cards:
+            print(f"  {float(card['t']):6.2f}s  {card['text']}  [{card.get('source')}]")
+        for asset in payload.get("assets", []):
+            print(f"  asset {asset['kind']}: {asset['provider']} {asset['file']}")
+        for note in payload.get("notes", []):
+            print(f"  note: {note}")
+        print(f"Spend: Meta ${float(design.get('spend_usd') or 0):.4f}, "
+              f"providers ${float(payload.get('provider_spend_usd') or 0):.4f} "
+              "(estimates)")
+        print(f"Wrote {job / 'dress.json'}")
+        print(f"Next: director dress render --job {job}")
+        return payload
+    if args.verb == "render":
+        import time  # DRESS
+
+        require_ffmpeg_binaries()
+        started = time.monotonic()
+        payload = dress_mod.render(job)
+        print(f"Wrote {job / 'cut.dressed.mp4'} in "
+              f"{time.monotonic() - started:.0f} s (cut.mp4 untouched)")
+        for warning in payload.get("warnings", []):
+            print(f"  warning: {warning}")
+        print(f"Next: open the app and switch Dressed/Plain, or "
+              f"director dress show --job {job}")
+        return payload
+    info = dress_mod.summary(job)
+    if not info.get("exists"):
+        print(f"No dress.json in {job}. Next: director dress plan --job {job}")
+        return info
+    for card in info["cards"]:
+        state = "on " if card.get("enabled") else "off"
+        print(f"  [{state}] {float(card['t']):6.2f}s  {card['text']}  ({card.get('source')})")
+    music = info["music"]
+    print(f"Music: {'on' if music['enabled'] else 'off'} at {music['gain_db']} dB"
+          f"{'' if music['has_asset'] else ' (no bed generated)'}")
+    print(f"Ghost: {'on' if info['ghost']['enabled'] else 'off'}, "
+          f"bing {'on' if info['ghost']['sfx'] else 'off'}")
+    print("Render: " + ("fresh" if info["fresh"] else "stale" if info["stale"]
+                        else "not rendered"))
+    return info
+
+
 def command_finish(args: argparse.Namespace) -> dict:
     from . import finish as finish_mod
 
@@ -1213,6 +1274,19 @@ def build_parser() -> argparse.ArgumentParser:
                                help="Refuse provider calls above this cap "
                                "(estimated list prices)")
     finish_parser.set_defaults(func=command_finish)
+
+    # DRESS: the dress subparser.
+    dress_parser = sub.add_parser("dress", help="Dress the cut: title cards, music and a ghost pop-up")
+    dress_parser.add_argument("verb", choices=["plan", "render", "show"])
+    dress_parser.add_argument("--job", required=True, help="A director cut job directory")
+    dress_parser.add_argument("--model", default="muse-spark-1.3")
+    dress_parser.add_argument("--no-muse", action="store_true",
+                              help="Plan cards with the built-in planner (no Meta call)")
+    dress_parser.add_argument("--max-provider-usd", type=float, default=1.0,
+                              help="Refuse ElevenLabs calls above this cap (estimates)")
+    dress_parser.add_argument("--ai-video", type=int, default=0,
+                              help="AI video B-roll clips (not built)")
+    dress_parser.set_defaults(func=command_dress)
 
     captions_parser = sub.add_parser("captions", help="Burn captions and a title hook into a finished job")
     captions_parser.add_argument("--job", required=True,
