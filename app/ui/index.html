@@ -5,6 +5,10 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>GhostCut Director</title>
 <link rel="stylesheet" href="app.css">
+<link rel="stylesheet" href="ghost.css">
+<link rel="stylesheet" href="import.css">
+<link rel="stylesheet" href="kitchen.css">
+<link rel="stylesheet" href="dress.css">
 </head>
 <body>
 <header class="top">
@@ -25,6 +29,7 @@
   <div class="top-right">
     <span class="engine-dot" id="engineDot"></span>
     <button class="spend" id="spendBtn" title="Meta API spend on this project"></button>
+    <button class="conn" id="helpBtn" title="Tour and help">?</button>
     <button class="conn" id="connBtn" title="Outside-service API keys">Connections</button>
     <button class="primary" data-view="deliver">Export</button>
   </div>
@@ -42,6 +47,7 @@
   <section class="center">
     <div class="player">
       <video id="video" preload="metadata" playsinline></video>
+      <div class="kitchen" id="kitchen" hidden><canvas id="kitchenCanvas"></canvas><div id="kitchenCaption"></div><div id="kitchenReadout"></div></div>
       <div class="player-empty" id="noVideo" hidden>Demo footage not found.<br><code>python app/make_demo.py …</code></div>
     </div>
     <div class="transport">
@@ -53,6 +59,7 @@
       <span class="pending" id="pending" hidden><i></i><b id="pendingN"></b> waiting to render
         <button id="undoLast" data-busy="undo">Undo last</button></span>
       <span class="ver" id="verChip" hidden></span>
+      <button class="icon" id="dressBtn" title="Dress the cut">✦ Dress</button>
       <button class="renderbtn" id="renderBtn" disabled>Render</button>
       <label class="zoom">Zoom <input type="range" id="zoom" min="1" max="12" step="0.5" value="1"></label>
     </div>
@@ -166,6 +173,11 @@
 </div>
 
 <script src="demo/project.js"></script>
+<script src="ghost/mascot.js"></script>
+<script src="import.js"></script>
+<script src="onboard.js"></script>
+<script src="kitchen.js"></script>
+<script src="dress.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
