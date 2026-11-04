@@ -4,13 +4,18 @@ Words from the audio clip are split into lines (sentence breaks, pauses over
 0.6 s, 8 s cap at the longest pause). Each line is covered by the cameras
 whose clip spans the whole line; one frame per line x covering camera goes to
 Muse Spark, which picks the angle. When exactly one camera sees the speaker
-addressing it for most of the line (near-frontal Vision yaw on sampled
-frames), a mechanical gaze rule picks it that Spark cannot overrule, and
-ambiguous lines carry the gaze numbers in Spark's prompt. Mechanical checks
-overrule Muse when its camera does not cover the line, merge same-camera
-lines, merge short shots, and pin cuts to inter-word gaps. Without guestlist
-(--no-muse) a deterministic rule opens on the reference camera and alternates.
-With --push-in, each rendered camera shot creeps toward the speaker.
+addressing it for most of the line (near-frontal Vision yaw on densely
+sampled frames), a mechanical gaze rule picks it that Spark cannot overrule,
+and ambiguous lines carry the gaze numbers in Spark's prompt. A held turn of
+address inside a line becomes a cut on the nearest word gap, unless an
+editor override pins the line or the turn would strand a side whose gaze
+would be wrong for at most a second. Mechanical checks overrule Muse when
+its camera does not cover the line, merge same-camera lines, merge short
+shots (keeping the camera addressed for the most time in the merged span),
+and pin cuts to inter-word gaps; every shot carries one reason. Without
+guestlist (--no-muse) a deterministic rule opens on the reference camera and
+alternates. With --push-in, each rendered camera shot creeps toward the
+speaker.
 """
 from __future__ import annotations
 
@@ -124,6 +129,11 @@ class Shot:
     source_end_s: float = 0.0
     kept_span_id: str = ""
     beat_id: int = -1
+    # Planning only (not written to angles.json): seconds the speaker
+    # addresses each camera inside this shot, and whether the shot came
+    # from a held gaze turn inside a line.
+    addressed_s: dict[str, float] = field(default_factory=dict)
+    gaze_split: bool = False
 
 
 # ---------------------------------------------------------------- words and lines
@@ -522,64 +532,212 @@ def apply_gaze_overrides(picks: list[Pick],
 
 # ---------------------------------------------------------------- checks (Muse is advisory; these decide)
 
-def _merge_same_camera(picks: list[Pick], lines: list[Line],
-                       clips: list[SyncClip]) -> list[Shot]:
+def _one_reason(reasons) -> str:
+    """The first non-empty reason: one clear reason per shot. Pure."""
+    for reason in reasons:
+        text = str(reason or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _combined_addressed(first: dict[str, float],
+                        second: dict[str, float]) -> dict[str, float]:
+    out = dict(first)
+    for label, seconds in second.items():
+        out[label] = out.get(label, 0.0) + seconds
+    return out
+
+
+def _addressed_winner(addressed: dict[str, float],
+                      preferred: str | None) -> str | None:
+    """The camera addressed for the most time; ties keep `preferred`. Pure."""
+    if not addressed:
+        return None
+    return max(sorted(addressed),
+               key=lambda label: (addressed[label], label == preferred))
+
+
+@dataclass(slots=True)
+class _Unit:
+    """One plannable piece: a whole line, or one gaze segment of a line."""
+
+    line_id: int
+    start_s: float
+    end_s: float
+    camera: str | None
+    shot_size: str
+    reason: str
+    method: str
+    overruled: list[str] = field(default_factory=list)
+    addressed_s: dict[str, float] = field(default_factory=dict)
+    gaze_split: bool = False
+
+
+def _line_addressed_s(line: Line, pick: Pick,
+                      gaze: gaze_mod.LineGaze | None) -> dict[str, float]:
+    """Duration-weighted addressed seconds for one whole line."""
+    duration = max(0.0, line.end_s - line.start_s)
+    if gaze is not None and gaze.cameras:
+        times = list(gaze.sample_times_s)
+        if not times:
+            count = max((cam.samples for cam in gaze.cameras.values()),
+                        default=0)
+            times = gaze_mod.line_sample_times(line.start_s, line.end_s, count)
+        totals = gaze_mod.addressed_durations(
+            line.start_s, line.end_s, times,
+            {label: list(cam.yaws) for label, cam in gaze.cameras.items()})
+        if totals:
+            return totals
+    if pick.camera is not None and duration > 0:
+        return {pick.camera: duration}
+    return {}
+
+
+def _gaze_units(line: Line, pick: Pick, words: list[TimedWord] | None,
+                gaze: gaze_mod.LineGaze | None) -> list[_Unit] | None:
+    """Split units for a held gaze turn in `line`, or None for no split.
+
+    Cut points snap to the word gap nearest the turn. An editor
+    override (method or note) pins the whole line, so it never splits.
+    """
+    if gaze is None:
+        return None
+    if pick.method == "editor" or any(
+            note.startswith("angle_override:") for note in pick.overruled):
+        return None
+    segments = [seg for seg in gaze_mod.segments_for_gaze(
+        gaze, line.start_s, line.end_s) if seg.camera in line.cameras]
+    if len(segments) < 2:
+        return None
+    if words is None:
+        # No words to snap to: split at the held turn itself.
+        units: list[_Unit] = []
+        for segment in segments:
+            over = list(pick.overruled)
+            note = f"gaze_split:L{line.id}"
+            if note not in over:
+                over.append(note)
+            units.append(_Unit(
+                line_id=line.id, start_s=segment.start_s,
+                end_s=segment.end_s, camera=segment.camera,
+                shot_size=pick.shot_size,
+                reason=segment.reason or _one_reason([gaze.reason, pick.reason]),
+                method="gaze", overruled=over,
+                addressed_s={segment.camera: segment.duration_s},
+                gaze_split=True))
+        return units
+    if not (line.word_start < line.word_end <= len(words)):
+        return None
+    line_words = words[line.word_start:line.word_end]
+    if len(line_words) < 2:
+        return None
+    cuts: list[int] = []
+    used = 0
+    for at, segment in enumerate(segments[:-1]):
+        remaining = len(segments) - at - 1
+        low = used + 1
+        high = len(line_words) - remaining
+        if high < low:
+            return None
+        turn = segment.end_s
+        chosen = min(
+            range(low, high + 1),
+            key=lambda count: abs(
+                (line_words[count - 1].end_s + line_words[count].start_s) / 2
+                - turn))
+        cuts.append(chosen)
+        used = chosen
+    units: list[_Unit] = []
+    bounds = [0, *cuts, len(line_words)]
+    for at, segment in enumerate(segments):
+        first_word = bounds[at]
+        last_word = bounds[at + 1] - 1
+        over = list(pick.overruled)
+        note = f"gaze_split:L{line.id}"
+        if note not in over:
+            over.append(note)
+        units.append(_Unit(
+            line_id=line.id,
+            start_s=line.start_s if at == 0 else line_words[first_word].start_s,
+            end_s=line.end_s if at == len(segments) - 1
+            else line_words[last_word].end_s,
+            camera=segment.camera,
+            shot_size=pick.shot_size,
+            reason=segment.reason or _one_reason([gaze.reason, pick.reason]),
+            method="gaze",
+            overruled=over,
+            addressed_s={segment.camera: segment.duration_s},
+            gaze_split=True))
+    return units
+
+
+def _merge_units(units: list[_Unit], clips: list[SyncClip]) -> list[Shot]:
     """Maximal runs of equal non-None cameras; interior gaps become black shots."""
     by_label = {c.label: c for c in clips}
-    order = sorted(lines, key=lambda l: l.id)
-    first = next((l for l in order if _pick_cam(picks, l.id) is not None), None)
-    last = next((l for l in reversed(order) if _pick_cam(picks, l.id) is not None), None)
+    first = next((i for i, unit in enumerate(units) if unit.camera is not None),
+                 None)
+    last = next((i for i in range(len(units) - 1, -1, -1)
+                 if units[i].camera is not None), None)
     if first is None or last is None:
         return []
-    span = [l for l in order if first.id <= l.id <= last.id]
-    picks_by_id = {p.line_id: p for p in picks}
+    span = units[first:last + 1]
     shots: list[Shot] = []
     i = 0
     while i < len(span):
-        line, pick = span[i], picks_by_id[span[i].id]
-        if pick.camera is None:
-            j = i
-            while j < len(span) and picks_by_id[span[j].id].camera is None:
-                j += 1
-            run = span[i:j]
-            lids = [l.id for l in run]
-            over: list[str] = []
-            for l in run:
-                for o in picks_by_id[l.id].overruled:
-                    if o not in over:
-                        over.append(o)
-            if "no_camera" not in over:
-                over.append("no_camera")
-            shots.append(Shot(len(shots), run[0].start_s, run[-1].end_s, "black", "",
-                              0.0, run[-1].end_s - run[0].start_s, lids, "", " ".join(
-                                  picks_by_id[l.id].reason for l in run).strip(),
-                              "rule", over))
-            i = j
-            continue
+        unit = span[i]
         j = i
-        while j < len(span) and picks_by_id[span[j].id].camera == pick.camera:
+        while j < len(span) and span[j].camera == unit.camera:
             j += 1
         run = span[i:j]
-        lids = [l.id for l in run]
-        clip = by_label.get(pick.camera or "")
-        over = []
-        for l in run:
-            for o in picks_by_id[l.id].overruled:
-                if o not in over:
-                    over.append(o)
-        shots.append(Shot(len(shots), run[0].start_s, run[-1].end_s, pick.camera or "",
-                          clip.path if clip else "", 0.0, 0.0, lids,
-                          picks_by_id[run[0].id].shot_size,
-                          " ".join(picks_by_id[l.id].reason for l in run).strip(),
-                          "muse" if all(picks_by_id[l.id].method == "muse" for l in run) else "rule",
-                          over))
+        lids = list(dict.fromkeys(u.line_id for u in run))
+        over: list[str] = []
+        for u in run:
+            for note in u.overruled:
+                if note not in over:
+                    over.append(note)
+        addressed: dict[str, float] = {}
+        for u in run:
+            addressed = _combined_addressed(addressed, u.addressed_s)
+        if unit.camera is None:
+            if "no_camera" not in over:
+                over.append("no_camera")
+            shots.append(Shot(len(shots), run[0].start_s, run[-1].end_s,
+                              "black", "", 0.0, run[-1].end_s - run[0].start_s,
+                              lids, "", _one_reason(u.reason for u in run),
+                              "rule", over, addressed_s=addressed))
+            i = j
+            continue
+        clip = by_label.get(unit.camera or "")
+        shots.append(Shot(len(shots), run[0].start_s, run[-1].end_s,
+                          unit.camera or "", clip.path if clip else "",
+                          0.0, 0.0, lids, run[0].shot_size,
+                          _one_reason(u.reason for u in run),
+                          "muse" if all(u.method == "muse" for u in run)
+                          else "rule",
+                          over, addressed_s=addressed,
+                          gaze_split=any(u.gaze_split for u in run)))
         i = j
-    for s in shots:
-        if s.camera != "black":
-            clip = by_label.get(s.camera)
+    for shot in shots:
+        if shot.camera != "black":
+            clip = by_label.get(shot.camera)
             off = clip.offset_s if clip and clip.offset_s is not None else 0.0
-            s.clip_in_s, s.clip_out_s = s.start_s - off, s.end_s - off
+            shot.clip_in_s, shot.clip_out_s = shot.start_s - off, shot.end_s - off
     return shots
+
+
+def _merge_same_camera(picks: list[Pick], lines: list[Line],
+                       clips: list[SyncClip]) -> list[Shot]:
+    """Maximal runs of equal non-None cameras; interior gaps become black shots."""
+    picks_by_id = {p.line_id: p for p in picks}
+    units: list[_Unit] = []
+    for line in sorted(lines, key=lambda l: l.id):
+        pick = picks_by_id[line.id]
+        units.append(_Unit(
+            line.id, line.start_s, line.end_s, pick.camera, pick.shot_size,
+            pick.reason, pick.method, list(pick.overruled),
+            _line_addressed_s(line, pick, None)))
+    return _merge_units(units, clips)
 
 
 def _pick_cam(picks: list[Pick], line_id: int) -> str | None:
@@ -591,7 +749,14 @@ def _pick_cam(picks: list[Pick], line_id: int) -> str | None:
 
 def _merge_short(shots: list[Shot], clips: list[SyncClip],
                  lines_by_id: dict[int, Line], min_shot_s: float) -> list[Shot]:
-    """Fold each short shot into a neighbour that covers its lines; else keep it."""
+    """Fold each short shot into a neighbour that covers its lines; else keep it.
+
+    A merged shot takes the camera the speaker addresses for the most
+    time in the merged span (duration-weighted, not a per-line vote),
+    unless an editor override pins a side. A gaze-split shot is kept,
+    despite being short, when folding it would show the wrong camera
+    for more than a second; a shorter wrong stretch folds away.
+    """
     by_label = {c.label: c for c in clips}
     if len(shots) <= 1:
         return shots
@@ -627,16 +792,21 @@ def _merge_short(shots: list[Shot], clips: list[SyncClip],
             prev, nxt = shots[idx - 1], shots[idx + 1]
             side, nb = ("prev", prev) if prev.end_s - prev.start_s >= nxt.end_s - nxt.start_s else ("next", nxt)
         short_angle = [o for o in short.overrules if o.startswith("angle_override:")]
-        if short_angle and not any(o.startswith("angle_override:") for o in nb.overrules):
+        nb_angle = [o for o in nb.overrules if o.startswith("angle_override:")]
+        if short_angle and not nb_angle:
             # An editor override on the disappearing shot wins over the
             # minimum-shot rule: the merged shot takes the override's
             # camera when it covers the merged lines, else the short
             # shot stays so the explicit choice is not destroyed.
             clip = by_label.get(short.camera)
-            merged_ids = sorted(nb.line_ids + short.line_ids)
+            merged_ids = sorted(set(nb.line_ids + short.line_ids))
             if clip is not None and all(covers(clip, lines_by_id[lid]) for lid in merged_ids):
                 nb.camera = short.camera
                 nb.clip_path = clip.path
+                nb.reason = _one_reason([short.reason, nb.reason])
+                nb.addressed_s = _combined_addressed(nb.addressed_s,
+                                                     short.addressed_s)
+                nb.gaze_split = nb.gaze_split or short.gaze_split
                 for note in short_angle:
                     if note not in nb.overrules:
                         nb.overrules.append(note)
@@ -644,24 +814,41 @@ def _merge_short(shots: list[Shot], clips: list[SyncClip],
                 short.overrules.append("min_shot_kept:" + "+".join(f"L{lid}" for lid in short.line_ids))
                 kept.add(short.id)
                 continue
-        if side == "prev":
-            nb.line_ids = sorted(nb.line_ids + short.line_ids)
-            nb.start_s = min(nb.start_s, short.start_s)
-            nb.end_s = max(nb.end_s, short.end_s)
-            nb.reason = f"{nb.reason} {short.reason}".strip()
-            nb.overrules.append("min_shot_merge:" + "+".join(f"L{lid}" for lid in short.line_ids) + f"->{nb.camera}")
-            if short.method != "muse" or nb.method != "muse":
-                nb.method = "rule"
-            shots.pop(idx)
         else:
-            nb.line_ids = sorted(short.line_ids + nb.line_ids)
-            nb.start_s = min(nb.start_s, short.start_s)
-            nb.end_s = max(nb.end_s, short.end_s)
-            nb.reason = f"{short.reason} {nb.reason}".strip()
-            nb.overrules.append("min_shot_merge:" + "+".join(f"L{lid}" for lid in short.line_ids) + f"->{nb.camera}")
-            if short.method != "muse" or nb.method != "muse":
-                nb.method = "rule"
-            shots.pop(idx)
+            combined = _combined_addressed(nb.addressed_s, short.addressed_s)
+            winner = _addressed_winner(combined, nb.camera)
+            merged_camera = nb.camera
+            if winner is not None and winner != nb.camera and not nb_angle:
+                clip = by_label.get(winner)
+                merged_ids = sorted(set(nb.line_ids + short.line_ids))
+                if clip is not None and all(
+                        covers(clip, lines_by_id[lid]) for lid in merged_ids):
+                    merged_camera = winner
+            if short.gaze_split and merged_camera != short.camera:
+                wrong_s = short.addressed_s.get(
+                    short.camera, max(0.0, short.end_s - short.start_s))
+                if wrong_s > 1.0 + 1e-9:
+                    note = ("gaze_split_kept:" + "+".join(
+                        f"L{lid}" for lid in short.line_ids))
+                    if note not in short.overrules:
+                        short.overrules.append(note)
+                    kept.add(short.id)
+                    continue
+            if merged_camera != nb.camera:
+                clip = by_label[merged_camera]
+                nb.camera = merged_camera
+                nb.clip_path = clip.path
+                if winner == short.camera:
+                    nb.reason = _one_reason([short.reason, nb.reason])
+            nb.addressed_s = combined
+            nb.gaze_split = nb.gaze_split or short.gaze_split
+        nb.line_ids = sorted(set(nb.line_ids + short.line_ids))
+        nb.start_s = min(nb.start_s, short.start_s)
+        nb.end_s = max(nb.end_s, short.end_s)
+        nb.overrules.append("min_shot_merge:" + "+".join(f"L{lid}" for lid in short.line_ids) + f"->{nb.camera}")
+        if short.method != "muse" or nb.method != "muse":
+            nb.method = "rule"
+        shots.pop(idx)
     return _join_same_camera(shots)
 
 
@@ -671,9 +858,11 @@ def _join_same_camera(shots: list[Shot]) -> list[Shot]:
     for shot in shots:
         prev = out[-1] if out else None
         if prev is not None and prev.camera == shot.camera and shot.camera != "black":
-            prev.line_ids = prev.line_ids + shot.line_ids
+            prev.line_ids = list(dict.fromkeys(prev.line_ids + shot.line_ids))
             prev.end_s = shot.end_s
-            prev.reason = f"{prev.reason} {shot.reason}".strip()
+            prev.addressed_s = _combined_addressed(prev.addressed_s,
+                                                   shot.addressed_s)
+            prev.gaze_split = prev.gaze_split or shot.gaze_split
             prev.overrules += [o for o in shot.overrules if o not in prev.overrules]
             if shot.method != "muse":
                 prev.method = "rule"
@@ -690,8 +879,16 @@ def _shot_warnings(shots: list[Shot]) -> None:
 
 
 def apply_checks(picks: list[Pick], lines: list[Line], clips: list[SyncClip], *,
-                 min_shot_s: float) -> list[Shot]:
-    """Coverage overrules, same-camera merge, min-shot merge, cut points, long-shot notes."""
+                 min_shot_s: float,
+                 words: list[TimedWord] | None = None,
+                 line_gaze: dict[int, gaze_mod.LineGaze] | None = None
+                 ) -> list[Shot]:
+    """Coverage overrules, gaze splits, merges, cut points, long-shot notes.
+
+    With `words` and `line_gaze`, a held turn of address inside a line
+    splits that line on the nearest word gap (editor overrides pin the
+    whole line instead). Without them, planning is per line, as before.
+    """
     known = {c.label for c in clips}
     lines_by_id = {line.id: line for line in lines}
     picks_by_id = {p.line_id: p for p in picks}
@@ -722,16 +919,28 @@ def apply_checks(picks: list[Pick], lines: list[Line], clips: list[SyncClip], *,
             pick.shot_size = "medium"
         prev_kept = pick.camera
         checked.append(pick)
-    shots = _merge_same_camera(checked, lines, clips)
+    checked_by_id = {p.line_id: p for p in checked}
+    units: list[_Unit] = []
+    for line in sorted(lines, key=lambda l: l.id):
+        pick = checked_by_id[line.id]
+        gaze = line_gaze.get(line.id) if line_gaze else None
+        split = _gaze_units(line, pick, words, gaze)
+        if split is not None:
+            units.extend(split)
+            continue
+        units.append(_Unit(
+            line.id, line.start_s, line.end_s, pick.camera, pick.shot_size,
+            pick.reason, pick.method, list(pick.overruled),
+            _line_addressed_s(line, pick, gaze)))
+    shots = _merge_units(units, clips)
     shots = _merge_short(shots, clips, lines_by_id, min_shot_s)
     by_label = {c.label: c for c in clips}
+    nominal = [(shot.start_s, shot.end_s) for shot in shots]
     for i, shot in enumerate(shots):
-        first = lines_by_id[shot.line_ids[0]]
-        last = lines_by_id[shot.line_ids[-1]]
-        start = first.start_s if i == 0 else (
-            lines_by_id[shots[i - 1].line_ids[-1]].end_s + first.start_s) / 2
-        end = last.end_s if i == len(shots) - 1 else (
-            last.end_s + lines_by_id[shots[i + 1].line_ids[0]].start_s) / 2
+        start = nominal[i][0] if i == 0 else (
+            nominal[i - 1][1] + nominal[i][0]) / 2
+        end = nominal[i][1] if i == len(shots) - 1 else (
+            nominal[i][1] + nominal[i + 1][0]) / 2
         shot.start_s, shot.end_s = start, end
         if shot.camera == "black":
             shot.clip_in_s, shot.clip_out_s = 0.0, end - start
@@ -1377,7 +1586,8 @@ def run(*, sync_path: Path, words_path: Path, out_path: Path, audio_label: str |
             apply_gaze_overrides(picks, line_gaze)
         if tighten is not None:
             _apply_angle_overrides(tighten, lines, picks)
-        shots = apply_checks(picks, lines, clips, min_shot_s=min_shot_s)
+        shots = apply_checks(picks, lines, clips, min_shot_s=min_shot_s,
+                             words=words, line_gaze=line_gaze or None)
     else:
         try:
             from guestlist.meta import cache, spark  # noqa: F401 (availability probe; the call lives in pick_with_muse)
@@ -1389,7 +1599,8 @@ def run(*, sync_path: Path, words_path: Path, out_path: Path, audio_label: str |
                 apply_gaze_overrides(picks, line_gaze)
             if tighten is not None:
                 _apply_angle_overrides(tighten, lines, picks)
-            shots = apply_checks(picks, lines, clips, min_shot_s=min_shot_s)
+            shots = apply_checks(picks, lines, clips, min_shot_s=min_shot_s,
+                             words=words, line_gaze=line_gaze or None)
         else:
             frames = grab_frames(lines, clips, frames_dir)
             picks, spend, muse_warnings = pick_with_muse(
@@ -1401,7 +1612,8 @@ def run(*, sync_path: Path, words_path: Path, out_path: Path, audio_label: str |
                 apply_gaze_overrides(picks, line_gaze)
             if tighten is not None:
                 _apply_angle_overrides(tighten, lines, picks)
-            shots = apply_checks(picks, lines, clips, min_shot_s=min_shot_s)
+            shots = apply_checks(picks, lines, clips, min_shot_s=min_shot_s,
+                             words=words, line_gaze=line_gaze or None)
     if tighten is not None:
         shots = _map_shots_to_output(shots, lines, by_label, tighten)
     for line in lines:

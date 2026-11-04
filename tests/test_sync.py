@@ -1071,6 +1071,32 @@ class LipsParserTests(unittest.TestCase):
             LipsFrame(3, 0.01, (0.31, 0.25, 0.18, 0.32), None, None, None),
         ])
 
+    def test_parse_helper_output_with_continuous_yaw(self) -> None:
+        text = ("0 0.023400 0.3100,0.2500,0.1800,0.3200 45.00,-3.10,1.50 6.25\n"
+                "1 NA 0.3000,0.2400,0.1900,0.3300 NA,NA,NA NA\n"
+                "2 0.010000 0.3100,0.2500,0.1800,0.3200 0.00,0.00,0.00 bogus\n"
+                "3 0.010000 0.3100,0.2500,0.1800,0.3200 0.00,0.00,0.00\n")
+        frames = sync.parse_lips_output(text)
+        self.assertEqual([f.yaw_continuous for f in frames],
+                         [6.25, None, None, None])
+        self.assertEqual(frames[0].yaw, 45.0)
+
+    def test_continuous_yaw_from_landmark_offset(self) -> None:
+        # Frontal: the nose tip sits on the eye midline.
+        frontal = sync.continuous_yaw_deg(0.0, 0.35)
+        assert frontal is not None
+        self.assertAlmostEqual(frontal, 0.0)
+        # A 45-degree turn projects the nose tip 0.55 eye-distances out.
+        half_turn = sync.continuous_yaw_deg(0.55 * 0.35, 0.35)
+        assert half_turn is not None
+        self.assertAlmostEqual(half_turn, 45.0)
+        turned = sync.continuous_yaw_deg(0.10, 0.35)
+        slight = sync.continuous_yaw_deg(0.03, 0.35)
+        assert turned is not None and slight is not None
+        self.assertGreater(turned, slight)
+        self.assertGreater(slight, 0.0)
+        self.assertIsNone(sync.continuous_yaw_deg(0.1, 0.0))
+
     def test_median_box(self) -> None:
         frames = [LipsFrame(0, 0.1, (0.3, 0.2, 0.2, 0.3)),
                   LipsFrame(1, None, None),

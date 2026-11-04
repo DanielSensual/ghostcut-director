@@ -14,6 +14,7 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -193,6 +194,38 @@ class LipsFrame:
     yaw: float | None = None  # Vision face yaw in degrees (the gaze rule)
     pitch: float | None = None  # Vision face pitch in degrees
     roll: float | None = None  # Vision face roll in degrees
+    # Continuous yaw in degrees from the face landmarks (the helper's
+    # fifth token); None when it reported none. The gaze rule prefers
+    # this and falls back to the coarse `yaw` above.
+    yaw_continuous: float | None = None
+
+
+# The nose tip sits about this fraction of the inter-eye distance in
+# front of the eye plane, so a landmark offset converts to a yaw with
+# atan2(offset, NOSE_DEPTH_RATIO * eye_distance). See lips_helper.swift.
+NOSE_DEPTH_RATIO = 0.55
+YAW_CONTINUOUS_MAX_DEG = 75.0
+
+
+def continuous_yaw_deg(nose_offset: float, eye_distance: float) -> float | None:
+    """Landmark nose offset (face-box units) to a continuous yaw. Pure.
+
+    `nose_offset` is the nose tip's sideways distance from the eye
+    midline and `eye_distance` the distance between the eye centres,
+    both in the same units. Frontal gives 0; the estimate grows
+    monotonically with the turn and is clamped to ±75 degrees. This
+    mirrors the formula in `lips_helper.swift` so the geometry can be
+    tested without Vision.
+    """
+    try:
+        offset = float(nose_offset)
+        distance = float(eye_distance)
+    except (TypeError, ValueError):
+        return None
+    if distance <= 0:
+        return None
+    yaw = math.degrees(math.atan2(offset, NOSE_DEPTH_RATIO * distance))
+    return max(-YAW_CONTINUOUS_MAX_DEG, min(YAW_CONTINUOUS_MAX_DEG, yaw))
 
 
 @dataclass(slots=True)
@@ -1179,8 +1212,9 @@ def parse_lips_output(text: str) -> list[LipsFrame]:
     """Helper stdout to per-frame openings, face boxes and pose. Pure; skips bad lines.
 
     The pose token (`yaw,pitch,roll` in degrees, each `NA` when Vision did
-    not report it) is auxiliary: an unparseable one keeps the frame with an
-    unknown pose rather than dropping the opening and box with it.
+    not report it) and the fifth token (the continuous landmark yaw in
+    degrees, or `NA`) are auxiliary: an unparseable one keeps the frame
+    with an unknown pose/yaw rather than dropping the opening and box.
     """
     frames: list[LipsFrame] = []
     for raw in (text or "").splitlines():
@@ -1208,7 +1242,14 @@ def parse_lips_output(text: str) -> list[LipsFrame]:
         yaw = pitch = roll = None
         if len(parts) >= 4:
             yaw, pitch, roll = _parse_pose(parts[3])
-        frames.append(LipsFrame(index, opening, box, yaw, pitch, roll))
+        yaw_continuous: float | None = None
+        if len(parts) >= 5 and parts[4].strip().upper() != "NA":
+            try:
+                yaw_continuous = float(parts[4])
+            except ValueError:
+                yaw_continuous = None
+        frames.append(LipsFrame(index, opening, box, yaw, pitch, roll,
+                                yaw_continuous))
     frames.sort(key=lambda f: f.index)
     return frames
 
