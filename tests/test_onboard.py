@@ -113,7 +113,8 @@ class HelpTests(unittest.TestCase):
                   "walk me through it", "how do I get started"]:
             self.assertTrue(offload.is_help(t), t)
         for t in ["transfer to my SSD", "the footage is on the SD card, transfer it to my SSD",
-                  "go ahead", "open the last job", "helpful footage", ""]:
+                  "go ahead", "open the last job", "helpful footage", "",
+                  "help me copy the SD card to my SSD", "can you help me transfer it to the SSD"]:
             self.assertFalse(offload.is_help(t), t)
 
     def test_briefing_is_in_the_developer_prompt_and_schema_unchanged(self) -> None:
@@ -136,7 +137,7 @@ class HelpTests(unittest.TestCase):
                 got = eng.offload_ask("What can you do?")
             self.assertTrue(got["help"])
             self.assertIn("CardA, 4 clips", got["reply"])
-            self.assertIn("CardB, 1 clips", got["reply"])
+            self.assertIn("CardB, 1 clip)", got["reply"])
             self.assertIn("Extreme SSD", got["reply"])
             self.assertIn("transfer to my SSD", got["reply"])
             self.assertGreaterEqual(len(got["steps"]), 3)
@@ -205,6 +206,7 @@ class MuseFallbackTests(unittest.TestCase):
                     mock.patch.dict(sys.modules, {"guestlist": mock.MagicMock(meta=fake_meta),
                                                   "guestlist.meta": fake_meta}):
                 got = eng.offload_ask("the footage is on the SD card, transfer it to my SSD")
+            fake_spark._structured.assert_called()  # Muse was really tried, then refused
             self.assertEqual(got["planner"], "rules")
             self.assertEqual(got["note"], engine.MUSE_UNAVAILABLE)
             self.assertTrue(got["shoot_dir"].endswith("2026-11-03 Shoot"))

@@ -1229,13 +1229,21 @@ GHOST_BRIEFING = (
 GHOST_DEVELOPER = GHOST_DEVELOPER + " " + GHOST_BRIEFING  # ONBOARD
 
 _HELP_RE = re.compile(  # ONBOARD
-    r"\b(help|what can you do|what do you do|how does (this|it) work|"
-    r"tutorial|walk me through|get(ting)? started)\b", re.IGNORECASE)
+    r"\b(what can you do|what do you do|how does (this|it) work|"
+    r"tutorial|walk me through)\b", re.IGNORECASE)
+_HELP_WEAK_RE = re.compile(r"\b(help|get(ting)? started)\b", re.IGNORECASE)  # ONBOARD
+# ONBOARD: "help me copy the card to my SSD" is a request, not a help question.
+_ACTION_RE = re.compile(
+    r"\b(copy|transfer|move|offload|import|back ?up|put|send|open|go ahead|"
+    r"include|plan)\b", re.IGNORECASE)
 
 
 def is_help(text: str) -> bool:  # ONBOARD
     """True when the editor asks how Ghost works rather than for a copy."""
-    return bool(_HELP_RE.search(str(text or "")))
+    t = str(text or "")
+    if _HELP_RE.search(t):
+        return True
+    return bool(_HELP_WEAK_RE.search(t)) and not _ACTION_RE.search(t)
 
 
 @dataclass(slots=True)

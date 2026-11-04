@@ -316,6 +316,8 @@
       if (j.text) say("ghost", "I heard: " + j.text);
       say("ghost", j.reply || "Here is the transfer to plan.");
       if (j.note) note(j.note);
+      // The status line says which planner actually answered (a set key does not mean Muse is reachable).
+      if (j.planner === "rules" || j.planner === "muse") { metaKey = j.planner === "muse"; renderVolumes(); }
       if (j.intent && j.intent.make_cut) wantCut = true;
       if (j.opened) { location.hash = "#edit"; setTimeout(function () { location.reload(); }, 800); return; }
       if (j.started) { say("ghost", "Transfer started."); followTransfer(null); return; }

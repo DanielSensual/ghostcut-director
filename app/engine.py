@@ -850,6 +850,7 @@ class Engine:
         mod = self._offload()
         vols = self._volumes()
         try:
+            self._start_background_scans()  # ONBOARD review: a fresh window still gets clip counts
             scans = {s["volume"]: s for s in self._scan_public()}
         except Exception:  # noqa: BLE001 - briefing never blocks on scans
             scans = {}
@@ -859,7 +860,8 @@ class Engine:
         def clip_phrase(v) -> str:
             s = scans.get(str(v.path))
             if s is not None and s.get("clip_count"):
-                return f"{v.name}, {s['clip_count']} clips"
+                n = s["clip_count"]
+                return f"{v.name}, {n} clip{'s' if n != 1 else ''}"
             if s is not None and s.get("state") == "scanning":
                 return f"{v.name}, scanning"
             return v.name

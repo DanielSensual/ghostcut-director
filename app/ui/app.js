@@ -1147,5 +1147,6 @@
   if (window.GCTour && start[1] !== "notour" && ((start[0] === "import" && start[1] === "tour") || firstRun)) requestAnimationFrame(() => setTimeout(() => window.GCTour.open(window.GC), 250));
   tab(["review", "words", "why"].includes(start[1]) ? start[1] : "muse");
   // Open on a chosen frame (the cold open's title card) rather than a black first frame.
-  if (P.startAt) video.addEventListener("loadedmetadata", () => seek(P.startAt), { once: true });
+  // ONBOARD review: the first-run settings await above can let metadata load first, so seek now when it already has.
+  if (P.startAt) { if (video.readyState >= 1) seek(P.startAt); else video.addEventListener("loadedmetadata", () => seek(P.startAt), { once: true }); }
 })();

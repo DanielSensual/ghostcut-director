@@ -67,6 +67,9 @@
     function onKey(e) {
       if (document.querySelector(".modal:not([hidden])")) return; // Connections (opened from step 2) handles its own keys
       if (e.key === "Escape") { e.preventDefault(); close(true); return; }
+      // Keys on the tour stay with the tour: the player's Space/arrow shortcuts would otherwise play the hidden video
+      // and swallow Space on the tour's buttons.
+      if (card.contains(e.target)) e.stopPropagation();
       if (e.key !== "Tab") return;
       var focusables = Array.prototype.slice.call(card.querySelectorAll("button, [href], input, textarea, select, [tabindex]")).filter(function (n) { return !n.disabled && n.offsetParent !== null; });
       if (!focusables.length) return;
