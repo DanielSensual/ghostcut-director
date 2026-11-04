@@ -56,6 +56,51 @@ VOICE_MODEL = "muse-spark-1.3"
 VOICE_MAX_USD = 2.00
 CONNECTIONS_MAX_BODY = 64 * 1024
 NO_CONNECT = "Connections are unavailable in this app build (director package not found)."
+# KITCHEN: sampler tick (seconds) for the re-render progress sampler.
+KITCHEN_TICK_S = 0.5
+_KITCHEN_TICK_S = KITCHEN_TICK_S
+
+
+def sample_parts(parts_dir: Path, started_at: float, total: int | None) -> dict:
+    """KITCHEN: count fresh render parts for the ghost-kitchen progress.
+
+    Pure function (no threads, no I/O beyond stat) so tests need no
+    engine. ``shot_*.mp4`` files with ``mtime >= started_at - 2.0``
+    are fresh (the 2 s absorbs coarse file-system clocks); older
+    files are leftovers of a previous run and never count. ffmpeg
+    creates ``shot_NNN.mp4`` the moment it *starts* that shot, so
+    the newest fresh file is the one being encoded. After the last
+    shot, per-span ``audio_*`` parts and then ``parts.txt`` appear.
+    """
+    try:
+        directory = Path(parts_dir)
+        if not directory.is_dir():
+            return {"phase": "plan", "done": 0, "total": total}
+        threshold = float(started_at) - 2.0
+        fresh = 0
+        join_fresh = False
+        for entry in directory.iterdir():
+            try:
+                if not entry.is_file():
+                    continue
+                mtime = entry.stat().st_mtime
+            except OSError:
+                continue
+            if mtime < threshold:
+                continue
+            name = entry.name
+            if name.startswith("shot_") and name.endswith(".mp4"):
+                fresh += 1
+            elif name.startswith("audio_") or name == "parts.txt":
+                join_fresh = True
+        if join_fresh:
+            return {"phase": "join", "done": fresh, "total": fresh}
+        if fresh > 0:
+            total_out = max(total or 0, fresh)
+            return {"phase": "shots", "done": fresh - 1, "total": total_out}
+        return {"phase": "plan", "done": 0, "total": total}
+    except OSError:
+        return {"phase": "plan", "done": 0, "total": total}
 
 
 class Busy(Exception):
@@ -1048,16 +1093,78 @@ class Engine:
         return {"state": "running"}
 
     def _rerender_worker(self, job: Path) -> None:
+        # KITCHEN: real-progress sampler around the render.
+        started_at = time.time()
+        total: int | None = None
+        try:
+            _angles = json.loads((job / "angles.json").read_text())
+            _shots = _angles.get("shots") if isinstance(_angles, dict) else None
+            total = len(_shots) if isinstance(_shots, list) else None
+        except Exception:  # noqa: BLE001 - unreadable angles: total unknown
+            total = None
+        parts_dir = job / "cut.next.parts"
+        stop = threading.Event()
+
+        def _sampler() -> None:  # KITCHEN
+            while not stop.wait(min(float(globals().get("_KITCHEN_TICK_S", 0.5)),
+                                    float(globals().get("KITCHEN_TICK_S", 0.5)))):
+                try:
+                    snap = sample_parts(parts_dir, started_at, total)
+                except Exception:  # noqa: BLE001 - next tick retries
+                    continue
+                phase = snap.get("phase")
+                done = int(snap.get("done") or 0)
+                tot = snap.get("total")
+                if phase in ("shots", "join"):
+                    if tot:
+                        pct: int | None = min(99, round(100 * done / tot))
+                    else:
+                        pct = 99 if phase == "join" else None
+                else:
+                    pct = None
+                if done >= 1 and tot:
+                    if tot > done:
+                        elapsed = max(0.0, time.time() - started_at)
+                        eta_s: int | None = round((elapsed / done) * (tot - done))
+                    else:
+                        eta_s = 0
+                else:
+                    eta_s = None
+                with self.lock:
+                    if self._cutjob_state.get("state") != "running":
+                        return
+                    self._cutjob_state.update(
+                        {"phase": phase, "done": done, "total": tot,
+                         "pct": pct, "eta_s": eta_s})
+
+        sampler = threading.Thread(target=_sampler, name="kitchen-sampler", daemon=True)
+        sampler.start()
         try:
             result = cutjob.rerender(job, self.demo)
             message = f"Re-rendered cut.mp4 ({float(result['duration_s']):.1f}s)"
+            # KITCHEN: stop and join the sampler before writing done.
+            stop.set()
+            sampler.join(timeout=2)
             with self.lock:
                 self._load()
                 self._render_cookie = self._cookie()
                 self._cutjob_state = {"state": "done", "message": message}
         except Exception as e:  # noqa: BLE001 - the status endpoint reports it, cut.mp4 is untouched
+            # KITCHEN: stop and join the sampler before writing failed.
+            stop.set()
+            try:
+                sampler.join(timeout=2)
+            except Exception:  # noqa: BLE001
+                pass
             with self.lock:
                 self._cutjob_state = {"state": "failed", "message": f"{type(e).__name__}: {e}"}
+        finally:
+            # KITCHEN: ensure the sampler can never overwrite done/failed.
+            stop.set()
+            try:
+                sampler.join(timeout=2)
+            except Exception:  # noqa: BLE001
+                pass
 
     def _save(self) -> None:
         tmp = self.edits_file.with_suffix(".tmp")

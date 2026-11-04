@@ -954,6 +954,8 @@
     } finally { polling = false; }
   }
   function showProgress(st) {
+    // KITCHEN: legacy render progress also feeds the kitchen when present.
+    try { if (window.Kitchen) Kitchen.update(st); } catch { /* kitchen is optional */ }
     bar.hidden = false;
     bar.className = "renderbar";
     if (mode !== "running") {
@@ -1040,6 +1042,10 @@
       barActs(h("button", { title: "Dismiss", onclick: closeBar }, "×"));
       return;
     }
+    // KITCHEN: start the ghost kitchen over the player, poster behind it.
+    try { if (window.Kitchen) Kitchen.start({mode:"cutjob"}); } catch { /* kitchen is optional */ }
+    try { video.pause(); } catch { /* ignore */ }
+    video.poster = `demo/poster.jpg${VQ}`;
     cutjobRunning = true;
     lockEdits();
     renderButton();
