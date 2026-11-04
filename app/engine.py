@@ -73,8 +73,12 @@ def _brief(st: dict) -> dict:
     return out
 
 
+MUSE_UNAVAILABLE = "Muse unavailable, using the built-in planner."  # ONBOARD
+
+
 class Engine:
-    def __init__(self, demo: Path = DEMO, render=None, job_dir: Path | str | None = None):
+    def __init__(self, demo: Path = DEMO, render=None, job_dir: Path | str | None = None, settings_path: Path | str | None = None):  # ONBOARD
+        self._settings_path: Path | None = Path(settings_path) if settings_path is not None else None  # ONBOARD: lazy, never read here
         self.demo = demo
         self.edits_file = demo / "edits.json"
         self.spend_file = demo / "muse_spend.json"
@@ -104,6 +108,87 @@ class Engine:
         self._load()
         self.render_state = _brief(self._status())
         self._render_cookie = self._cookie()
+
+    # ONBOARD: per-machine first-run settings (lazy file, never read in __init__)
+    def _settings_file(self) -> Path:
+        if getattr(self, "_settings_path", None) is not None:
+            return Path(self._settings_path)  # type: ignore[arg-type]
+        env = os.environ.get("GHOSTCUT_SETTINGS")
+        if env:
+            return Path(env)
+        return Path.home() / "Library" / "Application Support" / "GhostCut Director" / "settings.json"
+
+    @staticmethod
+    def _default_onboarding() -> dict:
+        return {"seen": False, "version": 1, "step": 0, "skipped": False, "completed_at": None}
+
+    def _read_onboarding(self) -> dict:
+        default = self._default_onboarding()
+        try:
+            path = self._settings_file()
+            if not path.exists():
+                return dict(default)
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return dict(default)
+        if not isinstance(raw, dict):
+            return dict(default)
+        ob = raw.get("onboarding")
+        if not isinstance(ob, dict):
+            return dict(default)
+        out = dict(default)
+        if "seen" in ob:
+            out["seen"] = bool(ob["seen"])
+        if "skipped" in ob:
+            out["skipped"] = bool(ob["skipped"])
+        if "step" in ob:
+            try:
+                out["step"] = int(ob["step"])  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                pass
+        if "completed_at" in ob:
+            v = ob["completed_at"]
+            out["completed_at"] = str(v) if v is not None else None
+        out["version"] = 1
+        return out
+
+    def settings_get(self) -> dict:  # ONBOARD
+        onboarding = self._read_onboarding()
+        first_run = not (onboarding.get("seen") or onboarding.get("completed_at"))
+        return {"onboarding": onboarding, "first_run": bool(first_run), "meta_key": bool(os.environ.get("MODEL_API_KEY"))}
+
+    def settings_post(self, body: dict) -> dict:  # ONBOARD
+        current = self._read_onboarding()
+        incoming: dict = {}
+        if isinstance(body, dict):
+            cand = body.get("onboarding")
+            if isinstance(cand, dict):
+                incoming = cand
+            elif any(k in body for k in ("seen", "step", "skipped", "completed_at", "version")):
+                incoming = body  # tolerate a bare onboarding block
+        merged = dict(current)
+        if "seen" in incoming:
+            merged["seen"] = bool(incoming["seen"])
+        if "skipped" in incoming:
+            merged["skipped"] = bool(incoming["skipped"])
+        if "step" in incoming:
+            try:
+                merged["step"] = int(incoming["step"])  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                pass
+        if "completed_at" in incoming:
+            v = incoming["completed_at"]
+            merged["completed_at"] = str(v) if v is not None else None
+        merged["version"] = 1
+        path = self._settings_file()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(json.dumps({"onboarding": merged}, indent=2), encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError:
+            pass
+        return self.settings_get()
 
     def _load(self) -> None:
         """Read the cut and its edit list (again after a render promotes or reverts). Edits the current version
@@ -526,6 +611,11 @@ class Engine:
                      "total": s.get("total", 0),
                      "clip_count": s.get("clip_count", 0),
                      "total_bytes": s.get("total_bytes", 0),
+                     # ONBOARD: tile facts from the scan
+                     "camera_labels": list(s.get("camera_labels") or []),
+                     "date_start": s.get("date_start"),
+                     "date_end": s.get("date_end"),
+                     "sample": s.get("sample"),
                      "message": s.get("message", "")}
                     for s in self._scan_states.values()]
 
@@ -584,10 +674,18 @@ class Engine:
             with self._scan_lock:
                 state = self._scan_states.get(key) or {
                     "volume": key, "name": Path(key).name}
+                try:  # ONBOARD: tile facts (never fail a ready scan over them)
+                    lo, hi = scan.date_range
+                except Exception:  # noqa: BLE001
+                    lo = hi = None
                 state.update({"state": "ready", "done": len(scan.clips),
                               "total": len(scan.clips),
                               "clip_count": len(scan.clips),
                               "total_bytes": scan.total_bytes,
+                              "camera_labels": sorted({c.camera_label for c in scan.clips if c.camera_label}),
+                              "date_start": lo.isoformat() if lo else None,
+                              "date_end": hi.isoformat() if hi else None,
+                              "sample": scan.clips[0].name if scan.clips else None,
                               "message": "", "_fingerprint": fingerprint})
                 self._scan_states[key] = state
         except Exception as e:  # noqa: BLE001 - scans endpoint reports it
@@ -755,13 +853,113 @@ class Engine:
         reply = self._shoot_sentence(scans, plan, named=bool(want_date))
         return self._plan_card(scans, plan, intent, reply=reply)
 
+    # ONBOARD: live briefing shared by Ghost help and the tour
+    def _briefing_payload(self) -> dict:
+        mod = self._offload()
+        vols = self._volumes()
+        try:
+            self._start_background_scans()  # ONBOARD review: a fresh window still gets clip counts
+            scans = {s["volume"]: s for s in self._scan_public()}
+        except Exception:  # noqa: BLE001 - briefing never blocks on scans
+            scans = {}
+        cards = [v for v in vols if v.kind == mod.KIND_CAMERA]
+        dests = [v for v in vols if v.kind == mod.KIND_DESTINATION]
+
+        def clip_phrase(v) -> str:
+            s = scans.get(str(v.path))
+            if s is not None and s.get("clip_count"):
+                n = s["clip_count"]
+                return f"{v.name}, {n} clip{'s' if n != 1 else ''}"
+            if s is not None and s.get("state") == "scanning":
+                return f"{v.name}, scanning"
+            return v.name
+
+        def gb(n: int) -> str:
+            try:
+                v = float(n or 0)
+            except (TypeError, ValueError):
+                v = 0.0
+            if v >= 1e9:
+                return f"{v / 1e9:.0f} GB"
+            if v >= 1e6:
+                return f"{v / 1e6:.0f} MB"
+            return f"{int(v)} B"
+
+        if cards and dests:
+            bits = "; ".join(clip_phrase(v) for v in cards)
+            d = dests[0]
+            detail = (cards[0].detail or "camera").strip()
+            reply = (f"I can see {len(cards)} {detail} card{'s' if len(cards) != 1 else ''} "
+                     f"({bits}) and {d.name} with {gb(d.free_bytes)} free. "
+                     f"Say 'transfer to my SSD' to begin.")
+        elif cards:
+            bits = "; ".join(clip_phrase(v) for v in cards)
+            reply = (f"I can see {len(cards)} camera card{'s' if len(cards) != 1 else ''} "
+                     f"({bits}) — connect your SSD to continue.")
+        elif dests:
+            d = dests[0]
+            reply = (f"I can see {d.name} with {gb(d.free_bytes)} free — "
+                     f"insert a camera card to begin.")
+        else:
+            reply = "Insert a camera card and connect your SSD — I'll plan the copy from there."
+        steps = [
+            "Insert a camera card — Ghost scans it and counts the clips.",
+            "Pick a destination drive and tell Ghost what to copy.",
+            "Review the plan card, then Transfer — every file is checksum-verified.",
+            "Make the cut: sync, takes, grade and angles, in the background.",
+        ]
+        live_cards = []
+        for v in vols:
+            if v.kind != mod.KIND_CAMERA:
+                continue
+            s = scans.get(str(v.path), {})
+            live_cards.append({
+                "volume": str(v.path), "name": v.name, "kind": v.kind,
+                "detail": v.detail, "free_bytes": v.free_bytes,
+                "total_bytes": v.total_bytes,
+                "clip_count": s.get("clip_count", 0),
+                "state": s.get("state", ""),
+            })
+        dest = None
+        if dests:
+            d = dests[0]
+            dest = {"volume": str(d.path), "name": d.name, "kind": d.kind,
+                    "detail": d.detail, "free_bytes": d.free_bytes,
+                    "total_bytes": d.total_bytes}
+        return {"reply": reply, "steps": steps,
+                "live": {"cards": live_cards, "destination": dest}}
+
+    def offload_briefing(self) -> dict:  # ONBOARD
+        payload = self._briefing_payload()
+        return {"reply": payload["reply"], "steps": payload["steps"],
+                "live": payload["live"]}
+
     def offload_ask(self, text: str) -> dict:
         mod = self._offload()
         vols = self._volumes()
+        # ONBOARD: help is answered from live state before any intent parse
+        try:
+            _is_help = getattr(mod, "is_help", None)
+            if callable(_is_help) and _is_help(str(text or "")):
+                payload = self._briefing_payload()
+                return {"reply": payload["reply"], "help": True,
+                        "steps": payload["steps"], "live": payload["live"]}
+        except Exception:  # noqa: BLE001 - fall through to intent
+            pass
         try:
             intent = mod.parse_intent(str(text or ""), vols)
         except Exception:
             intent = mod.parse_intent_rule(str(text or ""), vols)
+        res = self._offload_ask_intent(intent, vols)
+        # ONBOARD: say honestly which planner read the request (Muse can be
+        # unavailable, e.g. a 402 when the Meta API credit runs out).
+        if isinstance(res, dict):
+            res.setdefault("planner", "muse" if intent.method == "spark" else "rules")
+            if intent.method != "spark" and os.environ.get("MODEL_API_KEY"):
+                res.setdefault("note", MUSE_UNAVAILABLE)
+        return res
+
+    def _offload_ask_intent(self, intent, vols) -> dict:  # ONBOARD: body of offload_ask, unchanged
         data = intent.as_dict()
         if intent.confirm:
             if self._offload_plan is None:
@@ -1284,6 +1482,10 @@ class Handler(SimpleHTTPRequestHandler):
             return self._call(self.engine.offload_status)
         if url.path == "/api/offload/cut/status":
             return self._call(self.engine.cut_bg_status)
+        if url.path == "/api/settings":  # ONBOARD
+            return self._call(self.engine.settings_get)
+        if url.path == "/api/offload/briefing":  # ONBOARD
+            return self._call(self.engine.offload_briefing)
         if url.path == "/api/offload/shoot":
             q = parse_qs(url.query)
             return self._call(lambda: self.engine.offload_shoot(q.get("shoot", [""])[0]))
@@ -1417,6 +1619,8 @@ class Handler(SimpleHTTPRequestHandler):
             return e.start_offload_cut(
                 str(body.get("shoot_dir") or body.get("shoot")),
                 body.get("out_dir"))
+        if path == "/api/settings":  # ONBOARD
+            return e.settings_post(body)
         raise FileNotFoundError("unknown endpoint")
 
     # HTTP Range, so the video player can seek (Safari/WKWebView will not play without it).

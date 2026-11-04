@@ -1212,6 +1212,39 @@ GHOST_DEVELOPER = (
     "Never invent a volume, a path or footage that is not listed."
 )
 
+# ONBOARD: Ghost's briefing, shared by the help reply, the tour and Spark.
+GHOST_BRIEFING = (
+    "How an import goes: the editor inserts one or more camera cards, "
+    "names a destination drive (usually the SSD) and, if they like, a "
+    "project name. Ghost scans each card, then plans the copy. Only the "
+    "most recent shoot day is planned unless the editor names a date or "
+    "asks for everything; older footage is listed so it can be included. "
+    "Transfer copies every file and keeps it only when its checksum "
+    "matches the card. Afterwards, Make the cut runs sync, words, grade "
+    "and angles on the copied shoot. Ghost understands which card, which "
+    "drive, a project name, a shoot date, 'all of it', 'go ahead' and "
+    "'open the last job'. Ghost never copies without the editor's "
+    "confirm, never invents a volume, and never writes to a card."
+)
+GHOST_DEVELOPER = GHOST_DEVELOPER + " " + GHOST_BRIEFING  # ONBOARD
+
+_HELP_RE = re.compile(  # ONBOARD
+    r"\b(what can you do|what do you do|how does (this|it) work|"
+    r"tutorial|walk me through)\b", re.IGNORECASE)
+_HELP_WEAK_RE = re.compile(r"\b(help|get(ting)? started)\b", re.IGNORECASE)  # ONBOARD
+# ONBOARD: "help me copy the card to my SSD" is a request, not a help question.
+_ACTION_RE = re.compile(
+    r"\b(copy|transfer|move|offload|import|back ?up|put|send|open|go ahead|"
+    r"include|plan)\b", re.IGNORECASE)
+
+
+def is_help(text: str) -> bool:  # ONBOARD
+    """True when the editor asks how Ghost works rather than for a copy."""
+    t = str(text or "")
+    if _HELP_RE.search(t):
+        return True
+    return bool(_HELP_WEAK_RE.search(t)) and not _ACTION_RE.search(t)
+
 
 @dataclass(slots=True)
 class GhostIntent:

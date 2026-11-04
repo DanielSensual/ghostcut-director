@@ -1,0 +1,62 @@
+/* GhostCut Director — ONBOARD shared design upgrade (ghost.css).
+   Loaded after app.css. Only adds or overrides; never renames or removes
+   a class, and never touches .view, .panel, .timeline or grid rules.
+   System font stack only — no web font, no network. */
+:root {
+  --dim: #8791a5;
+  --warn: #e6b35a;
+  --blue: #9db8ff;
+  --glass: rgba(22, 26, 35, .62);
+  --ghost-glow: 0 0 24px #9db8ff55;
+  --t-xs: 11px;
+  --t-sm: 12.5px;
+  --t-md: 14px;
+  --t-lg: 20px;
+  --t-xl: 32px;
+}
+
+.primary { background: #e8590c; }
+.primary:hover { background: var(--orange2); }
+
+.page h2 {
+  font-size: var(--t-xl);
+  letter-spacing: -.02em;
+  line-height: 1.1;
+}
+.page .lede, .lede { font-size: var(--t-md); }
+
+.box, .ghost-plan, .dlg, .pop, .msg.muse {
+  background: var(--glass);
+  border: 1px solid #ffffff14;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, .35);
+  backdrop-filter: blur(14px) saturate(1.2);
+  -webkit-backdrop-filter: blur(14px) saturate(1.2);
+}
+
+#view-import, #view-story, #view-deliver {
+  background:
+    radial-gradient(720px 420px at 0% 0%, rgba(255, 106, 26, .10), transparent 62%),
+    radial-gradient(720px 420px at 100% 0%, rgba(157, 184, 255, .10), transparent 62%),
+    var(--bg);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes gfloat {
+    0%, 100% { transform: translateY(0); }
+    50% { transform: translateY(-6px); }
+  }
+  @keyframes gpop {
+    from { opacity: 0; transform: translateY(6px) scale(.985); }
+    to { opacity: 1; transform: none; }
+  }
+  .ghost-mark { animation: gfloat 3.4s ease-in-out infinite; }
+  .msg, .box { animation: gpop .35s ease both; }
+  .ghost-thumbs figure { animation: gpop .4s ease both; }
+  .ghost-thumbs figure:nth-child(2) { animation-delay: .04s; }
+  .ghost-thumbs figure:nth-child(3) { animation-delay: .08s; }
+  .ghost-thumbs figure:nth-child(4) { animation-delay: .12s; }
+  .ghost-thumbs figure:nth-child(5) { animation-delay: .16s; }
+  .ghost-thumbs figure:nth-child(6) { animation-delay: .20s; }
+  .primary { transition: transform .15s ease, background .15s ease; }
+  .primary:hover { transform: translateY(-1px); }
+}
