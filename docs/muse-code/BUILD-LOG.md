@@ -755,3 +755,56 @@ Live test: TBD (the owner fills this from the real-footage run).
   green except the same 11 pre-existing `ps`-sandbox errors in
   `tests/test_engine_render.py` and `tests/test_render_runner.py`
   (730 on the pristine tree, same 11).
+
+# Build log: OFFLOAD — Ghost, the import agent (2026-11-04)
+
+| Step | By | What |
+|---|---|---|
+| Brief | Project owner, with Claude Code | `OFFLOAD-BRIEF.md`: the Import page becomes Ghost (`director offload` + the app's Import tab), after the owner's review of the app on submission day. |
+| Build | Meta **Muse Code** on **`muse-wonder-1.0`** | `src/director/offload.py` (`list_volumes` / `scan_card` / `plan_offload` / `run_offload`, Ghost intent with a Spark path and a rule fallback), the `director offload` command, the Ghost endpoints and background cut in `app/engine.py`, the Ghost chat on the Import tab (plan card, live progress, shoot bins, Make the cut), `tests/test_offload.py` (14 tests). Built straight from the brief (no separate design). |
+
+Muse Code token use: TBD (the owner fills this from the run log).
+
+## Build notes (Muse Code)
+
+- `list_volumes()` skips hidden volumes, the boot volume and
+  installer/DMG drops, then guesses from layout (Sony
+  `PRIVATE/M4ROOT` or top-level `M4ROOT`, `DCIM/DJI_*`, `DCIM/*GOPRO*`,
+  `DCIM/100APPLE`, WAV-only recorder roots), then volume name, then
+  size. A multi-terabyte archive drive that merely contains a `DCIM`
+  backup folder still reads as the destination.
+- `scan_card()` walks read-only, skipping `.LRF` proxies, thumbnail
+  and system trees and dotfiles. Recorded time is ffprobe
+  `creation_time`, then the Sony `M01.XML` `CreationDate`, then file
+  mtime, and each clip says which (`time_source`); make/model come
+  from the probe or the XML `Device`. One card holding two cameras'
+  clips yields both camera labels (`FX3`, `7SM3` live), and
+  `plan_offload` numbers duplicate labels across cards (`FX3`,
+  `FX3 2`) into `<YYYY-MM-DD> <project>/<label>/`.
+- Copies stream through `*.part` and rename only after the streamed
+  checksum (xxhash when importable, else BLAKE2b) matches the source;
+  a mismatch stays unverified with its `.part` kept and named in the
+  result. `offload.json` records sources, destinations, sizes,
+  checksums, verified and skipped per file. Nothing writes to the
+  source card and nothing ejects.
+- Ghost: Spark turns the request into a checked intent against the
+  live volume facts (guarded import, `MODEL_API_KEY` only); without
+  it the rule parser covers "SD card", "drone", "to my SSD" /
+  "extreme", project naming, "make the cut", "yes, go" and "open
+  yesterday's job". Deterministic code does all file work either way,
+  and nothing copies before Transfer.
+
+## Live test (2026-11-04, read-only on the mounted cards)
+
+- `list_volumes()`: the destination SSD (536.6 GB free of 4000.7 GB),
+  and two Sony camera cards (246.3 GB free of 256.5 GB; 432.5 GB free
+  of 512.0 GB); boot, installer and hidden volumes skipped.
+- `scan_card()`: card one — 4 clips, 10.135 GB, all Sony `ILME-FX3`;
+  card two — 111 clips, 79.429 GB, 10× `ILME-FX3` + 101× `ILCE-7SM3`,
+  recorded 2026-10-19 to 2026-11-03. Every clip's time came from
+  ffprobe with its `M01.XML` sidecar paired.
+- Two smallest clips (67,384,204 B and 67,386,559 B) plus sidecars
+  planned into `/tmp/offload-test/` and copied for real: 4 files,
+  134,775,032 B, all verified (independent BLAKE2b re-hash matches),
+  `offload.json` written, source mtimes and sizes unchanged. The SSD
+  was not written.

@@ -390,6 +390,27 @@ code { font-family: var(--mono); font-size: 12px; }
 .dlg-acts button:not(.primary) { padding: 6px 12px; border-radius: 7px; border: 1px solid var(--line2); color: var(--muted); }
 .primary:disabled, .primary:disabled:hover { background: var(--bg); color: var(--dim); box-shadow: inset 0 0 0 1px var(--line2); cursor: not-allowed; }
 
+/* ---------- Ghost (Import) ---------- */
+.ghost-chat { display: flex; flex-direction: column; gap: 10px; max-width: 760px; margin-bottom: 14px; }
+.ghost-chat .msg { max-width: 100%; }
+.ghost-vols { max-width: 760px; margin-bottom: 14px; }
+.ghost-plan .vol { word-break: break-all; }
+.ghost-bar { height: 8px; background: var(--bg); border-radius: 4px; overflow: hidden; margin: 8px 0; max-width: 760px; }
+.ghost-bar i { display: block; height: 100%; background: var(--orange); transition: width .4s ease; }
+.ghost-live { max-width: 760px; font-size: 12px; color: var(--muted); }
+.ghost-ask { max-width: 760px; padding: 10px 0 14px; border-top: 0; align-items: flex-end; }
+.ghost-ask textarea { flex: 1; resize: none; background: var(--bg); color: var(--text); border: 1px solid var(--line2); border-radius: 8px; padding: 8px; font: inherit; }
+.ghost-ask textarea:focus { outline: none; border-color: var(--ghost); }
+.ghost-thumbs { display: flex; flex-wrap: wrap; gap: 10px; }
+.ghost-thumbs figure { margin: 0; width: 160px; }
+.ghost-thumbs img { width: 160px; height: 90px; object-fit: cover; border-radius: 6px; border: 1px solid var(--line2); background: #000; display: block; }
+.ghost-thumbs figcaption { font-size: 11px; color: var(--muted); margin-top: 4px; word-break: break-all; }
+.ghost-open { display: flex; gap: 8px; max-width: 760px; margin-top: 6px; }
+.ghost-open input { flex: 1; background: var(--bg); color: var(--text); border: 1px solid var(--line2); border-radius: 8px; padding: 7px 9px; font: inherit; font-size: 12.5px; }
+.ghost-open button { font-size: 12px; padding: 6px 14px; border-radius: 7px; border: 1px solid var(--line2); color: var(--muted); }
+.ghost-open button:hover { color: var(--text); }
+.ghost-cutstat { font-size: 12px; color: var(--muted); margin-top: 8px; white-space: pre-wrap; }
+
 @media (max-width: 1100px) {
   /* The hidden sidebar is no longer a grid item, so the grid has two columns, not three. */
   #view-edit { grid-template-columns: minmax(0, 1fr) 320px; }

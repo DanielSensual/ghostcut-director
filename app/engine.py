@@ -87,6 +87,14 @@ class Engine:
         self.job_dir = Path(job_dir) if job_dir else None
         self._cutjob_state: dict = {"state": "idle", "message": ""}
         self._cutjob_thread: threading.Thread | None = None
+        self._offload_state: dict = {"state": "idle", "message": ""}
+        self._offload_thread: threading.Thread | None = None
+        self._offload_plan = None
+        self._offload_intent: dict | None = None
+        self._offload_progress: dict = {}
+        self._offload_root: Path | None = None
+        self._cut_bg_state: dict = {"state": "idle", "message": ""}
+        self._cut_bg_thread: threading.Thread | None = None
         self._render_cookie: tuple = ()
         if self.job_dir is not None:
             cutjob.build_project(self.job_dir, self.demo)
@@ -457,6 +465,369 @@ class Engine:
             raise ValueError(str(e)) from e
         return {"providers": cm.list_providers()}
 
+    # ---------- Ghost: card offload (Import) + background cut ----------
+
+    def _offload(self):
+        """director.offload, with src/ put on the path here (503 without it)."""
+        src = str(ROOT / "src")
+        if src not in sys.path:
+            sys.path.insert(0, src)
+        try:
+            from director import offload as offload_mod
+        except ImportError as e:
+            raise Unavailable(f"Offload needs the Director package: {e}") from e
+        return offload_mod
+
+    def _allowed_path(self, raw: str) -> Path:
+        """A client path, re-resolved, confined to /Volumes, home or /tmp."""
+        text = str(raw or "").strip()
+        if not text:
+            raise ValueError("offload: missing path")
+        resolved = Path(text).expanduser().resolve()
+        roots = [Path("/Volumes"), Path.home().resolve(), Path("/tmp").resolve()]
+        for extra in ("/private/tmp", os.environ.get("TMPDIR") or ""):
+            if extra:
+                try:
+                    roots.append(Path(extra).resolve())
+                except OSError:
+                    pass
+        try:
+            import tempfile as _tempfile
+
+            roots.append(Path(_tempfile.gettempdir()).resolve())
+        except OSError:
+            pass
+        if not any(resolved == r or r in resolved.parents for r in roots):
+            raise ValueError(f"offload: path outside the allowed folders: {text}")
+        return resolved
+
+    def _volumes(self) -> list:
+        mod = self._offload()
+        root = getattr(self, "_offload_root", None)
+        return mod.list_volumes(root) if root is not None else mod.list_volumes()
+
+    def offload_volumes(self) -> dict:
+        return {"volumes": [v.as_dict() for v in self._volumes()]}
+
+    def _plan_card(self, scans, plan, intent: dict) -> dict:
+        cards = []
+        for scan in scans:
+            lo, hi = scan.date_range
+            cards.append({"volume": str(scan.volume),
+                          "name": Path(scan.volume).name,
+                          "kind": scan.kind, "detail": scan.detail,
+                          "camera": scan.detail or scan.kind,
+                          "clip_count": len(scan.clips),
+                          "total_bytes": scan.total_bytes,
+                          "gb": round(scan.total_bytes / 1e9, 3),
+                          "date_start": lo.isoformat() if lo else None,
+                          "date_end": hi.isoformat() if hi else None})
+        return {"intent": intent, "reply": intent.get("reply", ""),
+                "cards": cards,
+                "destination": str(plan.destination),
+                "shoot_dir": str(plan.shoot_dir),
+                "project": plan.project, "date": plan.date_str,
+                "total_bytes": plan.total_bytes,
+                "bytes_to_copy": plan.bytes_to_copy,
+                "free_bytes": plan.free_bytes,
+                "enough_space": plan.bytes_to_copy <= plan.free_bytes,
+                "entries": [e.as_dict() for e in plan.entries],
+                "volumes": [v.as_dict() for v in self._volumes()]}
+
+    def _make_plan(self, card_paths: list[str], destination: str,
+                   project: str | None, intent: dict) -> dict:
+        mod = self._offload()
+        if not card_paths:
+            raise ValueError("offload: no camera card in that request")
+        if not destination:
+            raise ValueError("offload: no destination drive in that request")
+        cards = [self._allowed_path(p) for p in card_paths]
+        dest = self._allowed_path(destination)
+        try:
+            scans = [mod.scan_card(c) for c in cards]
+            plan = mod.plan_offload(scans, dest, project=project)
+        except mod.OffloadError as e:
+            raise ValueError(str(e)) from e
+        self._offload_plan = plan
+        self._offload_intent = intent
+        self._offload_state = {"state": "planned",
+                               "message": f"Ready to copy to {plan.shoot_dir}",
+                               "shoot_dir": str(plan.shoot_dir)}
+        self._offload_progress = {}
+        return self._plan_card(scans, plan, intent)
+
+    def offload_ask(self, text: str) -> dict:
+        mod = self._offload()
+        vols = self._volumes()
+        try:
+            intent = mod.parse_intent(str(text or ""), vols)
+        except Exception:
+            intent = mod.parse_intent_rule(str(text or ""), vols)
+        data = intent.as_dict()
+        if intent.confirm:
+            if self._offload_plan is None:
+                return {"intent": data, "reply": "Nothing to transfer yet — tell me which card to copy."}
+            started = self.offload_start()
+            return {"intent": data, "reply": intent.reply or "Starting the transfer.",
+                    "started": started}
+        if intent.open_job:
+            job = self._resolve_open_job(intent.open_job)
+            opened = self.open_job(str(job))
+            return {"intent": data, "reply": intent.reply or "Opening that job.",
+                    "opened": True, "project": opened}
+        if not intent.cards or not intent.destination:
+            return {"intent": data, "reply": intent.reply,
+                    "volumes": [v.as_dict() for v in vols]}
+        return self._make_plan(list(intent.cards), str(intent.destination),
+                               intent.project, data)
+
+    def _resolve_open_job(self, wanted: str) -> Path:
+        if wanted and wanted != "yesterday":
+            return self._allowed_path(wanted)
+        # "yesterday's job": newest folder holding a Director job.
+        candidates: list[Path] = []
+        bases: list[Path] = []
+        try:
+            bases.append(Path("/") / "Volumes" / "Extreme SSD")
+        except OSError:
+            pass
+        bases.append(Path.home())
+        for base in bases:
+            try:
+                if not base.exists():
+                    continue
+                for child in base.iterdir():
+                    if child.is_dir() and ((child / "angles.json").exists()
+                                           or (child / "cut.json").exists()):
+                        candidates.append(child)
+            except OSError:
+                continue
+        if not candidates:
+            raise ValueError("offload: no Director job found to open")
+        candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        return candidates[0]
+
+    def offload_plan(self, cards: list, destination: str,
+                     project: str | None = None) -> dict:
+        intent = {"cards": [str(c) for c in (cards or [])],
+                  "destination": destination, "project": project,
+                  "make_cut": False, "open_job": None, "confirm": False,
+                  "reply": "Here is the transfer to plan.", "method": "explicit"}
+        return self._make_plan([str(c) for c in (cards or [])],
+                               str(destination or ""), project, intent)
+
+    def offload_start(self) -> dict:
+        plan = self._offload_plan
+        if plan is None:
+            raise ValueError("offload: nothing planned yet — ask Ghost first")
+        with self.lock:
+            if self._offload_state.get("state") == "running":
+                raise Busy("Offloading — wait for it to finish")
+            self._offload_state = {"state": "running", "message": "Copying",
+                                   "shoot_dir": str(plan.shoot_dir)}
+            self._offload_progress = {"bytes_done": 0,
+                                      "bytes_total": plan.bytes_to_copy,
+                                      "file": ""}
+            th = threading.Thread(target=self._offload_worker, args=(plan,),
+                                  name="offload-copy", daemon=True)
+            self._offload_thread = th
+            th.start()
+        return {"state": "running", "shoot_dir": str(plan.shoot_dir)}
+
+    def _offload_worker(self, plan) -> None:
+        mod = self._offload()
+
+        def progress(event: dict) -> None:
+            with self.lock:
+                self._offload_progress = dict(event)
+
+        try:
+            result = mod.run_offload(plan, progress)
+            failed = [e.destination.name for e in result.failed]
+            with self.lock:
+                if failed:
+                    self._offload_state = {
+                        "state": "done_with_failures",
+                        "message": (f"Verified {result.verified_count} files; "
+                                    f"failed: {', '.join(failed)}"),
+                        "shoot_dir": str(plan.shoot_dir),
+                        "result": result.as_dict()}
+                else:
+                    self._offload_state = {
+                        "state": "done",
+                        "message": (f"Verified {result.verified_count} files, "
+                                    f"{result.verified_bytes / 1e9:.2f} GB"),
+                        "shoot_dir": str(plan.shoot_dir),
+                        "result": result.as_dict()}
+        except Exception as e:  # noqa: BLE001 - status endpoint reports it
+            with self.lock:
+                self._offload_state = {"state": "failed",
+                                       "message": f"{type(e).__name__}: {e}",
+                                       "shoot_dir": str(plan.shoot_dir)}
+
+    def offload_status(self) -> dict:
+        state = dict(self._offload_state)
+        state["progress"] = dict(self._offload_progress)
+        if self._offload_plan is not None:
+            state["shoot_dir"] = str(self._offload_plan.shoot_dir)
+        return state
+
+    def start_offload_cut(self, shoot_dir: str, out_dir: str | None = None) -> dict:
+        shoot = self._allowed_path(shoot_dir)
+        if not shoot.is_dir():
+            raise ValueError(f"offload: no such shoot folder: {shoot_dir}")
+        out = (self._allowed_path(out_dir) if out_dir
+               else Path(f"{shoot}-job"))
+        with self.lock:
+            if self._cut_bg_state.get("state") == "running":
+                raise Busy("Cutting — wait for it to finish")
+            self._cut_bg_state = {"state": "running", "message": "Starting cut",
+                                  "shoot_dir": str(shoot), "out_dir": str(out),
+                                  "stages": {}}
+            th = threading.Thread(target=self._cut_worker, args=(shoot, out),
+                                  name="offload-cut", daemon=True)
+            self._cut_bg_thread = th
+            th.start()
+        return {"state": "running", "shoot_dir": str(shoot), "out_dir": str(out)}
+
+    def _cut_worker(self, shoot: Path, out: Path) -> None:
+        try:
+            self._run_cut_job(shoot, out)
+            with self.lock:
+                self._cut_bg_state = {"state": "done",
+                                      "message": f"Cut finished in {out}",
+                                      "shoot_dir": str(shoot),
+                                      "out_dir": str(out), "stages": {}}
+            try:
+                self.open_job(str(out))
+            except Exception as e:  # noqa: BLE001 - cut exists; opening is best-effort
+                with self.lock:
+                    self._cut_bg_state["message"] = (
+                        f"Cut finished in {out} (open failed: {e})")
+        except Exception as e:  # noqa: BLE001 - status endpoint reports it
+            with self.lock:
+                keep = dict(self._cut_bg_state)
+                keep.update({"state": "failed",
+                             "message": f"{type(e).__name__}: {e}"})
+                self._cut_bg_state = keep
+
+    def _run_cut_job(self, shoot: Path, out: Path) -> dict:
+        """The background `director cut` (patched by tests with a fake)."""
+        src = str(ROOT / "src")
+        if src not in sys.path:
+            sys.path.insert(0, src)
+        from director import cut as cut_mod
+        from director import sync as sync_mod
+
+        clips = sorted(
+            p for p in shoot.rglob("*")
+            if p.is_file() and p.suffix.lower()
+            in (".mp4", ".mov", ".m4v", ".mp3", ".wav", ".m4a")
+            and ".thumbs" not in p.parts and not p.name.startswith("."))
+        if len(clips) < 2:
+            raise ValueError("offload: a cut needs at least two clips in the shoot folder")
+        return cut_mod.run(
+            clips=clips, out_dir=out, reference_path=None, audio_path=None,
+            words_path=None, transcripts_dir=None,
+            methods=sync_mod.parse_methods(None),
+            no_grade=False, grade_check=False, no_muse=False,
+            model="muse-spark-1.3", min_shot_s=2.0, no_vertical=False,
+            no_sam=False, no_export=False, no_qc=False, max_usd=5.0,
+            force=False, project_name="Director cut", no_tighten=False)
+
+    def cut_bg_status(self) -> dict:
+        state = dict(self._cut_bg_state)
+        out = state.get("out_dir")
+        if out:
+            try:
+                manifest = json.loads((Path(out) / "cut.json").read_text())
+                stages = manifest.get("stages") or {}
+                state["stages"] = {k: (v.get("status") if isinstance(v, dict) else v)
+                                   for k, v in stages.items()}
+                if manifest.get("status"):
+                    state["cut_status"] = manifest["status"]
+            except (OSError, ValueError):
+                pass
+        return state
+
+    def offload_shoot(self, shoot_dir: str) -> dict:
+        shoot = self._allowed_path(shoot_dir)
+        if not shoot.is_dir():
+            raise ValueError(f"offload: no such shoot folder: {shoot_dir}")
+        bins: dict[str, list[dict]] = {}
+        for media in sorted(shoot.rglob("*")):
+            if not media.is_file() or media.name.startswith("."):
+                continue
+            if ".thumbs" in media.parts or media.name == "offload.json":
+                continue
+            if media.suffix.lower() not in (".mp4", ".mov", ".m4v", ".wav",
+                                            ".mp3", ".m4a"):
+                continue
+            label = media.parent.name if media.parent != shoot else "Shoot"
+            info = self._offload()._probe_info(media)  # noqa: SLF001
+            bins.setdefault(label, []).append(
+                {"name": media.name, "path": str(media),
+                 "duration_s": info.get("duration_s"),
+                 "thumb": f"/api/offload/thumb?shoot={shoot}&file={media}"})
+        return {"shoot_dir": str(shoot),
+                "bins": [{"camera": k, "clips": v}
+                         for k, v in sorted(bins.items())]}
+
+    def offload_thumb(self, shoot_raw: str, file_raw: str) -> Path:
+        shoot = self._allowed_path(shoot_raw)
+        media = self._allowed_path(file_raw)
+        if shoot not in media.parents:
+            raise ValueError("offload: thumbnail outside the shoot folder")
+        thumb_dir = shoot / ".thumbs"
+        thumb_dir.mkdir(parents=True, exist_ok=True)
+        thumb = thumb_dir / f"{media.stem}.jpg"
+        if not thumb.exists():
+            subprocess.run(
+                ["ffmpeg", "-v", "error", "-y", "-ss", "1", "-i", str(media),
+                 "-frames:v", "1", "-vf", "scale=320:-2", "-q:v", "4",
+                 str(thumb)], check=False, timeout=60,
+                capture_output=True)
+        if not thumb.exists():
+            raise KeyError(f"no thumbnail for {media.name}")
+        return thumb
+
+    def offload_voice(self, audio_b64: str, mime: str) -> dict:
+        """Ghost by voice: transcribe the request, then plan (no copy)."""
+        vm = self._voice()
+        try:
+            raw = base64.b64decode(audio_b64 or "", validate=True)
+        except Exception as e:
+            raise ValueError("Bad audio upload") from e
+        if not raw:
+            raise ValueError("Bad audio upload")
+        ext = {"audio/webm": "webm", "audio/mp4": "m4a", "audio/mpeg": "mp3",
+               "audio/wav": "wav", "audio/x-wav": "wav",
+               "video/mp4": "mp4", "video/quicktime": "mov"}.get(
+                   (mime or "").split(";")[0], "webm")
+        dest = self.demo / "voice"
+        dest.mkdir(parents=True, exist_ok=True)
+        saved = dest / f"ghost-{int(time.time() * 1000) % 10**9}.{ext}"
+        saved.write_bytes(raw)
+        try:
+            duration = vm.probe_note_duration(saved)
+        except vm.VoiceError as e:
+            raise ValueError(str(e)) from e
+        from ghostcut.ffmpeg_tools import run_command as _run
+
+        wav = dest / f"{saved.stem}.wav"
+        _run(vm.extract_audio_command(saved, wav))
+        try:
+            turns, _engine, _spend = vm.transcribe_wav(
+                wav, duration_s=duration, work_dir=dest)
+        except vm.VoiceError as e:
+            raise ValueError(str(e)) from e
+        text = " ".join(t.text for t in turns).strip()
+        if not text:
+            raise ValueError("offload: I didn't hear any speech in that recording")
+        planned = self.offload_ask(text)
+        planned["text"] = text
+        return planned
+
     def cutjob_status(self) -> dict:
         return dict(self._cutjob_state)
 
@@ -694,6 +1065,29 @@ class Handler(SimpleHTTPRequestHandler):
             return self._call(self.engine.connections_list)
         if url.path == "/api/cutjob/rerender":
             return self._call(self.engine.cutjob_status)
+        if url.path == "/api/offload/volumes":
+            return self._call(self.engine.offload_volumes)
+        if url.path == "/api/offload/status":
+            return self._call(self.engine.offload_status)
+        if url.path == "/api/offload/cut/status":
+            return self._call(self.engine.cut_bg_status)
+        if url.path == "/api/offload/shoot":
+            q = parse_qs(url.query)
+            return self._call(lambda: self.engine.offload_shoot(q.get("shoot", [""])[0]))
+        if url.path == "/api/offload/thumb":
+            q = parse_qs(url.query)
+            try:
+                thumb = self.engine.offload_thumb(q.get("shoot", [""])[0],
+                                                  q.get("file", [""])[0])
+            except (KeyError, ValueError) as e:
+                return self._json({"error": str(e)}, 404)
+            data = thumb.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
         if url.path == "/api/render":
             return self._call(self.engine.render_status)
         if url.path == "/api/render/plan":
@@ -786,6 +1180,25 @@ class Handler(SimpleHTTPRequestHandler):
                                      body.get("key_secret"))
         if path == "/api/connections/remove":
             return e.connections_remove(str(body.get("provider") or ""))
+        if path == "/api/offload/ask":
+            text = str(body.get("text") or "").strip()
+            if not text:
+                raise ValueError("Empty request")
+            return e.offload_ask(text)
+        if path == "/api/offload/plan":
+            return e.offload_plan(list(body.get("cards") or []),
+                                  str(body.get("destination") or ""),
+                                  body.get("project"))
+        if path == "/api/offload/start":
+            return e.offload_start()
+        if path == "/api/offload/voice":
+            return e.offload_voice(body.get("audio_b64", ""), body.get("mime", ""))
+        if path == "/api/offload/cut":
+            if not str(body.get("shoot_dir") or body.get("shoot") or ""):
+                raise ValueError("Missing shoot_dir")
+            return e.start_offload_cut(
+                str(body.get("shoot_dir") or body.get("shoot")),
+                body.get("out_dir"))
         raise FileNotFoundError("unknown endpoint")
 
     # HTTP Range, so the video player can seek (Safari/WKWebView will not play without it).

@@ -1104,17 +1104,168 @@
       });
     },
     import(el) {
-      const total = (P.media || []).reduce((a, m) => a + m.count, 0);
+      const gb = (n) => `${(n / 1e9).toFixed(2)} GB`;
+      const day = (s) => (s ? String(s).slice(0, 10) : "—");
+      const chatBox = h("div", { class: "ghost-chat" });
+      const planBox = h("div", {});
+      const shootBox = h("div", {});
+      const input = h("textarea", { rows: 2, placeholder: "Ask Ghost… e.g. the footage is on the SD card, transfer it to my SSD" });
+      const micB = h("button", { class: "icon mic", type: "button", title: "Hold to talk" }, "🎙");
+      const volsBox = h("div", { class: "ghost-vols" });
+      let shootDir = "", offTimer = 0, cutTimer = 0;
+      const say = (who, text) => {
+        chatBox.append(h("div", { class: `msg ${who === "you" ? "you" : "muse"}` },
+          who === "you" ? text : [h("div", { class: "who" }, "Ghost"), h("div", {}, text)]));
+        chatBox.scrollTop = chatBox.scrollHeight;
+      };
+      const bar = (done, total) => {
+        const wrap = h("div", { class: "ghost-bar" });
+        const fill = h("i", {});
+        fill.style.width = `${total ? Math.min(100, (done / total) * 100) : 0}%`;
+        wrap.append(fill);
+        return wrap;
+      };
+      async function loadShoot(dir) {
+        shootDir = dir;
+        try {
+          const j = await api(`/api/offload/shoot?shoot=${encodeURIComponent(dir)}`);
+          shootBox.replaceChildren(h("h3", {}, "Shoot"),
+            j.bins.map((b) => h("div", { class: "box" }, h("h3", {}, b.camera),
+              h("div", { class: "ghost-thumbs" }, b.clips.map((c) =>
+                h("figure", {}, h("img", { src: c.thumb, alt: "", loading: "lazy" }),
+                  h("figcaption", {}, `${c.name} · ${c.duration_s != null ? fmt(c.duration_s) : "—"}`)))))));
+        } catch (e) { shootBox.replaceChildren(h("p", { class: "err" }, e.message)); }
+        const cutBtn = h("button", { class: "primary" }, "Make the cut");
+        const cutStat = h("div", { class: "ghost-cutstat" });
+        cutBtn.onclick = async () => {
+          cutBtn.disabled = true;
+          try {
+            await api("/api/offload/cut", { shoot_dir: shootDir });
+            cutStat.textContent = "Cutting…";
+            clearInterval(cutTimer);
+            cutTimer = setInterval(async () => {
+              try {
+                const s = await api("/api/offload/cut/status");
+                const stages = Object.entries(s.stages || {}).map(([k, v]) => `${k}: ${v}`).join(" · ");
+                cutStat.textContent = [s.message, stages].filter(Boolean).join(" — ");
+                if (s.state === "done") { clearInterval(cutTimer); setTimeout(() => location.reload(), 1200); }
+                if (s.state === "failed") { clearInterval(cutTimer); cutBtn.disabled = false; }
+              } catch { /* keep polling */ }
+            }, 1200);
+          } catch (e) { cutStat.textContent = e.message; cutBtn.disabled = false; }
+        };
+        shootBox.append(h("p", {}, cutBtn), cutStat);
+      }
+      function renderPlan(j) {
+        shootDir = j.shoot_dir || shootDir;
+        const transfer = h("button", { class: "primary" }, "Transfer");
+        const change = h("button", {}, "Change");
+        transfer.onclick = async () => {
+          transfer.disabled = true;
+          try {
+            await api("/api/offload/start", {});
+            planBox.append(h("p", {}, "Copying…"));
+            clearInterval(offTimer);
+            offTimer = setInterval(async () => {
+              try {
+                const s = await api("/api/offload/status");
+                const p = s.progress || {};
+                planBox.querySelector(".ghost-live")?.replaceWith(
+                  h("div", { class: "ghost-live" }, h("div", {}, `${p.file || ""} · ${gb(p.bytes_done || 0)} / ${gb(p.bytes_total || 0)}${p.eta_s ? ` · about ${fmt(p.eta_s)} left` : ""}`), bar(p.bytes_done || 0, p.bytes_total || 0)));
+                if (!planBox.querySelector(".ghost-live")) planBox.append(h("div", { class: "ghost-live" }, bar(p.bytes_done || 0, p.bytes_total || 0)));
+                if (s.state === "done" || s.state === "done_with_failures") {
+                  clearInterval(offTimer);
+                  say("ghost", s.message);
+                  if (s.shoot_dir) loadShoot(s.shoot_dir);
+                }
+                if (s.state === "failed") { clearInterval(offTimer); say("ghost", s.message); transfer.disabled = false; }
+              } catch { /* keep polling */ }
+            }, 800);
+          } catch (e) { say("ghost", e.message); transfer.disabled = false; }
+        };
+        change.onclick = () => { input.focus(); say("ghost", "Tell me what to change — another card, drive or shoot name — and I will re-plan. Nothing has been copied."); };
+        planBox.replaceChildren(h("div", { class: "box ghost-plan" },
+          h("h3", {}, "Transfer plan"),
+          (j.cards || []).map((c) => h("div", { class: "vol" },
+            `${c.name} · ${c.camera} · ${c.clip_count} clips`, h("span", {}, `${gb(c.total_bytes)} · ${day(c.date_start)} – ${day(c.date_end)}`))),
+          h("div", { class: "vol" }, `To: ${j.shoot_dir}`, h("span", {}, `${gb(j.bytes_to_copy || 0)} to copy · ${gb(j.free_bytes || 0)} free`)),
+          h("p", { class: j.enough_space ? "" : "err" }, j.enough_space ? "Space check passed. Nothing is copied until you transfer." : "Not enough free space on the destination."),
+          h("div", { class: "acts" }, transfer, change)));
+      }
+      function handleAsk(j) {
+        if (j.text) say("ghost", `I heard: ${j.text}`);
+        say("ghost", j.reply || "Here is the transfer to plan.");
+        if (j.opened) { setTimeout(() => location.reload(), 800); return; }
+        if (j.started) { say("ghost", "Transfer started."); return; }
+        if (j.shoot_dir) renderPlan(j);
+      }
+      async function askGhost(text) {
+        say("you", text);
+        try { handleAsk(await api("/api/offload/ask", { text })); }
+        catch (e) { say("ghost", `That didn't go through: ${e.message}`); }
+      }
+      const form = h("form", { class: "ask ghost-ask" }, input, micB,
+        h("button", { class: "primary", type: "submit" }, "Send"));
+      form.onsubmit = (e) => {
+        e.preventDefault();
+        const v = input.value.trim();
+        if (v) { input.value = ""; askGhost(v); }
+      };
+      input.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); form.requestSubmit(); } });
+      // Ghost by voice: same hold-to-talk as Edit, heard by the voice path.
+      let grec = null, gchunks = [];
+      const gMime = () => (typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? "audio/webm;codecs=opus" : "");
+      async function gStart() {
+        if (!LIVE || grec) return;
+        if (!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)) { say("ghost", "The microphone is not available in this window — open this page in your browser to talk, or type the request."); return; }
+        let stream;
+        try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); } catch { say("ghost", "The microphone is not available in this window — type the request instead."); return; }
+        gchunks = [];
+        const m = gMime();
+        grec = m ? new MediaRecorder(stream, { mimeType: m }) : new MediaRecorder(stream);
+        grec.ondataavailable = (e) => { if (e.data.size) gchunks.push(e.data); };
+        grec.start();
+        grec._stream = stream;
+        micB.classList.add("rec");
+        micB.textContent = "●";
+      }
+      async function gStop() {
+        if (!grec) return;
+        const done = grec, mime = grec.mimeType || "";
+        grec = null;
+        micB.classList.remove("rec");
+        micB.textContent = "🎙";
+        const blob = await new Promise((res) => { done.onstop = () => res(new Blob(gchunks, { type: mime })); done.stop(); });
+        (done._stream.getTracks() || []).forEach((t) => t.stop());
+        const buf = await blob.arrayBuffer();
+        const bytes = new Uint8Array(buf);
+        let bin = "";
+        for (let i = 0; i < bytes.length; i += 8192) bin += String.fromCharCode(...bytes.subarray(i, i + 8192));
+        say("you", "🎙 (voice request)");
+        try { handleAsk(await api("/api/offload/voice", { audio_b64: btoa(bin), mime })); }
+        catch (e) { say("ghost", `That didn't go through: ${e.message}`); }
+      }
+      micB.addEventListener("pointerdown", (e) => { e.preventDefault(); gStart(); });
+      ["pointerup", "pointerleave", "pointercancel"].forEach((ev) => micB.addEventListener(ev, gStop));
+      const openInput = h("input", { type: "text", placeholder: "Job folder to open" });
+      const openBtn = h("button", { type: "button" }, "Open job");
+      openBtn.onclick = async () => {
+        const v = openInput.value.trim();
+        if (!v) return;
+        try { await api("/api/job/open", { path: v }); location.reload(); }
+        catch (e) { say("ghost", e.message); }
+      };
       el.append(h("h2", {}, "Import"),
-        h("p", { class: "lede" }, "Planned: point GhostCut at a card or folder, confirm the shoot date, and it scans every mounted drive for clips recorded that day. NOT BUILT YET: this page shows hand-written sample data."),
-        h("div", { class: "stats" }, stat(P.shootDate || "—", "shoot date"), stat(total, "clips & assets"), stat((P.media || []).length, "bins"), stat(P.sections.length, "sections proposed")),
-        h("div", { class: "cols" },
-          P.importFlag && h("div", { class: "box flag" }, h("h3", {}, `⚑ ${P.importFlag.title}`),
-            h("p", {}, P.importFlag.body),
-            h("div", { class: "vol" }, P.importFlag.where, h("span", {}, P.importFlag.clips))),
-          h("div", { class: "box" }, h("h3", {}, "Bins"), (P.media || []).map((m) => h("div", { class: "vol" }, m.bin, h("span", {}, m.count)))),
-          h("div", { class: "box" }, h("h3", {}, "What happens next"),
-            h("ol", { class: "thinking", style: "padding-left:18px" }, ["360p proxies for every clip (originals stay here)", "Whisper words for every talking take", "Spark inventory: what each clip shows and where it belongs", "Sections proposed from the day's order"].map((s) => h("li", {}, s))))));
+        h("p", { class: "lede" }, "Ghost moves camera cards to your destination drive and verifies every file. Tell it what to copy — nothing is copied until you transfer."),
+        volsBox, chatBox, planBox, shootBox, form,
+        h("div", { class: "ghost-open" }, openInput, openBtn));
+      say("ghost", LIVE ? "Tell me where the footage is — for example, the footage is on the SD card, transfer it to my SSD." : "Ghost needs the engine: run the app server, then ask here.");
+      if (LIVE) {
+        api("/api/offload/volumes").then((j) => {
+          volsBox.replaceChildren(h("div", { class: "box" }, h("h3", {}, "Mounted"),
+            (j.volumes || []).map((v) => h("div", { class: "vol" }, `${v.name} · ${v.kind} ${v.detail || ""}`, h("span", {}, `${gb(v.free_bytes)} free`)))));
+        }).catch(() => {});
+      }
     },
     deliver(el) {
       const L = { ...P.mix, ...P.loudness }, f = (v) => (v == null || v === "" ? NaN : +v);

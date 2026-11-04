@@ -862,6 +862,85 @@ def command_voice(args: argparse.Namespace) -> dict:
     return payload
 
 
+def command_offload(args: argparse.Namespace) -> dict:
+    from . import offload as offload_mod
+
+    volumes = offload_mod.list_volumes()
+    by_path = {str(v.path): v for v in volumes}
+    by_name = {v.name.lower(): v for v in volumes}
+    cards: list = []
+    for raw in (args.cards or []):
+        path = Path(raw)
+        if path.exists():
+            cards.append(path)
+        elif raw.lower() in by_name:
+            cards.append(by_name[raw.lower()].path)
+        else:
+            raise ValueError(f"offload: no such card: {raw}")
+    if not cards:
+        cards = [v.path for v in volumes if v.kind == offload_mod.KIND_CAMERA]
+    if not cards:
+        raise ValueError("offload: no camera cards found; name a card or mount one")
+    if args.to:
+        dest = Path(args.to)
+        if not dest.exists() and args.to.lower() in by_name:
+            dest = by_name[args.to.lower()].path
+    else:
+        dests = [v for v in volumes if v.kind == offload_mod.KIND_DESTINATION]
+        if not dests:
+            raise ValueError("offload: no destination drive found; pass --to DEST")
+        dest = dests[0].path
+    scans = [offload_mod.scan_card(c) for c in cards]
+    plan = offload_mod.plan_offload(scans, dest, project=args.project)
+    for scan in scans:
+        lo, hi = scan.date_range
+        span = ""
+        if lo and hi:
+            span = f", {lo.date().isoformat()} to {hi.date().isoformat()}"
+        gb = scan.total_bytes / 1e9
+        print(f"{scan.volume.name} ({scan.detail or scan.kind}): "
+              f"{len(scan.clips)} clips, {gb:.2f} GB{span}")
+    print(f"Destination: {plan.shoot_dir} "
+          f"({plan.bytes_to_copy / 1e9:.2f} GB to copy, "
+          f"{plan.free_bytes / 1e9:.2f} GB free)")
+    for entry in plan.entries:
+        if entry.skipped:
+            print(f"  skip {entry.destination.name} (already there, verified)")
+    if not bool(args.yes):
+        print("Copy these files? [y/N]", file=sys.stderr, end=" ")
+        try:
+            answer = "" if not sys.stdin.isatty() else sys.stdin.readline()
+        except (OSError, ValueError):
+            answer = ""
+        if answer.strip().lower() not in ("y", "yes"):
+            print("Not copied.")
+            return plan.as_dict()
+    last_file = {"name": ""}
+
+    def progress(event: dict) -> None:
+        name = event.get("file", "")
+        total = event.get("bytes_total") or 0
+        done = event.get("bytes_done") or 0
+        pct = (done / total * 100) if total else 100.0
+        if name != last_file["name"]:
+            last_file["name"] = name
+            print(f"  {name}")
+        print(f"\r  {pct:5.1f}%  {done / 1e9:.2f} / {total / 1e9:.2f} GB",
+              end="", file=sys.stderr)
+
+    result = offload_mod.run_offload(plan, progress)
+    print("", file=sys.stderr)
+    verified_gb = result.verified_bytes / 1e9
+    print(f"Verified {result.verified_count} files, {verified_gb:.2f} GB "
+          f"({result.skipped_count} skipped)")
+    for failed in result.failed:
+        print(f"! failed {failed.destination.name}: {failed.error}")
+    print(f"Wrote {result.manifest}")
+    print(f"Cut it with: director cut \"{plan.shoot_dir}\" --out-dir "
+          f"\"{plan.shoot_dir}-job\"")
+    return {**plan.as_dict(), "result": result.as_dict()}
+
+
 def command_demo(args: argparse.Namespace) -> dict:
     from .demo import run as run_demo
 
@@ -1158,6 +1237,19 @@ def build_parser() -> argparse.ArgumentParser:
     demo_parser.add_argument("--keep", action="store_true",
                              help="Reuse the shoot media already in the output folder")
     demo_parser.set_defaults(func=command_demo)
+
+    offload_parser = sub.add_parser("offload", help="Copy camera cards to the destination drive, verified")
+    offload_parser.add_argument("cards", metavar="CARD", nargs="*",
+                                help="Cards to copy (paths or volume names; "
+                                     "default: every mounted camera card)")
+    offload_parser.add_argument("--to", default=None, metavar="DEST",
+                                help="Destination drive or folder "
+                                     "(default: the mounted destination drive)")
+    offload_parser.add_argument("--project", default=None,
+                                help="Shoot name for the dated destination folder")
+    offload_parser.add_argument("--yes", action="store_true",
+                                help="Copy without asking to confirm")
+    offload_parser.set_defaults(func=command_offload)
 
     return parser
 
