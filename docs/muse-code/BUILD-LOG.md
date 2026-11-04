@@ -992,6 +992,13 @@ nothing below runs while it answers.
   `transcribe_wav` (one Meta call, no retries) and `resolve_notes`, Muse still primary when it answers, other failures
   still raising, the skipped frame check, `run()` end to end with both calls returning 402, and the app's card text.
 
+### Live use (owner's agent, Claude Code, 2026-11-04 ~15:53)
+
+The owner asked for the opening flub to go ("My mic", a pause, then "my drone has no microphone"). The typed note "cut
+where I say my mic" went through `resolve_typed` (Muse unavailable, rules) on the real job: one op, `drop_words` 9-11
+"My mic" from beat B0, all checks passing. `apply_notes` recorded it in `tighten.json` as edit `e1`; the first kept span
+now starts at 160.30 s (was 158.74 s), 0.32 s before "my drone". The cut was then re-rendered from the angles stage.
+
 # Build log: ONBOARD — first-run tour, the Import page and Ghost's face (2026-11-04)
 
 | Step | By | What |
@@ -1056,9 +1063,13 @@ error tells the editor to type instead. The Muse path stays primary whenever a w
   one-line guard in `_scan_worker` (`date_range` errors never fail a ready scan) `test_offload`, `test_onboard` and
   `test_engine_render` were re-run: 70 tests, OK.
 
-## Live test
+## Live test (owner's agent, Claude Code, 2026-11-04 ~15:15, engine on the real job, browser at 1440x900)
 
-Left for the owner's agent.
+- `#import/tour` opens the tour on step 1 with the mascot; Esc closes it. No console errors.
+- The Import page shows both mounted Sony cards as tiles (`Untitled`: 4 clips, 10.1 GB, FX3, Oct 29; `Untitled 1`: 111
+  clips, 79.4 GB, 7SM3 + FX3, Oct 19 to Nov 3), the Extreme SSD destination (535 GB free of 4.00 TB), the Resume card,
+  and Ghost on the built-in planner with three quick-reply chips. Ghost's greeting named both cards and the free space.
+- Not done live: a real transfer (Transfer was not clicked), stepping through all six tour steps by hand, voice input.
 
 # Build log: KITCHEN — the ghost kitchen render screen (2026-11-04)
 
@@ -1133,10 +1144,16 @@ the sampler stop/join ordering, and no Meta/ElevenLabs/xAI/Whisper call anywhere
   and the `canplay` wait.
 - The Web Audio bing and pointer interactions in a browser.
 
-## Live test
+## Live test (owner's agent, Claude Code, 2026-11-04 ~15:25, engine on the real job)
 
-Left for the owner's agent: open the Edit tab at `#edit/kitchen` (preview), then run Render on a cut job and watch the
-kitchen hand off to the new cut; record which one the recording shows (WebGL or the CSS fallback) in the README.
+- `#edit/kitchen` (preview): the WebGL scene renders (three.js 0.170; WebGL 2 available, not the CSS fallback): the
+  chef ghost in its hat stirring a glowing pot, three coloured ghosts floating, film cards falling in, rotating captions
+  ("Whisking the sync to soft peaks", "Proofing the timeline until it rises") and the readout ("preview · shots 13/23 ·
+  57% · about 9 s left"). When the preview ends the cut pops in on its opening frame.
+- A real render from the Dress panel: the kitchen covered the player ("Dressing the cut · shots 8/23 · 35%"), then the
+  player switched to `demo/dressed.mp4` (cache-busted) with the switch on Dressed and the kitchen hidden.
+- Not verified live: the in-app Re-render of a cut job (the ~30-minute angles render) handing off, the click bing and
+  dragging a ghost.
 
 # Build log: DRESS — dress the cut (`director dress`: title cards, music, a ghost that pops with a bing) (2026-11-04)
 
@@ -1217,17 +1234,23 @@ feature has an offline path that stands on its own:
   WebGL was run.
 - Render time on the real 130 s cut is unmeasured (target 1 to 3 minutes).
 
-## Live test (left for the owner's agent)
+## Live test (owner's agent, Claude Code, 2026-11-04 ~15:10 to 15:35, the real 130 s job)
 
-1. Restart the engine with `ELEVENLABS_API_KEY` (and `XAI_API_KEY` if used) in the process environment only.
-2. `director connect test elevenlabs`.
-3. `director dress plan --job <job>` (expect the Muse-unavailable note while the Meta credit is out); check the cards
-   against the transcript.
-4. `director dress render --job <job>` and time it.
-5. Look at frames: caption collisions at the top corners, the title overlap (0 to 3.5 s), the pill centred on its text,
-   the ghost beside the pill; listen for the bing under speech and the bed level.
-6. In the app: type "add B-roll where I say synced" (expect a card "Synced" near 14.3 s) and "turn the music down";
-   Accept, Render, switch Dressed/Plain.
+- `director dress plan --job <job> --no-muse --max-provider-usd 2`: 18 s. Five rule cards (13.4 s "Two cameras synced",
+  23.3 s "B-roll and captions", 35.4 s "Muse Spark sees the footage", 46.3 s "Cut angle to angle", 73.4 s "Color grade
+  from log"); the ElevenLabs music bed, bing and pop were generated live; provider estimate $0.378.
+- `director dress render`: 50 s wall clock, `cut.mp4` untouched; 1920x1080, 23.976 fps, 130.13 s, -14.1 LUFS integrated.
+- Frames showed two defects, fixed in `d574831`: every pill was about 1.6x wider than its text (PIL measures the em
+  square, libass sizes a font by ascent + descent, so the text drew at about 62% of the measured width), and the ghost
+  sat on the pill's inner end, over the speaker's head in three of four cards. Cards are now 84 (libass units) with the
+  width scaled to what libass draws, and the ghost sits in a 170 px slot at the frame's outer edge (sprite 150 px).
+  Re-render 53 s; the four card frames were checked again.
+- In the app: the panel lists the cards with their rule badges. The typed note "add a card that says No mic on the drone
+  where I say microphone" resolved to a card at 3.0 s anchored on "microphone" and was correctly blocked by the hard
+  check "Inside the title (cards start at 3.8s)". Render from the panel ran under the kitchen and swapped the player to
+  the dressed cut. The panel was see-through over the chat; made opaque in `0c3326a`.
+- Not verified: `director connect test elevenlabs` (not run; the live calls above succeeded), the "turn the music down"
+  note, Accept then Render of a typed card, and the bing and bed levels by ear.
 
 ## Independent review (Claude Code, Opus)
 
