@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -274,6 +275,168 @@ class PlanRunTests(unittest.TestCase):
             self.assertEqual(folders, ["FX3", "FX3 2"])
 
 
+SHOT = datetime(2026, 11, 3, 12, 0, tzinfo=timezone.utc)
+
+
+def clip_on(card: Path, rel: str, data: bytes, label: str = "Camera",
+            carries_card: bool = True) -> offload.ClipInfo:
+    """A clip written onto a synthetic card, recorded at SHOT."""
+    source = write(card / rel, data)
+    return offload.ClipInfo(source, len(data), 1.0, SHOT, "mtime",
+                            camera_label=label,
+                            volume=card if carries_card else None)
+
+
+def listing(folder: Path) -> list[str]:
+    """Every path under a folder, relative and sorted (the card check)."""
+    return sorted(str(p.relative_to(folder)) for p in folder.rglob("*"))
+
+
+class SafetyTests(unittest.TestCase):
+    """Astra F01/F02: one destination per file, and never onto a card."""
+
+    def test_nested_duplicate_names_refused_before_any_write(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            card = root / "CARD"
+            first = clip_on(card, "DCIM/100MEDIA/clip.mp4", b"first")
+            second = clip_on(card, "DCIM/101MEDIA/clip.mp4", b"second")
+            dest = root / "dest"
+            dest.mkdir()
+            before = listing(card)
+            with self.assertRaises(offload.OffloadError) as ctx:
+                offload.plan_offload(
+                    [offload.CardScan(card, [first, second])], dest,
+                    project="Dupes")
+            message = str(ctx.exception)
+            day = offload.local_day(SHOT).isoformat()
+            self.assertTrue(message.startswith("offload: "), message)
+            self.assertIn(str(first.source), message)
+            self.assertIn(str(second.source), message)
+            self.assertIn(str(dest / f"{day} Dupes" / "Camera" / "clip.mp4"),
+                          message)
+            self.assertIn("nothing was copied", message)
+            self.assertIn("both are on", message)
+            self.assertEqual(list(dest.iterdir()), [])
+            self.assertEqual(listing(card), before)
+
+    def test_hand_edited_duplicate_refused_at_run_time(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            card = root / "CARD"
+            a = clip_on(card, "A/clip.mp4", b"first")
+            b = clip_on(card, "B/other.mp4", b"second")
+            dest = root / "dest"
+            plan = offload.plan_offload([offload.CardScan(card, [a, b])], dest)
+            plan.entries[1].destination = plan.entries[0].destination
+            with self.assertRaises(offload.OffloadError) as ctx:
+                offload.run_offload(plan)
+            self.assertIn("would both be copied to", str(ctx.exception))
+            self.assertFalse(dest.exists())
+
+    def test_two_same_camera_cards_with_one_clip_name_refused(self) -> None:
+        # Clips that don't carry their card share one camera folder, so
+        # C0001.MP4 from each card would land on one destination.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            card_a, card_b = root / "CardA", root / "CardB"
+            a = clip_on(card_a, "DCIM/100MEDIA/C0001.MP4", b"card-a",
+                        carries_card=False)
+            b = clip_on(card_b, "DCIM/100MEDIA/C0001.MP4", b"card-b!",
+                        carries_card=False)
+            dest = root / "dest"
+            dest.mkdir()
+            with self.assertRaises(offload.OffloadError) as ctx:
+                offload.plan_offload([offload.CardScan(card_a, [a]),
+                                      offload.CardScan(card_b, [b])], dest)
+            message = str(ctx.exception)
+            self.assertIn(str(a.source), message)
+            self.assertIn(str(b.source), message)
+            self.assertIn("transfer the cards one at a time", message)
+            self.assertEqual(list(dest.iterdir()), [])
+            self.assertEqual(card_a.joinpath("DCIM/100MEDIA/C0001.MP4")
+                             .read_bytes(), b"card-a")
+
+    def test_destination_inside_a_card_refused_at_plan_and_run(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            card = sony_card(root)
+            before = listing(card)
+            # Plan time: a folder on the card itself.
+            with self.assertRaises(offload.OffloadError) as ctx:
+                offload.plan_offload([card], card / "offload")
+            self.assertIn("is inside the source card", str(ctx.exception))
+            self.assertEqual(listing(card), before)
+            # Run time, hand-edited: a good plan re-pointed at the card.
+            dest = root / "dest"
+            plan = offload.plan_offload([card], dest)
+            plan.destination = card
+            plan.shoot_dir = card / plan.shoot_dir.name
+            for entry in plan.entries:
+                entry.destination = (plan.shoot_dir
+                                     / entry.destination.parent.name
+                                     / entry.destination.name)
+            with self.assertRaises(offload.OffloadError) as ctx:
+                offload.run_offload(plan)
+            self.assertIn("source card", str(ctx.exception))
+            self.assertEqual(listing(card), before)
+            self.assertFalse(dest.exists())
+            # Run time, stale: the destination became a link onto the card.
+            plan = offload.plan_offload([card], dest)
+            dest.symlink_to(card / "PRIVATE", target_is_directory=True)
+            with self.assertRaises(offload.OffloadError) as ctx:
+                offload.run_offload(plan)
+            self.assertIn("is inside the source card", str(ctx.exception))
+            self.assertEqual(listing(card), before)
+
+    def test_destination_equal_to_the_card_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            card = sony_card(root)
+            before = listing(card)
+            with self.assertRaises(offload.OffloadError) as ctx:
+                offload.plan_offload([card], card, project="test")
+            message = str(ctx.exception)
+            self.assertTrue(message.startswith("offload: the destination"))
+            self.assertIn("is the source card itself", message)
+            self.assertEqual(listing(card), before)
+            # Another spelling of the card (a link to it) is the card too.
+            alias = root / "alias"
+            alias.symlink_to(card, target_is_directory=True)
+            with self.assertRaises(offload.OffloadError):
+                offload.plan_offload([card], alias)
+            self.assertEqual(listing(card), before)
+
+    def test_card_inside_the_shoot_folder_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            dest = Path(td) / "dest"
+            day = offload.local_day(SHOT).isoformat()
+            card = dest / f"{day} Shoot" / "CARD"
+            clip = clip_on(card, "clip.mp4", b"bytes")
+            before = listing(dest)
+            with self.assertRaises(offload.OffloadError) as ctx:
+                offload.plan_offload([offload.CardScan(card, [clip])], dest)
+            self.assertIn("is inside the shoot folder", str(ctx.exception))
+            self.assertEqual(listing(dest), before)
+
+    def test_normal_single_card_plan_still_works(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            card = sony_card(root)  # root/CARD
+            dest = root / "CARD-backup"  # shares the card's name prefix
+            before = listing(card)
+            plan = offload.plan_offload([card], dest, project="Safe")
+            self.assertEqual(plan.source_roots, [str(card.resolve())])
+            offload.check_plan_safety(plan)
+            result = offload.run_offload(plan)
+            self.assertEqual(result.verified_count, 4)
+            self.assertEqual(result.failed, [])
+            self.assertEqual(
+                len({str(e.destination) for e in result.entries}), 4)
+            self.assertTrue((plan.shoot_dir / "offload.json").is_file())
+            self.assertEqual(listing(card), before)
+
+
 class IntentTests(unittest.TestCase):
     def volumes(self):
         return [
@@ -404,6 +567,65 @@ class EngineTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.post(eng, "/api/offload/plan",
                           {"cards": ["/etc"], "destination": str(dest)})
+
+
+class SafetyEngineTests(unittest.TestCase):
+    """The refusals reach the UI as readable 400s, never a 500."""
+
+    def call(self, eng, path, body):
+        """Handler._call around _post: the JSON and status the UI gets."""
+        handler = engine.Handler.__new__(engine.Handler)
+        handler.engine = eng
+        sent: dict = {}
+        handler._json = lambda obj, code=200: sent.update(obj=obj, code=code)
+        handler._call(lambda: handler._post(path, body or {}))
+        return sent["obj"], sent["code"]
+
+    def setup_engine(self, root: Path):
+        vols = root / "volumes"
+        card = sony_card(vols, "CardA")
+        dest = vols / "Extreme SSD"
+        dest.mkdir(parents=True)
+        demo = root / "demo"
+        demo.mkdir()
+        eng = engine.Engine(demo, render=FakeRender())
+        eng._offload_root = vols
+        return eng, card, dest
+
+    def test_plan_onto_the_card_is_a_readable_400(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            eng, card, _ = self.setup_engine(Path(td))
+            before = listing(card)
+            body, code = self.call(
+                eng, "/api/offload/plan",
+                {"cards": [str(card)], "destination": str(card / "copies")})
+            self.assertEqual(code, 400)
+            self.assertTrue(body["error"].startswith("offload: the destination"),
+                            body)
+            self.assertIn("is inside the source card", body["error"])
+            self.assertEqual(listing(card), before)
+
+    def test_transfer_rechecks_a_stale_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            eng, card, dest = self.setup_engine(Path(td))
+            before = listing(card)
+            planned, code = self.call(
+                eng, "/api/offload/plan",
+                {"cards": [str(card)], "destination": str(dest)})
+            self.assertEqual(code, 200, planned)
+            plan = eng._offload_plan
+            plan.entries[0].destination = card / "PRIVATE" / "evil.MP4"
+            body, code = self.call(eng, "/api/offload/start", {})
+            self.assertEqual(code, 400)
+            self.assertIn("would be written on the source card", body["error"])
+            self.assertNotEqual(eng.offload_status().get("state"), "running")
+            # The worker's own re-check reports a sentence, not a type name.
+            eng._offload_worker(plan)
+            status = eng.offload_status()
+            self.assertEqual(status["state"], "failed")
+            self.assertTrue(status["message"].startswith("offload: "), status)
+            self.assertFalse(Path(planned["shoot_dir"]).exists())
+            self.assertEqual(listing(card), before)
 
 
 def dated_xml(day: str) -> bytes:

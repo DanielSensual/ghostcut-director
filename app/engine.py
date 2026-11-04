@@ -1312,6 +1312,11 @@ class Engine:
         plan = self._offload_plan
         if plan is None:
             raise ValueError("offload: nothing planned yet — ask Ghost first")
+        mod = self._offload()
+        try:  # a stale plan must not write to a card (run_offload re-checks)
+            mod.check_plan_safety(plan)
+        except mod.OffloadError as e:
+            raise ValueError(str(e)) from e
         with self.lock:
             if self._offload_state.get("state") == "running":
                 raise Busy("Offloading — wait for it to finish")
@@ -1352,9 +1357,12 @@ class Engine:
                         "shoot_dir": str(plan.shoot_dir),
                         "result": result.as_dict()}
         except Exception as e:  # noqa: BLE001 - status endpoint reports it
+            # An offload refusal already reads as a sentence ("offload: ...").
+            message = (str(e) if isinstance(e, mod.OffloadError)
+                       else f"{type(e).__name__}: {e}")
             with self.lock:
                 self._offload_state = {"state": "failed",
-                                       "message": f"{type(e).__name__}: {e}",
+                                       "message": message,
                                        "shoot_dir": str(plan.shoot_dir)}
 
     def offload_status(self) -> dict:
