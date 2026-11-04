@@ -111,6 +111,7 @@ From [docs/muse-code/BUILD-LOG.md](docs/muse-code/BUILD-LOG.md) and the git log,
 | Ghost kitchen render screen (interactive, offline) | Muse Code (partial) + Claude Code: started by Muse Code on muse-wonder-1.0 from `KITCHEN-BRIEF.md`, after my review of the app on submission day (`5e5aef2`, cut off mid-build when the Meta API credit ran out); finished, fixed and tested by Claude Code. three.js 0.170 (MIT) is vendored third-party code |
 | The Director app, Render, and the test-run scripts in `scripts/` | Built by Claude Code with me (imported into this repository) |
 | The briefs in `docs/muse-code/` | Me, with Claude Code |
+| Dress the cut: title cards, ElevenLabs music and SFX, ghost pop-up (`director dress`) | Muse Code (partial) + Claude Code: Muse Code on muse-wonder-1.0 built the core from `DRESS-BRIEF.md` (after my review of the app on submission day) and was cut off when its Meta API credit ran out; Claude Code finished, fixed and tested it, and added the built-in card planner used when Muse is unavailable. Music and SFX generated with ElevenLabs during the event; the ghost sprite is the owner's own brand art |
 
 ## The Director app
 
@@ -182,6 +183,7 @@ Keys come from environment variables or from `director connect`, never from file
 - Meta models: `MODEL_API_KEY` (with `pip install -e ".[muse]"`). Without it, the offline paths above still run.
 - ElevenLabs: `ELEVENLABS_API_KEY`, or `director connect add elevenlabs` (with `pip install -e ".[connect]"` for macOS Keychain storage). Environment variables win over saved keys.
 - Higgsfield: `HF_API_KEY_ID` and `HF_API_KEY_SECRET`, or `director connect add higgsfield`. See the limitation below: connecting it changes nothing yet.
+- xAI: `XAI_API_KEY` is read from the environment only (no screen shows a saved key, and it is not in `director connect`).
 
 ```bash
 director connect list    # every provider, connected or not, and what it can do

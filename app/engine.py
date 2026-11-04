@@ -382,6 +382,7 @@ class Engine:
         return self.project()
 
     def _store_voice(self, payload: dict, request: str) -> dict:
+        payload["notes"] = self._dress_notes(payload.get("notes", []) or [])  # DRESS
         pid = uuid.uuid4().hex[:8]
         flat = []
         for note in payload.get("notes", []):
@@ -464,6 +465,11 @@ class Engine:
         job = self._need_job()
         self._cutjob_idle("apply")
         if ops is not None:
+            ops = self._dress_split_ops(ops)  # DRESS: dress_* ops go to dress.json
+            if not ops:
+                cutjob.build_project(job, self.demo)
+                self._load()
+                return self.project()
             context = vm.build_job_context(job)
             checked = vm._check_ops(context, [dict(op) for op in ops], None)
             notes = [{"id": "n0", "status": "resolved", "at_s": None, "beat_id": -1,
@@ -482,8 +488,9 @@ class Engine:
         with self.lock:
             self._cutjob_idle("apply")
             context = vm.build_job_context(job)
+            notes = self._dress_split_apply(prop["notes"], pick)  # DRESS
             try:
-                result = vm.apply_notes(job=context, notes=prop["notes"], pick=pick,
+                result = vm.apply_notes(job=context, notes=notes, pick=pick,
                                         candidates={k: int(v) for k, v in (candidates or {}).items()},
                                         source="voice")
             except vm.VoiceError as e:
@@ -509,6 +516,172 @@ class Engine:
             path.write_text(json.dumps(payload))
         except OSError:
             pass
+
+    # ---------- DRESS: dress the cut (title cards, music, ghost pop) ----------
+
+    def _dress(self):
+        """director.dress, with src/ put on the path here (503 without it). DRESS"""
+        src = str(ROOT / "src")
+        if src not in sys.path:
+            sys.path.insert(0, src)
+        try:
+            from director import dress as dress_mod
+        except ImportError as e:
+            raise Unavailable(f"Dress needs the Director package: {e}") from e
+        return dress_mod
+
+    def _dress_checked(self, dm, ops: list[dict], note_id: str | None = None) -> list[dict]:  # DRESS
+        job = self._need_job()
+        plan = dm.load_plan(job)
+        return [{**dm.validate_op(op, job_dir=job, plan_payload=plan), "note_id": note_id}
+                for op in ops]
+
+    def _dress_notes(self, notes: list[dict]) -> list[dict]:
+        """DRESS: notes whose words match the dress grammar get checked dress ops.
+
+        Card, B-roll, ghost and bing notes always win over whatever Spark (or the
+        no-key stub) put there; music and level notes only once dress.json exists
+        or the note says "add music", so "turn the music down" stays a mix note
+        on a cut that was never dressed.
+        """
+        if self.job_dir is None or not notes:
+            return notes
+        try:
+            dm = self._dress()
+        except Unavailable:
+            return notes
+        job = self.job_dir
+        has_plan = (job / "dress.json").exists()
+        out = []
+        for note in notes:
+            raw = str((note or {}).get("raw_text") or "")
+            try:
+                ops = dm.parse_note(raw, job_dir=job, playhead_s=note.get("at_s"))
+            except Exception:  # noqa: BLE001 - the voice path must never break on dress
+                ops = None
+            if ops and ops[0]["op"] == "dress_set_music" and not (
+                    has_plan or "add music" in raw.lower()):
+                ops = None
+            if not ops:
+                out.append(note)
+                continue
+            checked = self._dress_checked(dm, ops, note.get("id"))
+            out.append({**note, "ops": checked, "status": "resolved",
+                        "message": checked[0]["label"], "candidates": []})
+        return out
+
+    def _dress_split_apply(self, notes: list[dict], pick: list[int] | None) -> list[dict]:
+        """DRESS: apply picked, unblocked dress_* ops; hand vm.apply_notes them blocked.
+
+        Flat op indexes stay valid because no op is removed, only marked.
+        """
+        flat = [op for note in notes for op in (note.get("ops") or [])]
+        chosen = (set(range(len(flat))) if pick is None
+                  else {i for i in pick if 0 <= i < len(flat)})
+        dress_ops = [op for i, op in enumerate(flat)
+                     if i in chosen and str(op.get("op", "")).startswith("dress_")
+                     and not op.get("blocked")]
+        if dress_ops:
+            self._dress().apply_ops(self._need_job(), dress_ops)
+        return [{**note, "ops": [({**op, "blocked": True}
+                                  if str(op.get("op", "")).startswith("dress_") else op)
+                                 for op in (note.get("ops") or [])]}
+                for note in notes]
+
+    def _dress_split_ops(self, ops: list[dict]) -> list[dict]:
+        """DRESS: the ops= path; applies dress_* ops and returns the rest."""
+        dress_ops = [dict(op) for op in ops if str(op.get("op", "")).startswith("dress_")]
+        if dress_ops:
+            dm = self._dress()
+            checked = self._dress_checked(dm, dress_ops)
+            dm.apply_ops(self._need_job(), [op for op in checked if not op.get("blocked")])
+        return [op for op in ops if not str(op.get("op", "")).startswith("dress_")]
+
+    def dress_get(self) -> dict:  # DRESS
+        dm = self._dress()
+        job = self._need_job()
+        st = dict(getattr(self, "_dress_state", None) or {"state": "idle", "message": ""})
+        plan = dm.load_plan(job)
+        return {"state": st.get("state", "idle"), "message": st.get("message", ""),
+                "plan": plan, "summary": dm.summary(job), "status": dm.load_status(job),
+                "stale": dm.is_stale(job, plan), "fresh": dm.is_fresh(job, plan)}
+
+    def dress_plan(self, no_muse: bool = False) -> dict:  # DRESS
+        dm = self._dress()
+        job = self._need_job()
+        if getattr(self, "_dress_state", {}).get("state") == "running":
+            raise Busy("The dressed cut is rendering: plan again when it finishes")
+        dm.plan(job, no_muse=bool(no_muse))
+        with self.lock:
+            cutjob.build_project(job, self.demo)
+            self._load()
+        return {**self.dress_get(), **self.project()}
+
+    def dress_edit(self, card_id: str | None = None, enabled: bool | None = None,
+                   remove: bool = False, ops: list[dict] | None = None) -> dict:  # DRESS
+        dm = self._dress()
+        job = self._need_job()
+        try:
+            if card_id:
+                dm.set_card(job, str(card_id), enabled=enabled, remove=bool(remove))
+            if ops:
+                checked = self._dress_checked(dm, [dict(o) for o in ops])
+                dm.apply_ops(job, [o for o in checked if not o.get("blocked")])
+        except dm.DressError as e:
+            raise ValueError(str(e)) from e
+        with self.lock:
+            cutjob.build_project(job, self.demo)
+            self._load()
+        return {**self.dress_get(), **self.project()}
+
+    def dress_render(self, renderer=None) -> dict:  # DRESS
+        dm = self._dress()
+        job = self._need_job()
+        if dm.load_plan(job) is None:
+            raise ValueError("Plan the dress first (Plan button or director dress plan)")
+        run = renderer or dm.render
+        with self.lock:
+            self._cutjob_idle("dress")
+            if getattr(self, "_dress_state", {}).get("state") == "running":
+                raise Busy("The dressed cut is already rendering")
+            self._dress_state = {"state": "running", "message": "Dressing the cut"}
+            th = threading.Thread(target=self._dress_worker, args=(job, run),
+                                  name="dress-render", daemon=True)
+            self._dress_thread = th
+            th.start()
+        return {"state": "running"}
+
+    def _dress_worker(self, job: Path, run) -> None:  # DRESS
+        try:
+            run(job)
+            with self.lock:
+                cutjob.build_project(job, self.demo)
+                self._load()
+                self._dress_state = {"state": "done", "message": "Dressed cut ready"}
+        except Exception as e:  # noqa: BLE001 - reported by GET /api/dress; cut.mp4 untouched
+            with self.lock:
+                self._dress_state = {"state": "failed", "message": f"{type(e).__name__}: {e}"}
+
+    def dress_note(self, text: str, at: float | None = None) -> dict:  # DRESS
+        dm = self._dress()
+        job = self._need_job()
+        ops = dm.parse_note(text, job_dir=job, playhead_s=at)
+        if not ops:
+            return {"matched": False}
+        # Review fix: hand _store_voice an empty stub so _dress_notes is the one gate.
+        # Before, a music note on a never-dressed cut ("turn the music down") kept its
+        # unchecked ops and was swallowed here instead of reaching the chat.
+        note = {"id": "n1", "source": "typed", "raw_text": text, "heard": text,
+                "anchor_kind": "dress", "at_s": at, "beat_id": -1, "status": "unresolved",
+                "message": "", "ops": [], "candidates": [], "engine": "rules", "usd": 0.0}
+        stored = self._store_voice({"notes": [note], "spend_usd": 0.0, "engine": "rules",
+                                    "warnings": []}, f"dress:typed:{text[:60]}")
+        if not stored["ops"]:
+            self.proposals.pop(stored["id"], None)
+            return {"matched": False}
+        return {"matched": True, "id": stored["id"], "reply": stored["notes"][0]["message"],
+                "ops": stored["ops"], "notes": stored["notes"], "usd": 0, "cached": True,
+                "model": "rules"}
 
     def taste_list(self) -> dict:
         vm = self._voice()
@@ -1584,6 +1757,8 @@ class Handler(SimpleHTTPRequestHandler):
             return self._call(self.engine.connections_list)
         if url.path == "/api/cutjob/rerender":
             return self._call(self.engine.cutjob_status)
+        if url.path == "/api/dress":  # DRESS
+            return self._call(self.engine.dress_get)
         if url.path == "/api/offload/volumes":
             return self._call(self.engine.offload_volumes)
         if url.path == "/api/offload/scans":
@@ -1697,6 +1872,19 @@ class Handler(SimpleHTTPRequestHandler):
             return e.taste_remove(str(body.get("id", "")))
         if path == "/api/cutjob/rerender":
             return e.start_cutjob_rerender()
+        if path == "/api/dress/plan":  # DRESS
+            return e.dress_plan(bool(body.get("no_muse")))
+        if path == "/api/dress/render":  # DRESS
+            return e.dress_render()
+        if path == "/api/dress/edit":  # DRESS
+            return e.dress_edit(body.get("card_id"), body.get("enabled"),
+                                bool(body.get("remove")), body.get("ops"))
+        if path == "/api/dress/note":  # DRESS
+            text = str(body.get("text") or "").strip()
+            if not text:
+                raise ValueError("Empty request")
+            at = body.get("at")
+            return e.dress_note(text, None if at is None else float(at))
         if path == "/api/connections/test":
             return e.connections_test(body.get("provider"))
         if path == "/api/connections/add":

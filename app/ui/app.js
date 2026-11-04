@@ -382,6 +382,7 @@
   function applyResult(j) {
     ({ project: P, edits: EDITS, engine: ENGINE } = j);
     renderTimeline(); renderFindings(); renderSpend(); renderButton();
+    window.GCDress?.refresh?.(); // DRESS
   }
 
   function proposalMsg(r) {
@@ -629,7 +630,7 @@
           applyResult(j);
           loadTaste();
           picks.forEach((c) => (c.disabled = true));
-          acts.replaceChildren(h("span", { class: "applied" }, "✓ Applied · re-render to watch it"));
+          acts.replaceChildren(h("span", { class: "applied" }, note.ops?.[0]?.op?.startsWith("dress_") ? "✓ Applied · open Dress the cut and Render" : "✓ Applied · re-render to watch it")); // DRESS
         } catch (e) { ok.disabled = all.disabled = false; acts.append(h("span", { class: "err" }, e.message)); }
       };
       ok.onclick = () => send("checked");
@@ -695,6 +696,7 @@
     catch (err) { $("#tasteList").append(h("li", { class: "err" }, err.message)); }
   };
   loadTaste();
+  window.GCDress?.mount({ h, $, api, fmt, LIVE: () => LIVE, project: () => P, isCutJob, seek, applyResult, ask: (t) => reply(t), voiceNoteCard, chat, scrollChat, video }); // DRESS
 
   // Review
   let filter = "all";
