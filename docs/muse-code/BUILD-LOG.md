@@ -997,7 +997,11 @@ nothing below runs while it answers.
 The owner asked for the opening flub to go ("My mic", a pause, then "my drone has no microphone"). The typed note "cut
 where I say my mic" went through `resolve_typed` (Muse unavailable, rules) on the real job: one op, `drop_words` 9-11
 "My mic" from beat B0, all checks passing. `apply_notes` recorded it in `tighten.json` as edit `e1`; the first kept span
-now starts at 160.30 s (was 158.74 s), 0.32 s before "my drone". The cut was then re-rendered from the angles stage.
+now starts at 160.30 s (was 158.74 s), 0.32 s before "my drone". The cut was then re-rendered from the angles stage
+(`director cut` with the same options plus `--no-sam`, since SAM also returned 402): 128.6 s, 28 shots, every angle
+batch on the gaze rule, QC `complete_with_warnings` (long shots; true peak -0.48 dBTP; the Muse QC watch skipped on the
+402). It opens on the drone on "my drone has no microphone" and cuts to the Sony at 2.13 s. `director dress plan
+--no-muse` then re-anchored the same five cards 1.56 s earlier from cached assets, and `dress render` took 64 s.
 
 # Build log: ONBOARD — first-run tour, the Import page and Ghost's face (2026-11-04)
 
