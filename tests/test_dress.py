@@ -581,6 +581,160 @@ class EngineTests(_NoKeys):
             eng.dress_render(renderer=lambda j: None)
 
 
+def _voice_job(root: Path) -> Path:
+    """A full director cut job (words, sync, angles, cut) the voice path can read."""
+    tests = str(ROOT / "tests")
+    if tests not in sys.path:
+        sys.path.insert(0, tests)
+    from test_cutjob import _write_job
+    job = _write_job(root)
+    dress.save_plan(job, {"cards": [], "music": {"enabled": True}, "ghost": {}, "sfx": {}})
+    return job
+
+
+class RenderLockTests(_NoKeys):
+    """Render lock after verification (Claude Code, 2026-11-04, Astra F03).
+
+    The dress render saves the plan it loaded at its start, so while it runs
+    every plan change is refused (Busy, HTTP 409) and dress.json is untouched.
+    """
+
+    MUSIC_OFF = [{"op": "dress_set_music", "enabled": False}]
+
+    def _start(self, eng) -> threading.Event:
+        """Astra's renderer: load the plan, wait, save that snapshot back (the old render())."""
+        ready, release = threading.Event(), threading.Event()
+
+        def renderer(job: Path) -> None:
+            old = dress.load_plan(job)
+            ready.set()
+            if not release.wait(10):
+                raise RuntimeError("test timed out")
+            old["rendered"] = {"at": "test"}
+            dress.save_plan(job, old)
+
+        self.assertEqual(eng.dress_render(renderer=renderer), {"state": "running"})
+        self.assertTrue(ready.wait(5))
+        return release
+
+    def _finish(self, eng, release: threading.Event) -> None:
+        release.set()
+        eng._dress_thread.join(5)
+        self.assertEqual(eng._dress_state["state"], "done")
+
+    def test_edit_during_render_is_a_409_then_works_after(self) -> None:
+        job = _job(self.tmp)
+        dress.plan(job, no_muse=True, key=None)
+        eng = _engine(self.tmp, job)
+        before = dress.load_plan(job)
+        card = before["cards"][0]["id"]
+        with mock.patch.object(cutjob, "build_project", lambda *a, **k: {}):
+            release = self._start(eng)
+            try:
+                for call in (lambda: eng.dress_edit(ops=self.MUSIC_OFF),
+                             lambda: eng.dress_edit(card_id=card, enabled=False),
+                             lambda: eng.dress_edit(card_id=card, remove=True),
+                             lambda: eng.dress_plan(no_muse=True),
+                             lambda: eng.dress_note("no music", 1.0)):
+                    with self.assertRaises(engine_mod.Busy) as cm:
+                        call()
+                    self.assertEqual(str(cm.exception), engine_mod.DRESS_BUSY)
+                # The route layer turns it into a 409 with the readable message (no socket).
+                stub = SimpleNamespace(_json=lambda obj, code=200: (code, obj))
+                self.assertEqual(engine_mod.Handler._call(stub, lambda: eng.dress_edit(ops=self.MUSIC_OFF)),
+                                 (409, {"error": engine_mod.DRESS_BUSY}))
+                self.assertEqual(dress.load_plan(job), before)
+            finally:
+                self._finish(eng, release)
+        # Astra's repro: the render's snapshot save no longer undoes an accepted edit.
+        self.assertTrue(dress.load_plan(job)["music"]["enabled"])
+        eng.dress_edit(ops=self.MUSIC_OFF)
+        eng.dress_edit(card_id=card, enabled=False)
+        after = dress.load_plan(job)
+        self.assertFalse(after["music"]["enabled"])
+        self.assertFalse(next(c for c in after["cards"] if c["id"] == card)["enabled"])
+
+    def test_voice_dress_ops_during_render_are_a_409(self) -> None:
+        job = _voice_job(self.tmp)
+        eng = _engine(self.tmp, job)
+        r = eng.dress_note("no music", 1.0)
+        self.assertTrue(r["matched"])
+        with mock.patch.object(cutjob, "build_project", lambda *a, **k: {}):
+            release = self._start(eng)
+            try:
+                with self.assertRaises(engine_mod.Busy) as cm:
+                    eng.voice_apply(r["id"])  # an accepted voice/typed dress proposal
+                self.assertEqual(str(cm.exception), engine_mod.DRESS_BUSY)
+                with self.assertRaises(engine_mod.Busy):
+                    eng.voice_apply(ops=self.MUSIC_OFF)  # the ops= path
+                self.assertTrue(dress.load_plan(job)["music"]["enabled"])
+                self.assertIn(r["id"], eng.proposals)  # the refusal did not consume it
+            finally:
+                self._finish(eng, release)
+        # The finished render reloads the cut (proposals on the old cut are forgotten):
+        # the same note, said again, now applies.
+        r = eng.dress_note("no music", 1.0)
+        eng.voice_apply(r["id"])
+        self.assertFalse(dress.load_plan(job)["music"]["enabled"])
+        self.assertEqual(dress.load_plan(job)["history"][-1]["op"], "dress_set_music")
+
+    def test_plan_in_progress_blocks_render_and_edits(self) -> None:
+        job = _job(self.tmp)
+        dress.plan(job, no_muse=True, key=None)
+        eng = _engine(self.tmp, job)
+        entered, release, errors = threading.Event(), threading.Event(), []
+        real_plan = dress.plan
+
+        def slow_plan(j, **kw):
+            entered.set()
+            release.wait(10)
+            return real_plan(j, key=None, **kw)
+
+        def run() -> None:
+            try:
+                eng.dress_plan(no_muse=True)
+            except Exception as error:  # noqa: BLE001 - asserted below
+                errors.append(error)
+
+        with mock.patch.object(dress, "plan", slow_plan), \
+                mock.patch.object(cutjob, "build_project", lambda *a, **k: {}):
+            th = threading.Thread(target=run)
+            th.start()
+            try:
+                self.assertTrue(entered.wait(5))
+                with self.assertRaises(engine_mod.Busy):
+                    eng.dress_render(renderer=lambda j: None)
+                with self.assertRaises(engine_mod.Busy) as cm:
+                    eng.dress_edit(ops=[{"op": "dress_set_ghost", "enabled": False}])
+                self.assertEqual(str(cm.exception), engine_mod.DRESS_PLANNING)
+            finally:
+                release.set()
+                th.join(10)
+        self.assertEqual(errors, [])
+        self.assertFalse(eng._dress_planning)
+        eng.dress_edit(ops=[{"op": "dress_set_ghost", "enabled": False}])
+        self.assertFalse(dress.load_plan(job)["ghost"]["enabled"])
+
+    def test_render_save_keeps_a_newer_plan(self) -> None:
+        job = _job(self.tmp)
+        dress.plan(job, no_muse=True, key=None)
+        snapshot = dress.load_plan(job)  # what render() loaded at its start
+        snapshot.setdefault("warnings", []).append("dress_ghost_skipped:icon or Pillow missing")
+        newer = dress.load_plan(job)
+        newer["music"]["enabled"] = False  # an edit that landed while it ran (CLI, another tool)
+        dress.save_plan(job, newer)
+        rendered = {"file": "cut.dressed.mp4", "source_stamp": "1:2",
+                    "plan_fingerprint": dress._plan_fingerprint(snapshot), "at": "t"}
+        out = dress._save_rendered(job, snapshot, rendered)
+        saved = dress.load_plan(job)
+        self.assertEqual(saved, out)
+        self.assertFalse(saved["music"]["enabled"])
+        self.assertEqual(saved["rendered"], rendered)
+        self.assertIn("dress_ghost_skipped:icon or Pillow missing", saved["warnings"])
+        # Rendered from the older plan, so it reads as stale, not fresh.
+        self.assertNotEqual(saved["rendered"]["plan_fingerprint"], dress._plan_fingerprint(saved))
+
+
 class BuildProjectTests(_NoKeys):
     def _fresh(self, job: Path, *, stale: bool = False) -> None:
         (job / "cut.mp4").write_bytes(b"plain")

@@ -51,6 +51,8 @@ NO_MUSE = "Muse needs the Meta client: run the engine with the venv that has gue
 NO_JOB = "No cut job is open: open one with POST /api/job/open or python app/engine.py --job DIR."
 BUSY = "Rendering — {} after it finishes"
 CUTJOB_BUSY = "Re-rendering — {} after it finishes"
+DRESS_BUSY = "Dress is rendering — wait for it to finish, then change the plan"  # DRESS
+DRESS_PLANNING = "Dress is planning — wait for it to finish, then change the plan"  # DRESS
 LOG_TAIL = 256_000
 VOICE_MODEL = "muse-spark-1.3"
 VOICE_MAX_USD = 2.00
@@ -501,7 +503,8 @@ class Engine:
         job = self._need_job()
         self._cutjob_idle("apply")
         if ops is not None:
-            ops = self._dress_split_ops(ops)  # DRESS: dress_* ops go to dress.json
+            with self.lock:  # DRESS: busy check + dress.json write under dress_render's lock
+                ops = self._dress_split_ops(ops)  # DRESS: dress_* ops go to dress.json (409 while dressing)
             if not ops:
                 cutjob.build_project(job, self.demo)
                 self._load()
@@ -524,7 +527,7 @@ class Engine:
         with self.lock:
             self._cutjob_idle("apply")
             context = vm.build_job_context(job)
-            notes = self._dress_split_apply(prop["notes"], pick)  # DRESS
+            notes = self._dress_split_apply(prop["notes"], pick)  # DRESS (409 while dressing)
             try:
                 result = vm.apply_notes(job=context, notes=notes, pick=pick,
                                         candidates={k: int(v) for k, v in (candidates or {}).items()},
@@ -610,6 +613,8 @@ class Engine:
         """DRESS: apply picked, unblocked dress_* ops; hand vm.apply_notes them blocked.
 
         Flat op indexes stay valid because no op is removed, only marked.
+        Called under self.lock; a picked dress op while the dressed cut renders
+        refuses the whole apply (Busy, 409) before anything is written.
         """
         flat = [op for note in notes for op in (note.get("ops") or [])]
         chosen = (set(range(len(flat))) if pick is None
@@ -618,6 +623,7 @@ class Engine:
                      if i in chosen and str(op.get("op", "")).startswith("dress_")
                      and not op.get("blocked")]
         if dress_ops:
+            self._dress_idle()
             self._dress().apply_ops(self._need_job(), dress_ops)
         return [{**note, "ops": [({**op, "blocked": True}
                                   if str(op.get("op", "")).startswith("dress_") else op)
@@ -625,13 +631,27 @@ class Engine:
                 for note in notes]
 
     def _dress_split_ops(self, ops: list[dict]) -> list[dict]:
-        """DRESS: the ops= path; applies dress_* ops and returns the rest."""
+        """DRESS: the ops= path; applies dress_* ops and returns the rest. Under self.lock."""
         dress_ops = [dict(op) for op in ops if str(op.get("op", "")).startswith("dress_")]
         if dress_ops:
+            self._dress_idle()
             dm = self._dress()
             checked = self._dress_checked(dm, dress_ops)
             dm.apply_ops(self._need_job(), [op for op in checked if not op.get("blocked")])
         return [op for op in ops if not str(op.get("op", "")).startswith("dress_")]
+
+    def _dress_idle(self) -> None:  # DRESS
+        """Under self.lock, the lock dress_render starts under: dress.json is frozen while
+        the dressed cut renders or a plan is being made (Busy, HTTP 409).
+
+        Render lock after verification (Claude Code, 2026-11-04, Astra F03): the render
+        saves the plan it loaded at its start, so an edit accepted while it ran ("no
+        music") came back undone when it finished.
+        """
+        if getattr(self, "_dress_state", {}).get("state") == "running":
+            raise Busy(DRESS_BUSY)
+        if getattr(self, "_dress_planning", False):
+            raise Busy(DRESS_PLANNING)
 
     def dress_get(self) -> dict:  # DRESS
         dm = self._dress()
@@ -645,9 +665,16 @@ class Engine:
     def dress_plan(self, no_muse: bool = False) -> dict:  # DRESS
         dm = self._dress()
         job = self._need_job()
-        if getattr(self, "_dress_state", {}).get("state") == "running":
-            raise Busy("The dressed cut is rendering: plan again when it finishes")
-        dm.plan(job, no_muse=bool(no_muse))
+        # Planning can wait on Muse and ElevenLabs, so it claims a flag under the lock
+        # instead of holding it: dress_render and every edit refuse while it is set.
+        with self.lock:
+            self._dress_idle()
+            self._dress_planning = True
+        try:
+            dm.plan(job, no_muse=bool(no_muse))
+        finally:
+            with self.lock:
+                self._dress_planning = False
         with self.lock:
             cutjob.build_project(job, self.demo)
             self._load()
@@ -657,15 +684,16 @@ class Engine:
                    remove: bool = False, ops: list[dict] | None = None) -> dict:  # DRESS
         dm = self._dress()
         job = self._need_job()
-        try:
-            if card_id:
-                dm.set_card(job, str(card_id), enabled=enabled, remove=bool(remove))
-            if ops:
-                checked = self._dress_checked(dm, [dict(o) for o in ops])
-                dm.apply_ops(job, [o for o in checked if not o.get("blocked")])
-        except dm.DressError as e:
-            raise ValueError(str(e)) from e
-        with self.lock:
+        with self.lock:  # the busy check and the dress.json write are one step (409 while dressing)
+            self._dress_idle()
+            try:
+                if card_id:
+                    dm.set_card(job, str(card_id), enabled=enabled, remove=bool(remove))
+                if ops:
+                    checked = self._dress_checked(dm, [dict(o) for o in ops])
+                    dm.apply_ops(job, [o for o in checked if not o.get("blocked")])
+            except dm.DressError as e:
+                raise ValueError(str(e)) from e
             cutjob.build_project(job, self.demo)
             self._load()
         return {**self.dress_get(), **self.project()}
@@ -680,6 +708,8 @@ class Engine:
             self._cutjob_idle("dress")
             if getattr(self, "_dress_state", {}).get("state") == "running":
                 raise Busy("The dressed cut is already rendering")
+            if getattr(self, "_dress_planning", False):
+                raise Busy("Dress is planning — render when it finishes")
             self._dress_state = {"state": "running", "message": "Dressing the cut"}
             th = threading.Thread(target=self._dress_worker, args=(job, run),
                                   name="dress-render", daemon=True)
@@ -704,6 +734,7 @@ class Engine:
         ops = dm.parse_note(text, job_dir=job, playhead_s=at)
         if not ops:
             return {"matched": False}
+        self._dress_idle()  # a dress note while dressing is a 409 (voice_apply re-checks under the lock)
         # Review fix: hand _store_voice an empty stub so _dress_notes is the one gate.
         # Before, a music note on a never-dressed cut ("turn the music down") kept its
         # unchecked ops and was swallowed here instead of reaching the chat.

@@ -12,6 +12,8 @@
     dress_music_unavailable: "No music bed (ElevenLabs not connected)",
   };
   const noteText = (n) => NOTE_TEXT[n] || n.replace(/^dress_[a-z_]+:/, "");
+  // The engine's 409 while dress.json is frozen (a dressed render or a plan is running).
+  const BUSY = /^Dress is (rendering|planning)/;
 
   function live() { return !!(ctx && ctx.LIVE() && ctx.isCutJob()); }
 
@@ -76,7 +78,17 @@
     const chat = ctx.chat || document.querySelector("#chat");
     const v = ctx.video || document.querySelector("#video");
     let r = null;
-    try { r = await ctx.api("/api/dress/note", { text, at: v ? v.currentTime || 0 : 0 }); } catch { r = null; }
+    try { r = await ctx.api("/api/dress/note", { text, at: v ? v.currentTime || 0 : 0 }); }
+    catch (e) {
+      if (BUSY.test(e.message || "")) { // 409: say so here instead of handing a dress note to the chat
+        chat.append(ctx.h("div", { class: "msg you" }, text));
+        chat.append(ctx.h("div", { class: "msg muse dressprop" }, ctx.h("div", { class: "who" }, "Ghost · Dress the cut"),
+          ctx.h("span", { class: "err" }, e.message)));
+        ctx.scrollChat?.();
+        return;
+      }
+      r = null;
+    }
     if (!r || !r.matched) return ctx.ask(text);
     chat.append(ctx.h("div", { class: "msg you" }, text));
     chat.append(proposalCard(r));
@@ -100,6 +112,8 @@
     if (!panel) return;
     const { h, fmt } = ctx;
     const s = j?.summary || { exists: false, cards: [] };
+    const running = j?.state === "running";
+    const lock = running || null; // render lock: no plan edits while the dressed cut renders (409)
     const body = panel.querySelector(".dress-body");
     const rows = [];
     if (!s.exists) rows.push(h("p", { class: "dress-muted" }, "No plan yet. Plan reads the transcript and proposes title cards; music and the bing come from ElevenLabs when it is connected."));
@@ -107,22 +121,21 @@
       const design = s.design || {};
       rows.push(h("div", { class: "dress-meta" }, `Cards by ${design.model === "rules" ? "the built-in planner" : design.model || "?"}${design.cached ? " (cached)" : ""} · providers $${Number(s.provider_spend_usd || 0).toFixed(2)} (est.)`));
       rows.push(h("ul", { class: "dress-cards" }, s.cards.length ? s.cards.map((c) => h("li", { class: c.enabled ? "" : "off" },
-        h("input", { type: "checkbox", checked: c.enabled || null, title: "Show this card", onchange: (e) => edit({ card_id: c.id, enabled: e.target.checked }) }),
+        h("input", { type: "checkbox", checked: c.enabled || null, disabled: lock, title: "Show this card", onchange: (e) => edit({ card_id: c.id, enabled: e.target.checked }) }),
         h("a", { class: "go", onclick: (e) => { e.preventDefault(); ctx.seek(c.t); } }, fmt(c.t)),
         h("span", { class: "dress-text" }, c.text),
         h("span", { class: "dress-src" }, c.source),
-        h("button", { class: "x", title: "Remove", onclick: () => edit({ card_id: c.id, remove: true }) }, "×"))) : [h("li", { class: "dress-muted" }, "No cards.")]));
+        h("button", { class: "x", title: "Remove", disabled: lock, onclick: () => edit({ card_id: c.id, remove: true }) }, "×"))) : [h("li", { class: "dress-muted" }, "No cards.")]));
       const music = s.music || {}, ghost = s.ghost || {};
       rows.push(h("div", { class: "dress-toggles" },
-        h("label", {}, h("input", { type: "checkbox", checked: music.enabled || null, onchange: (e) => edit({ ops: [{ op: "dress_set_music", enabled: e.target.checked }] }) }),
+        h("label", {}, h("input", { type: "checkbox", checked: music.enabled || null, disabled: lock, onchange: (e) => edit({ ops: [{ op: "dress_set_music", enabled: e.target.checked }] }) }),
           ` Music ${music.has_asset ? `(${Number(music.gain_db).toFixed(0)} dB)` : "(no bed yet)"}`),
-        h("label", {}, h("input", { type: "checkbox", checked: ghost.enabled || null, onchange: (e) => edit({ ops: [{ op: "dress_set_ghost", enabled: e.target.checked }] }) }), " Ghost"),
-        h("label", {}, h("input", { type: "checkbox", checked: ghost.sfx || null, onchange: (e) => edit({ ops: [{ op: "dress_set_sfx", enabled: e.target.checked }] }) }), " Bing")));
+        h("label", {}, h("input", { type: "checkbox", checked: ghost.enabled || null, disabled: lock, onchange: (e) => edit({ ops: [{ op: "dress_set_ghost", enabled: e.target.checked }] }) }), " Ghost"),
+        h("label", {}, h("input", { type: "checkbox", checked: ghost.sfx || null, disabled: lock, onchange: (e) => edit({ ops: [{ op: "dress_set_sfx", enabled: e.target.checked }] }) }), " Bing")));
       if (s.notes?.length) rows.push(h("ul", { class: "dress-notes" }, s.notes.map((n) => h("li", {}, noteText(n)))));
     }
     body.replaceChildren(...rows);
     const st = j?.status || {};
-    const running = j?.state === "running";
     const bar = panel.querySelector(".dress-bar");
     bar.hidden = !running;
     panel.querySelector(".dress-fill").style.width = `${Math.max(2, Number(st.pct || 0))}%`;
@@ -130,6 +143,9 @@
       : j?.state === "failed" ? `Render failed: ${j.message}` : j?.fresh ? "Dressed cut ready" : j?.stale ? "Plan changed since the last render" : "";
     panel.querySelector(".dress-render").disabled = running || !s.exists;
     panel.querySelector(".dress-plan").disabled = running;
+    const ask = panel.querySelector(".dress-ask input");
+    ask.disabled = running;
+    ask.placeholder = running ? "Wait for the dressed render to finish" : "Tell Ghost what to add";
     const sw = panel.querySelector(".dress-switch");
     sw.hidden = !j?.fresh;
     sw.querySelectorAll("button").forEach((b) => b.classList.toggle("on", (b.dataset.v === "dressed") === dressed));
@@ -142,7 +158,10 @@
 
   async function edit(body) {
     try { const j = await ctx.api("/api/dress/edit", body); ctx.applyResult(j); render(j); }
-    catch (e) { panel.querySelector(".dress-status").textContent = e.message; }
+    catch (e) {
+      if (BUSY.test(e.message || "")) await poll(); // re-sync: controls lock, the refused toggle snaps back
+      panel.querySelector(".dress-status").textContent = e.message;
+    }
   }
 
   async function plan() {
@@ -150,7 +169,10 @@
     status.textContent = "Planning: reading the transcript…";
     panel.querySelector(".dress-plan").disabled = true;
     try { const j = await ctx.api("/api/dress/plan", {}); ctx.applyResult(j); render(j); }
-    catch (e) { status.textContent = e.message; panel.querySelector(".dress-plan").disabled = false; }
+    catch (e) {
+      if (BUSY.test(e.message || "")) await poll(); else panel.querySelector(".dress-plan").disabled = false;
+      status.textContent = e.message;
+    }
   }
 
   async function poll() {
