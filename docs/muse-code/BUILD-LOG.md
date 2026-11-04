@@ -628,7 +628,7 @@ Live test: TBD (the owner fills this from the real-footage run).
   −11.9/−13.7/−10.1/−14.2 dB (mean −11.6 dB), normal speech low band −0.6 dB, speech
   level −0.4 dB; mastered −14.82 LUFS, final true peak −0.99 dBTP (limiter transparent).
   Test outputs went to `/tmp/muse-air-test/`: this sandbox forbids writes to the named
-  `/Volumes/.../muse-air-test/` folder (reads worked).
+  `<air-test>/` folder (reads worked).
 
 # Build log: slow push-in on every shot (`--push-in`) (2026-11-03)
 

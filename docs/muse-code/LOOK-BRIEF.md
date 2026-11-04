@@ -36,10 +36,10 @@ method and `src/director/lips_helper.swift`), `cut.py` and their tests.
    sensible bounds), so skin brightness, warmth and contrast agree. Fall back to whole-frame matching with a
    warning when no face is found. Record before/after skin stats in `grade.json`.
 4. **Check it on real footage.** The owner's job is at
-   `/Volumes/Extreme SSD/Meta-Hackathon-2026-11-03/final/` (cards in `cards/`, the last job in `job/`). You may read
+   `<shoot-root>/` (cards in `cards/`, the last job in `job/`). You may read
    that folder's media and run `director cut` on a COPY into a new folder under
-   `/Volumes/Extreme SSD/Meta-Hackathon-2026-11-03/final/muse-look-test/` (never write into `job/` or `cards/`), with
-   `--lut "DJI_*=/Volumes/Extreme SSD/Meta-Hackathon-2026-11-03/final/dji-dlog-to-rec709.cube" --grade-reference
+   `<look-test>/` (never write into `job/` or `cards/`), with
+   `--lut "DJI_*=<SSD>/dji-dlog-to-rec709.cube" --grade-reference
    "DJI_*" --no-muse --no-sam --no-captions` if you need it offline. Note your sandbox may hide the GPU (Whisper
    skips) and the network (Muse calls fail); the job's existing `words.json`/`sync.json` can be reused with
    `--words`/the sync cache. Report the measured face yaw ranges per camera and the before/after skin stats.

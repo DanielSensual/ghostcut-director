@@ -16,12 +16,12 @@ cards on a Mac, and look finished, not like a prototype.
 
 The owner's real cards when mounted look like this (names vary; never hard-code them):
 
-- Sony camera SD card: `/Volumes/Untitled 1/` with `PRIVATE/M4ROOT/CLIP/*.MP4` plus `*M01.XML` sidecars (timecode,
+- Sony camera SD card: `<card-one>/` with `PRIVATE/M4ROOT/CLIP/*.MP4` plus `*M01.XML` sidecars (timecode,
   capture gamma), and `AVF_INFO/`, `SONY/`.
-- A second Sony-style card: `/Volumes/Untitled/` with `PRIVATE/`, `AVF_INFO/`.
+- A second Sony-style card: `<card-two>/` with `PRIVATE/`, `AVF_INFO/`.
 - DJI drone / Osmo: `DCIM/DJI_*/DJI_*.MP4` (+ `.SRT`/`.LRF`), GoPro: `DCIM/1xxGOPRO/*.MP4`, Rode Wireless PRO /
   recorders: `*.WAV` (32-bit float), iPhone AirDrops land in `~/Downloads`.
-- The destination SSD: `/Volumes/Extreme SSD/` (4 TB, mostly full: free space matters).
+- The destination SSD: `<SSD>/` (4 TB, mostly full: free space matters).
 
 ## The job
 

@@ -5,7 +5,7 @@ the owner's final take. Build straight from this brief on Muse Spark. Read `AGEN
 (its Rules apply), `docs/muse-code/VOICE-DESIGN.md`, `docs/muse-code/TIGHTEN-DESIGN.md` §5, then
 `src/director/voice.py`, `src/director/cutlist.py`, `app/cutjob.py` and their tests.
 
-## What happened (real job, read-only: `/Volumes/Extreme SSD/Meta-Hackathon-2026-11-03/final/job/`)
+## What happened (real job, read-only: `<job>/`)
 
 `director voice note.wav --job <that folder> --yes`, notes spoken in plain English:
 

@@ -36,9 +36,9 @@ then adds ~19 dB of gain, so those air bursts stand out.
 2. Add a gentle peak limiter after loudness normalisation so true peak never exceeds the target (−1 dBTP); today's
    take measured −0.31 dBTP after `loudnorm`. Measure and record the final true peak.
 3. Keep every existing finish behaviour and test; ElevenLabs isolation, when asked for, runs before the de-plosive.
-4. Check it on the owner's take: `/Volumes/Extreme SSD/Meta-Hackathon-2026-11-03/final/job/finish/voice_raw.wav`
+4. Check it on the owner's take: `<job>/finish/voice_raw.wav`
    (read only). Write any test outputs under
-   `/Volumes/Extreme SSD/Meta-Hackathon-2026-11-03/final/muse-air-test/` and report the low-band change at the seven
+   `<air-test>/` and report the low-band change at the seven
    moments and in normal speech, and the final true peak.
 
 ## Rules

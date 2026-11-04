@@ -8,7 +8,7 @@ with the owner's two Sony cards mounted. Build it straight from this brief on Mu
 
 Typed: "The footage is on the SD card, transfer it to my SSD". After about 25 s Ghost answered "Found 2 cards
 (Untitled, Untitled 1) — here is the transfer to plan." The plan: 4 clips (10.13 GB, 2026-10-29) + 111 clips
-(79.43 GB, 2026-10-19 – 2026-11-03), to `/Volumes/Extreme SSD/2026-10-19 Shoot`, 89.56 GB.
+(79.43 GB, 2026-10-19 – 2026-11-03), to `<SSD>/2026-10-19 Shoot`, 89.56 GB.
 
 ## Fix
 

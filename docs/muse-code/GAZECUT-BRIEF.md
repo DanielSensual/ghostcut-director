@@ -12,7 +12,7 @@ take in the app. Build it straight from this brief on Muse Wonder. Read `AGENTS.
 when we start, and then cut to the other one right away."
 
 The cut opens on the tripod camera B while he is plainly facing the drone C. What the job's `angles.json` says
-(read-only job: `/Volumes/Extreme SSD/Meta-Hackathon-2026-11-03/final/job/`, files `angles.json`, `gaze-frames/`,
+(read-only job: `<job>/`, files `angles.json`, `gaze-frames/`,
 `tighten.json`, `words.json`):
 
 - Line 0 "My mic" (0.7 s): 3 samples each camera; C yaw [0,0,0], B yaw [-45,-45,-45] → pick C. Correct.
