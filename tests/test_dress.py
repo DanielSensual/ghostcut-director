@@ -150,6 +150,15 @@ class AssTests(_NoKeys):
               "enabled": True},
              {"id": "c2", "t": 9.5, "d": 2.0, "text": "Off card", "enabled": False}]
 
+    def test_pill_has_round_ends_and_a_box_at_the_origin(self) -> None:
+        # Review fix: the top-left corner was a straight "l r 0" diagonal (a chevron on screen).
+        path = dress.pill_path(300, 84)
+        self.assertTrue(path.startswith("m 0 42 b "))
+        nums = [float(x) for x in path.replace("m", " ").replace("l", " ").replace("b", " ").split()]
+        xs, ys = nums[0::2], nums[1::2]
+        self.assertEqual((min(xs), min(ys), max(xs), max(ys)), (0.0, 0.0, 300.0, 84.0))
+        self.assertEqual(path.count(" b "), 4)
+
     def test_events_times_pos_and_measurer(self) -> None:
         widths = []
 
@@ -376,6 +385,16 @@ class PlanTests(_NoKeys):
         self.assertTrue(all(c["source"] == "rule" for c in payload["cards"]))
         self.assertEqual(payload["design"]["model"], "rules")
 
+    def test_any_propose_error_falls_back(self) -> None:
+        # Review fix: an error outside Spark's own try (cache, import-time key check) still falls back.
+        job = _job(self.tmp)
+
+        def boom(**_kw):
+            raise RuntimeError("402 Payment Required")
+        payload = dress.plan(job, key=None, propose=boom)
+        self.assertIn(dress.MUSE_FALLBACK_NOTE, payload["notes"])
+        self.assertTrue(payload["cards"])
+
     def test_garbage_reply_and_missing_guestlist_fall_back(self) -> None:
         job = _job(self.tmp)
         FakeGuestlist({"nonsense": True}).install(self)
@@ -513,6 +532,10 @@ class EngineTests(_NoKeys):
         self.assertFalse(r["ops"][0]["blocked"])
         self.assertIn(r["id"], eng.proposals)
         self.assertEqual(eng.dress_note("what does this cut say", 1.0), {"matched": False})
+        # Review fix: a music note on a never-dressed cut goes to the chat, not an unchecked card.
+        before = set(eng.proposals)
+        self.assertEqual(eng.dress_note("turn the music down a bit", 1.0), {"matched": False})
+        self.assertEqual(set(eng.proposals), before)
 
     def test_dress_notes_replaces_spark_ops_and_gates_music(self) -> None:
         job = _job(self.tmp)
@@ -580,6 +603,10 @@ class BuildProjectTests(_NoKeys):
         self.assertTrue(project["cutJob"]["dress"]["fresh"])
         self.assertTrue(project["cards"])
         self.assertTrue(all(isinstance(c["lines"], list) for c in project["cards"]))
+        # Review fix: muse.context indexes c["caption"]; the chat must survive a dressed cut.
+        sys.path.insert(0, str(ROOT / "app"))
+        import muse as legacy_muse
+        legacy_muse.context(project, 5.0)
 
     def test_stale_is_ignored(self) -> None:
         job = _job(self.tmp)

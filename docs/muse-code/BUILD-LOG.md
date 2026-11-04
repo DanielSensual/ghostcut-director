@@ -1046,3 +1046,19 @@ feature has an offline path that stands on its own:
    the ghost beside the pill; listen for the bing under speech and the bed level.
 6. In the app: type "add B-roll where I say synced" (expect a card "Synced" near 14.3 s) and "turn the music down";
    Accept, Render, switch Dressed/Plain.
+
+## Independent review (Claude Code, Opus)
+
+A second Claude Code agent read the diff against `DRESS-BRIEF.md` and rendered a 3 s synthetic cut (`testsrc` + `sine`,
+a job folder with a space, the captioned/clean stamp path with a copied `captions-horizontal.ass` header, a title PNG,
+two cards with the ghost, a music bed and the bing) and looked at two frames. Fixes:
+
+- The card pill's top-left corner was a straight diagonal (`l r 0`), so every pill showed a chevron on its left end. It
+  is now four quarter-circle beziers; the box still spans `(0,0)-(w,h)` and the text is centred on it (checked by eye).
+- `muse.context` reads `card["caption"]`, so after a cut was dressed every chat request to Muse raised `KeyError`. Dress
+  cards in `project.json` now carry `caption: ""`.
+- `/api/dress/note` swallowed music notes on a cut that was never dressed ("turn the music down a bit") and showed an
+  unchecked, unlabelled card; it now returns `matched:false` so the chat handles them as before.
+- `plan` fell back to the built-in planner only on `DressUnavailable`; any error from the Muse path now falls back.
+- A plan made only from typed notes had no bing asset; render now synthesises the offline bing.
+- The panel opened mid-render now swaps to the dressed video when the render finishes.

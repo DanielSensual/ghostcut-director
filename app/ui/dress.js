@@ -160,6 +160,7 @@
     const st = j.status || {};
     if (j.state === "running") {
       window.Kitchen?.update?.({ state: "running", step: "Dressing the cut", pct: st.pct || 0, eta_s: st.eta_s });
+      lastState = "running"; // review fix: a panel opened mid-render still swaps the video when it finishes
       pollTimer = setTimeout(poll, 1000);
       return;
     }

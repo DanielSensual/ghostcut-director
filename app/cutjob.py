@@ -405,7 +405,8 @@ def _dress_project(job_dir: Path, out_dir: Path, project: dict) -> None:
         return  # never dressed: the project stays exactly as before
     project["cutJob"]["dress"] = summary
     project["cards"] = [
-        {"id": c["id"], "t": c["t"], "d": c["d"], "lines": [c["text"]]}
+        # caption: muse.context and muse.validate index it (review fix).
+        {"id": c["id"], "t": c["t"], "d": c["d"], "lines": [c["text"]], "caption": ""}
         for c in summary.get("cards", [])
         if c.get("enabled", True) and c.get("t") is not None]
 

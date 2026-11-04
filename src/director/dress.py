@@ -1031,14 +1031,19 @@ def pill_path(width: float, height: float) -> str:
     w = max(10.0, float(width))
     h = max(10.0, float(height))
     r = h / 2
-    # Start at the origin so \an5 centres the box on the card point.
+    # The box spans (0,0)-(w,h), so \an5 centres it on the card point.
+    # Four quarter-circle beziers (k = 0.5523), so both ends are round.
+    # Review fix (Claude Code): the top-left corner was a straight
+    # diagonal ("l r 0"), which rendered as a chevron.
+    c = r * 0.5523
     return (
         f"m 0 {r:.0f} "
-        f"l {r:.0f} 0 l {w - r:.0f} 0 "
-        f"b {w:.0f} 0 {w:.0f} {r:.0f} {w:.0f} {r:.0f} "
-        f"b {w:.0f} {h - r:.0f} {w:.0f} {h:.0f} {w - r:.0f} {h:.0f} "
+        f"b 0 {r - c:.0f} {r - c:.0f} 0 {r:.0f} 0 "
+        f"l {w - r:.0f} 0 "
+        f"b {w - r + c:.0f} 0 {w:.0f} {r - c:.0f} {w:.0f} {r:.0f} "
+        f"b {w:.0f} {r + c:.0f} {w - r + c:.0f} {h:.0f} {w - r:.0f} {h:.0f} "
         f"l {r:.0f} {h:.0f} "
-        f"b 0 {h:.0f} 0 {h - r:.0f} 0 {r:.0f}")
+        f"b {r - c:.0f} {h:.0f} 0 {r + c:.0f} 0 {r:.0f}")
 
 
 CARD_Y = 150
@@ -1444,6 +1449,16 @@ def render(job_dir: Path, *, measurer=None) -> dict:  # noqa: ANN001
         bing_asset = by_kind.get("bing")
         if bing_asset is not None and not bing_asset.exists():
             bing_asset = None
+        if bing_asset is None and cards:
+            # Review fix (Claude Code): a plan made only from typed notes
+            # (apply_ops on a never-planned cut) has no assets; synth the
+            # offline bing so its cards still ping. No network.
+            bing_asset = dress_dir / "assets" / "bing-local.wav"
+            if not bing_asset.exists():
+                try:
+                    _write_synth(bing_asset, _ping_samples())
+                except Exception:  # noqa: BLE001 - cards still render silent
+                    bing_asset = None
         if not bool(ghost_cfg.get("sfx", True)):
             bing_asset = None  # "no bing" / "no sound effects"
         music_gain = float(music_cfg.get("gain_db", MUSIC_GAIN_DEFAULT))
@@ -1648,9 +1663,9 @@ def plan(job_dir: Path, *, model: str = DEFAULT_MODEL,
             muse_failed = not auto_cards
             if muse_failed and plan_warnings:
                 notes.append(plan_warnings[0])
-        except DressUnavailable as error:
+        except Exception as error:  # noqa: BLE001 - review fix: any Muse failure falls back
             muse_failed = True
-            notes.append(f"dress_plan_unavailable:{error}")
+            notes.append(f"dress_plan_unavailable:{type(error).__name__}")
     # Muse unavailable (402 credit, no key, network, garbage reply) or
     # --no-muse: the deterministic transcript planner fills in, so a
     # no-key demo still has cards. Added by Claude Code.

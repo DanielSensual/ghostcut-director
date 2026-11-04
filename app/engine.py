@@ -531,11 +531,17 @@ class Engine:
         ops = dm.parse_note(text, job_dir=job, playhead_s=at)
         if not ops:
             return {"matched": False}
+        # Review fix: hand _store_voice an empty stub so _dress_notes is the one gate.
+        # Before, a music note on a never-dressed cut ("turn the music down") kept its
+        # unchecked ops and was swallowed here instead of reaching the chat.
         note = {"id": "n1", "source": "typed", "raw_text": text, "heard": text,
-                "anchor_kind": "dress", "at_s": at, "beat_id": -1, "status": "resolved",
-                "message": "", "ops": ops, "candidates": [], "engine": "rules", "usd": 0.0}
+                "anchor_kind": "dress", "at_s": at, "beat_id": -1, "status": "unresolved",
+                "message": "", "ops": [], "candidates": [], "engine": "rules", "usd": 0.0}
         stored = self._store_voice({"notes": [note], "spend_usd": 0.0, "engine": "rules",
                                     "warnings": []}, f"dress:typed:{text[:60]}")
+        if not stored["ops"]:
+            self.proposals.pop(stored["id"], None)
+            return {"matched": False}
         return {"matched": True, "id": stored["id"], "reply": stored["notes"][0]["message"],
                 "ops": stored["ops"], "notes": stored["notes"], "usd": 0, "cached": True,
                 "model": "rules"}
