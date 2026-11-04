@@ -355,7 +355,11 @@ def build_project(job_dir: Path, out_dir: Path) -> dict:
         "cutJob": {"dir": job_arg, "tightened": tightened},
     }
     # Loudness Director's QC measured on cut.mp4, for the Deliver page.
-    for check in ((cut or {}).get("qc") or {}).get("checks") or []:
+    # Astra F07 (Claude Code, 2026-11-04): a valid cut.json whose "qc" or
+    # "checks" is not the expected shape ("bad") is skipped, not a crash.
+    qc = (cut or {}).get("qc")
+    checks = qc.get("checks") if isinstance(qc, dict) else None
+    for check in checks if isinstance(checks, list) else []:
         detail = check.get("detail") if isinstance(check, dict) else None
         if isinstance(detail, dict) and "integrated_lufs" in detail:
             project["loudness"] = {"lufs": detail["integrated_lufs"],

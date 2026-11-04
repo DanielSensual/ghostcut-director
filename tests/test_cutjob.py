@@ -328,6 +328,27 @@ class UntightenedTests(unittest.TestCase):
             f"(run director cut there first)")
 
 
+class MalformedQcTests(unittest.TestCase):
+    """Astra F07 (Claude Code, 2026-11-04): a valid cut.json whose QC block
+    has the wrong shape builds without loudness instead of crashing."""
+
+    def test_bad_qc_or_checks_still_builds(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="cutjob-qc-") as td:
+            root = Path(td)
+            job = _write_job(root)
+            good = json.loads((job / "cut.json").read_text())
+            for qc in ("bad", {"checks": "bad"}, {"checks": 5},
+                       {"checks": ["bad", {"detail": "bad"}]}):
+                with self.subTest(qc=qc):
+                    (job / "cut.json").write_text(json.dumps({**good, "qc": qc}))
+                    project = cutjob.build_project(job, root / "demo")
+                    self.assertNotIn("loudness", project)
+            (job / "cut.json").write_text(json.dumps({**good, "qc": {"checks": [
+                {"detail": {"integrated_lufs": -14.0, "true_peak_dbtp": -1.2}}]}}))
+            project = cutjob.build_project(job, root / "demo")
+            self.assertEqual(project["loudness"]["lufs"], -14.0)
+
+
 class OpenTests(unittest.TestCase):
     """Item 19: POST /api/job/open returns the project, mic-visible."""
 

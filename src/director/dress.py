@@ -1409,6 +1409,27 @@ def _overlay_ass(job_dir: Path, cards) -> Path:  # noqa: ANN001
     return out
 
 
+def _save_rendered(job: Path, snapshot: dict, rendered: dict) -> dict:
+    """Write the render's own result into the CURRENT dress.json. Returns it.
+
+    Render lock after verification (Claude Code, 2026-11-04, Astra F03):
+    render() used to save the snapshot it loaded at its start, so a plan
+    edit made while it ran (music off) came back. Only `rendered` and the
+    render's warnings are merged; the fingerprint stays the snapshot's, so
+    a plan changed mid-render reads as stale instead of fresh.
+    """
+    current = load_plan(job)
+    if current is None:
+        current = snapshot
+    else:
+        warnings = list(current.get("warnings", []) or [])
+        warnings += [w for w in snapshot.get("warnings", []) or []
+                     if w not in warnings]
+        current["warnings"] = warnings
+    current["rendered"] = rendered
+    return save_plan(job, current)
+
+
 def render(job_dir: Path, *, measurer=None) -> dict:  # noqa: ANN001
     """FFmpeg-only render to cut.dressed.mp4. Returns dress.json."""
     job = Path(job_dir)
@@ -1565,11 +1586,10 @@ def render(job_dir: Path, *, measurer=None) -> dict:  # noqa: ANN001
                 "dress: dressed render failed its duration check; "
                 "cut.mp4 is unchanged")
         os.replace(next_out, job / "cut.dressed.mp4")
-        plan["rendered"] = {
+        plan = _save_rendered(job, plan, {
             "file": "cut.dressed.mp4", "source_stamp": _stamp(source),
             "plan_fingerprint": _plan_fingerprint(plan),
-            "at": datetime.now().isoformat(timespec="seconds")}
-        save_plan(job, plan)
+            "at": datetime.now().isoformat(timespec="seconds")})
         _write_status(job, "done", 100, 0, "Dressed cut ready")
         return plan
     except Exception as error:

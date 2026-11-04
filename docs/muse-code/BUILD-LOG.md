@@ -1276,6 +1276,30 @@ two cards with the ghost, a music bed and the bing) and looked at two frames. Fi
 - A plan made only from typed notes had no bing asset; render now synthesises the offline bing.
 - The panel opened mid-render now swaps to the dressed video when the render finishes.
 
+### Render lock after verification (Claude Code, 2026-11-04)
+
+Astra's verification (F03, P1) reproduced a lost edit: a plan change accepted while the dressed cut rendered ("no
+music" in the panel, or an accepted `dress_*` op from a typed or spoken note) was undone when the render finished,
+because `render()` saved the plan snapshot it had loaded at its start.
+
+- While a dress render runs, every dress plan change is refused with HTTP 409 and "Dress is rendering — wait for it to
+  finish, then change the plan": `/api/dress/edit`, `/api/dress/plan`, `/api/dress/note` (only notes that match the
+  dress grammar; other text still reaches the chat) and `/api/voice/apply` when it carries a picked `dress_*` op (by
+  proposal id or `ops=`; the whole apply is refused before anything is written). `Engine._dress_idle()` raises `Busy`
+  (the existing 409 mapping in `Handler._call`) and runs under `self.lock`, the lock `dress_render` starts under, so the
+  check and the `dress.json` write are one step.
+- A plan in progress (it can wait on Muse and ElevenLabs, so it does not hold the lock) sets `_dress_planning` under the
+  lock: render and edits are refused meanwhile ("Dress is planning — …").
+- `render()` now writes only its own result (`rendered`, plus its warnings) into the current `dress.json`
+  (`_save_rendered`); the fingerprint stays the rendered plan's, so a plan changed some other way (the CLI) reads as
+  stale instead of being overwritten.
+- Panel: the card toggles and ×, the Music/Ghost/Bing boxes, Plan and the note box are disabled while the render runs; a
+  409 that comes back anyway is shown (in the chat for a typed note, in the panel status for an edit).
+- Astra F07: `cutjob.build_project` skips a `cut.json` whose `qc` or `checks` is not the expected shape (`"bad"`) instead
+  of raising `AttributeError`.
+- Tests: `test_dress.RenderLockTests` (4) and `test_cutjob.MalformedQcTests` (1); all five fail on the code before
+  this fix. Astra's repro now prints `accepted_while_running: False`.
+
 
 # Build log: DELIVER — real job outputs and measured loudness (2026-11-04)
 
