@@ -209,6 +209,8 @@ class SamplingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch("director.angles.run_command",
                             side_effect=fake_run), \
+                    mock.patch("director.angles.shutil.which",
+                               return_value="/usr/bin/ffmpeg"), \
                     mock.patch("director.sync.build_lips_helper",
                                return_value=(Path("/fake/helper"), None)), \
                     mock.patch("director.sync.run_lips_helper",
@@ -235,6 +237,8 @@ class SamplingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch("director.angles.run_command",
                             side_effect=fake_run), \
+                    mock.patch("director.angles.shutil.which",
+                               return_value="/usr/bin/ffmpeg"), \
                     mock.patch("director.sync.build_lips_helper",
                                return_value=(Path("/fake/helper"), None)), \
                     mock.patch("director.sync.run_lips_helper",

@@ -257,6 +257,8 @@ class GazeSampleTests(unittest.TestCase):
             clips = {"B": SimpleNamespace(offset_s=2.0, path="/media/B.mp4")}
             with mock.patch("ghostcut.ffmpeg_tools.run_command",
                             side_effect=fake_run), \
+                    mock.patch("director.gaze.shutil.which",
+                               return_value="/usr/bin/ffmpeg"), \
                     mock.patch("director.sync.build_lips_helper",
                                return_value=(Path("/fake/helper"), None)), \
                     mock.patch("director.sync.run_lips_helper",

@@ -782,6 +782,7 @@ class CliPrintTests(JobFixture):
         out, err = io.StringIO(), io.StringIO()
         with mock.patch("director.voice.probe_note_duration",
                         return_value=30.0), \
+                mock.patch("director.cli.require_ffmpeg_binaries"), \
                 mock.patch("director.voice.run",
                            return_value=payload) as ran, \
                 mock.patch("sys.stdout", out), mock.patch("sys.stderr",
