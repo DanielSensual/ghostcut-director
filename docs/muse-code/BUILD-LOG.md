@@ -755,3 +755,97 @@ Live test: TBD (the owner fills this from the real-footage run).
   green except the same 11 pre-existing `ps`-sandbox errors in
   `tests/test_engine_render.py` and `tests/test_render_runner.py`
   (730 on the pristine tree, same 11).
+
+# Build log: gaze cuts inside a line (`angles` gazecut) (2026-11-04)
+
+| Step | By | What |
+|---|---|---|
+| Brief | Project owner, with Claude Code | `GAZECUT-BRIEF.md`: cut to the camera I'm facing, inside a line. Written after the owner watched the final take in the app and saw the cut open on tripod camera B while he was facing the drone C. |
+| Build | Meta **Muse Code** on **`muse-wonder-1.0`** | Dense gaze sampling, held-turn gaze segments and word-gap splits, duration-weighted minimum-shot merges and one reason per shot in `src/director/gaze.py` + `src/director/angles.py`, the continuous landmark yaw in `src/director/lips_helper.swift` + `src/director/sync.py`, 13 new tests (11 in `tests/test_gaze.py`, 2 in `tests/test_sync.py`; the dense-sampling test updated). Built straight from the brief (no separate design). |
+| Code review and live test | Claude Code, piloted by the owner | Real footage, below. |
+
+Muse Code token use: TBD (the owner fills this from the run log).
+Live test: TBD (the owner fills this from the real-footage run).
+
+## Build notes (Muse Code)
+
+- Sampling is dense now: about one frame every 0.5 s per covering
+  camera across each line, at least the old 3 and capped at 16 per
+  line (`dense_line_sample_times`); frame names are zero-padded so
+  the helper's sorted order stays the sample order past nine samples.
+  The sample times are recorded per line in `angles.json`
+  (`sample_times_s`, with the held `segments` beside them), and the
+  per-line pick still needs a majority of addressed samples.
+- A turn inside a line becomes a cut: per sample, the addressed
+  camera is the one camera with |yaw| ≤ 18°; samples with no single
+  addressed camera inherit the previous address, and a run held for
+  under 1.0 s is a glance that folds into its longer neighbour
+  (`gaze_segments_for_line`), so a 0.4 s look away makes no cut. A
+  surviving change of address splits the line on the word gap nearest
+  the turn (`_gaze_units` in `angles.py`, noted `gaze_split:L<n>` on
+  both shots). A side that would be folded away despite being short
+  is kept when folding would show the wrong camera for more than
+  1 s (`gaze_split_kept`); at or under a second it folds.
+- Merges keep the gaze: a minimum-shot merge now takes the camera
+  addressed for the most time in the merged span — each sample owns
+  the interval halfway to its neighbours, summed over the span
+  (`addressed_durations`) — not a per-line vote and not simply the
+  surviving neighbour's camera. Adjacent pieces on one camera group
+  first, so a short split side that continues the previous shot's
+  camera is already part of that shot before the rule runs.
+- Overrides win: a line pinned by an editor (`set_angle` /
+  `angle_override`, method `editor`) never gaze-splits, and a
+  neighbour carrying an override keeps its camera against the
+  duration-weighted winner, exactly as the short-shot override rule
+  already worked.
+- One reason per shot: shots no longer concatenate their lines'
+  reasons. A shot keeps the first reason for its camera (a split
+  shot's own `speaker addresses camera <label>`), through same-camera
+  grouping, minimum-shot merges and same-camera joins alike; the
+  repeated four-copy reasons on the final take's opening shots are
+  gone (see the job check below).
+- Better yaw, and what was measured: Vision's yaw is quantised
+  (0°, ±45°), so the helper now also prints a fifth token, a
+  continuous yaw in degrees from the face landmarks — the nose tip
+  (the lowest `nose` landmark) sideways from the midpoint of the two
+  eye centroids, as `atan2(offset, 0.55 × eyeDistance)` clamped to
+  ±75°, its sign aligned with the coarse yaw when that is non-zero;
+  `NA` when the eye or nose landmarks are missing. The nose tip sits
+  roughly 0.55 inter-eye distances in front of the eye plane, which
+  is what the 0.55 encodes. The gaze rule uses this estimate when
+  present and the coarse yaw otherwise (`effective_yaw`); both are
+  recorded (`yaw_continuous_deg` / `yaw_coarse_deg`) when the
+  continuous one exists. Measured here: the formula's Python mirror
+  (`continuous_yaw_deg` in `sync.py`, tested in `test_sync.py`) gives
+  0° for a centred nose tip and 45.0° for an offset of
+  0.55 eye-distances, rising monotonically between; the helper still
+  builds with `swiftc -O` as today (rebuilt through
+  `build_lips_helper` and directly). It was **not** measured on real
+  faces in this sandbox: Vision returns NOFACE here (the ANE model
+  fails to load, as on the `look` build), so the 0.55 depth ratio is
+  geometry, not a fit to the owner's footage — the live check below
+  is the owner's agent's to run with the real helper.
+- Job check, on copies in `/tmp/gazecut-job/` only (the JSON files
+  copied out of the read-only job; nothing written into it, no
+  `--render`): the planner ran `--no-muse` with stand-in gaze, since
+  this sandbox can run neither Vision nor new ffmpeg samples. The
+  stand-in samples are the job's existing three samples per line held
+  over their thirds at the new dense times, except line 1, where the
+  brief's frame reading (faces C for "my drone has no microphone",
+  B for "but this software lined it up here") puts the samples on C
+  before the microphone|but gap and B after it. First 30 s, output
+  timeline. Before (the job's `angles.json`): B 0.00–5.73 (lines
+  0–1, with the four-times-repeated reason), B 5.73–10.53, B
+  10.53–11.34, C 11.34–15.22, B 15.22–26.64, C 26.64–29.33, C
+  29.33–30.86. After: C 0.00–3.69 (lines 0–1: "My mic, my drone has
+  no microphone"), B 3.69–5.73, B 5.73–10.53, B 10.53–12.80 (lines
+  3–4), C 12.80–17.12 (lines 4–5), B 17.12–26.64, C 26.64–29.33, C
+  29.33–30.86 — the opening now opens on the drone and cuts to B at
+  the word gap after "microphone", and every reason appears once.
+  The extra mid-line cuts after 10 s come from those held thirds of
+  sparse samples, not from live dense sampling; with the real helper
+  the owner's agent re-runs this check before trusting them.
+- Full suite: 771 tests (13 new), green except the same 11
+  pre-existing `ps`/socket-sandbox errors in
+  `tests/test_engine_render.py` and `tests/test_render_runner.py`
+  (758 on the tree before this build, same 11).
