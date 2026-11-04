@@ -990,8 +990,7 @@ Muse Code token use: TBD (the owner fills this from the run log).
 - **CPU.** Manual rAF capped at 30 fps, pixel ratio ≤ 1.5, antialias off, low-power context, paused while the page or
   `#view-edit` is hidden, `ResizeObserver` on `.player`, geometry/materials/renderer disposed on finish, fail and stop.
 - **Accepted gaps.** Thumbnail URLs carry no version for cut jobs, so a heuristic browser cache can show the old
-  timeline thumbs until a reload. The Words list is redrawn but reads the transcript captured at page load
-  (`const T = P.transcript` sits outside the functions this build may edit), so new words appear after a reload.
+  timeline thumbs until a reload (the engine sends `Cache-Control: no-store`, so this is unlikely).
   The legacy `showProgress` hook is a no-op unless something started the kitchen (only the cut-job path does); the
   offload-cut poller is not hooked (stretch, ONBOARD owns that page).
 - **Vendored code.** `app/ui/vendor/three.module.min.js` is three.js 0.170, MIT (`three.LICENSE`), third-party and not
@@ -1010,6 +1009,18 @@ readouts (`shots 7/23 · 30% · about 4 min left`, plan/join captions, stage and
 failure message, no-ops before start).
 
 Full suite outside the sandbox (`.venv/bin/python -m unittest discover -s tests -p 'test_*.py'`): 811 tests, OK (287 s), no errors or skips-as-failures; before this build the same suite was 794 tests (811 minus the 17 new ones).
+
+## Independent review (Claude Code, Opus)
+
+Read the diff against the brief and fixed four defects: the Words list kept the page-load transcript after the
+in-place hand-off (`pollCutjob` now refills `T` from the fresh project before `renderWords()`); a slow status poll
+landing after another poll had already seen `done` could run the hand-off twice (it now returns once the timer is
+cleared); the hand-off waited only for `canplay`, which `preload="metadata"` may never reach in Safari/WKWebView, so
+the kitchen could hang for the full 4 s cap (`loadeddata` now also counts); and a Render retry during the 2 s
+sad-ghost beat was ignored by `Kitchen.start()` and then hidden by the old fail timer (start now clears a failing
+kitchen first, and resets the ghosts' action). Checked and sound: the vendored module path and its MIT header, `.js`
+served as `text/javascript`, the 30 fps accumulator, the hidden-tab/hidden-view pause, the reduced-motion fallback,
+the sampler stop/join ordering, and no Meta/ElevenLabs/xAI/Whisper call anywhere in the kitchen. Full suite: 811 OK.
 
 ## Not verified
 

@@ -1061,6 +1061,7 @@
   async function pollCutjob() {
     try {
       const st = await api("/api/cutjob/rerender");
+      if (!cutjobTimer) return; // KITCHEN: a slow poll that lands after another one finished must not hand off twice
       // KITCHEN: every status feeds the scene, before the running return; real shot progress drives the bar too.
       try { if (window.Kitchen) Kitchen.update(st); } catch { /* kitchen is optional */ }
       if (st.state === "running" && st.pct != null) {
@@ -1081,10 +1082,12 @@
           const j = await api("/api/project");
           ({ project: P, edits: EDITS, engine: ENGINE } = j);
           applyResult(j);
-          const ready = new Promise((res) => { video.addEventListener("canplay", res, { once: true }); setTimeout(res, 4000); });
+          // KITCHEN: preload="metadata" may stop short of canplay (Safari), so the first decoded frame counts too.
+          const ready = new Promise((res) => { video.addEventListener("canplay", res, { once: true }); video.addEventListener("loadeddata", res, { once: true }); setTimeout(res, 4000); });
           video.poster = `demo/poster.jpg?v=${Date.now()}`;
           video.src = `demo/video.mp4?v=${Date.now()}`;
           $("#tcDur").textContent = fmt(P.duration);
+          T.splice(0, T.length, ...(P.transcript || [])); // KITCHEN: the Words list reads T, captured at page load
           renderWords(); lockEdits();
           layout();
           await ready;

@@ -198,6 +198,8 @@ class PageTests(unittest.TestCase):
         self.assertIn("applyResult(j)", done)
         self.assertIn("video.src = `demo/video.mp4?v=${Date.now()}`", done)
         self.assertIn("renderWords(); lockEdits();", done)
+        self.assertLess(done.index("T.splice(0, T.length"), done.index("renderWords(); lockEdits();"))
+        self.assertLess(poll.index("if (!cutjobTimer) return;"), poll.index("Kitchen.update(st)"))
         self.assertIn("Kitchen.finish()", done)
         self.assertIn("location.reload()", done[done.index("catch"):])  # the old path is the fallback only
         self.assertIn("Kitchen.fail(", poll)
@@ -280,6 +282,8 @@ try {
   K.preview(); K.update({ phase: "shots", done: 2, total: 23, pct: 9 });
   out.preview = els.kitchenReadout.textContent; K.stop(); out.hiddenAfterStop = els.kitchen.hidden;
   out.renders = ctx.__renders || globalThis.__renders || 0; out.tris = globalThis.__tris || 0; out.disposed = !!globalThis.__disposed; out.firstTris = globalThis.__first;
+  K.start({ mode: "cutjob" }); K.fail("boom"); K.start({ mode: "cutjob" });  // a retry during the sad-ghost beat
+  await sleep(2200); out.retryShown = !els.kitchen.hidden; K.stop();
 } catch (e) { out.errors.push(String(e && e.stack || e)); }
 console.log(JSON.stringify(out));
 process.exit(0);
@@ -313,6 +317,7 @@ class KitchenScriptTests(unittest.TestCase):
         self.assertTrue(res["hiddenAfterFinish"])
         self.assertEqual(res["failText"], "RuntimeError: boom")
         self.assertTrue(res["hiddenAfterFail"])
+        self.assertTrue(res["retryShown"])  # the old fail timer must not hide the retry's kitchen
         self.assertTrue(res["preview"].startswith("preview \u00b7 "))
         self.assertTrue(res["hiddenAfterStop"])
 

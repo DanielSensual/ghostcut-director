@@ -724,6 +724,7 @@
     if (st.message) setCaption(String(st.message));
   }
   function start(opts) {
+    if (active && failing) stop(); // a retry during the 2 s sad-ghost beat gets a fresh kitchen
     if (active) return;
     const ov = overlay(); if (!ov) return;
     mode = (opts && opts.mode) || "cutjob";
@@ -732,7 +733,7 @@
     if (!thumbCount) {
       try { const d = +(window.PROJECT && window.PROJECT.duration); if (d > 0) thumbCount = Math.floor(d / 2); } catch (e) { thumbCount = 0; }
     }
-    active = true; finishing = false; failing = false;
+    active = true; finishing = false; failing = false; currentAction = "stir";
     const myGen = ++gen;
     lastDone = -1; lastTotal = null; lastPhase = null; dressIndex = -1;
     captionMode = "rotate"; captionIndex = 0; cycleIndex = 0; lastCycleAt = performance.now();
