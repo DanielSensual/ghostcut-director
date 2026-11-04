@@ -14,7 +14,7 @@ You need Python 3.11 or newer and `ffmpeg`/`ffprobe` on your `PATH`. No footage 
 
 `director demo` makes a small synthetic shoot in `director-demo/shoot/` (a lav track and three cameras at known offsets, one of them silent, with a deliberate restart in the script), runs the real `director cut` pipeline on it offline, and checks its own work. You will see the sync offsets against the known ones (pass within one frame), how many seconds the restart removal took out, and where to look next: `director-demo/job/cut.mp4`, `director-demo/job/vertical.mp4`, `director-demo/job/timeline.fcpxml`, and `director-demo/job/cut.json`. It exits non-zero if a check fails. `director demo --muse` runs the same shoot with Muse and SAM when `MODEL_API_KEY` is set; `--keep` reuses shoot media already in the output folder.
 
-Demo video (3 minutes): VIDEO_LINK_HERE — placeholder, the link goes here.
+Demo video (2:14): https://youtu.be/qOY_rNQEcWQ
 
 ## Built with Meta's AI
 
