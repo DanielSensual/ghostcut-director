@@ -1151,24 +1151,30 @@
       const num = (v) => (Number.isFinite(v) ? v.toFixed(1).replace("-", "−") : "–");
       const pos = (v) => `${((Math.max(-24, Math.min(0, Number.isFinite(v) ? v : -24)) + 24) / 24) * 100}%`;
       el.append(h("h2", {}, "Deliver"),
-        h("p", { class: "lede" }, `Finish here, or hand the cut to your editor with every decision editable. PROTOTYPE: the export buttons are not wired yet. ${P.version
-          ? `The loudness figures were measured on the ${P.version} master.` : "This cut was built before Render: its loudness figures were entered by hand, and the first render re-measures them."}`),
-        h("div", { class: "stats" }, stat(P.version || "legacy", P.version ? "version · rendered by GhostCut" : "version · built before Render"),
+        h("p", { class: "lede" }, `Finish here, or hand the cut to your editor with every decision editable. ${P.version
+          ? `The loudness figures were measured on the ${P.version} master.` : P.loudness && P.loudness.measured ? `Loudness measured by ${P.loudness.measured}.` : "This cut was built before Render: its loudness figures were entered by hand, and the first render re-measures them."}`),
+        h("div", { class: "stats" }, stat(P.version || (isCutJob() ? "cut" : "legacy"), P.version ? "version · rendered by GhostCut" : isCutJob() ? "director cut job" : "version · built before Render"),
           stat(num(lufs), "LUFS integrated"), stat(num(tp), "dBTP true peak"),
           Number.isFinite(gain) ? stat(`${num(gain)} dB`, "music bed gain") : null),
         h("div", { class: "cols" },
           h("div", { class: "box" }, h("h3", {}, "Outputs"),
             [["Master · 1080p59.94 MP4", "−14 LUFS web master"], ["Phone preview · 540p", "under 30 MB, for the client's phone"], ["Final Cut Pro · FCPXML", "cuts, B-roll lane, cards as titles"], ["Premiere Pro · XML", "FCP7 XML"], ["DaVinci Resolve", "imports the FCPXML"], ["Captions · SRT", "from Whisper words on the render"], ["Reshoot list", "missing shots, never generated"]]
               .map(([a, b], i) => h("label", { class: "out" }, h("input", { type: "checkbox", checked: i < 3 || null }), h("div", {}, h("b", {}, a), h("span", {}, b))))),
-          h("div", { class: "box" }, h("h3", {}, `Loudness · ${P.version || "legacy build"}`),
+          h("div", { class: "box" }, h("h3", {}, `Loudness · ${P.version || (isCutJob() ? "cut.mp4" : "legacy build")}`),
             h("div", { class: "big" }, `${num(lufs)} LUFS`), h("p", {}, `True peak ${num(tp)} dBTP · target −14 LUFS ±1, ≤ −1 dBTP`),
             h("div", { class: "meter" }, h("div", { class: "tgt", style: `left:${pos(-15)};right:${`${100 - parseFloat(pos(-13))}%`}` }), h("i", { style: `left:${pos(lufs)}` })),
-            h("p", { class: "muted", style: "font-size:11px" }, P.version ? `−24 … 0 LUFS · measured with ffmpeg ebur128 on the ${P.version} master` : "−24 … 0 LUFS · entered by hand, not re-measured")),
+            h("p", { class: "muted", style: "font-size:11px" }, P.version ? `−24 … 0 LUFS · measured with ffmpeg ebur128 on the ${P.version} master` : P.loudness && P.loudness.measured ? `−24 … 0 LUFS · measured by ${P.loudness.measured}` : "−24 … 0 LUFS · entered by hand, not re-measured")),
           h("div", { class: "box" }, h("h3", {}, "Open before you send"),
             (P.findings || []).filter((f) => f.state === "open").map((f) => h("div", { class: "vol" }, f.title, h("span", {}, fmt(f.t)))),
             P.pending ? h("div", { class: "vol" }, `${P.pending} accepted change${P.pending === 1 ? "" : "s"} waiting to render`, h("span", {}, "Edit")) : null),
         ),
-        h("p", {}, h("button", { class: "primary", style: "margin-top:16px", onclick: (e) => (e.target.textContent = "Exporting… (prototype)") }, "Export selected")));
+        h("p", {}, h("button", { class: "primary", style: "margin-top:16px", onclick: () => api("/api/job/reveal", {}).catch(() => {}) }, isCutJob() ? "Show the job folder" : "Export selected")));
+      if (isCutJob()) api("/api/job/files", {}).then((r) => {  // real deliverables the cut job wrote
+        const box = el.querySelector(".cols .box"); if (!box || !r.files || !r.files.length) return;
+        box.replaceChildren(h("h3", {}, "Outputs · in the job folder"), ...r.files.map((f) =>
+          h("div", { class: "out" }, h("div", {}, h("b", {}, f.label), h("span", {}, `${f.note} · ${f.size}`)),
+            h("button", { onclick: () => api("/api/job/reveal", { name: f.name }).catch(() => {}) }, "Show in Finder"))));
+      }).catch(() => {});
     },
   };
 

@@ -354,6 +354,14 @@ def build_project(job_dir: Path, out_dir: Path) -> dict:
         "spend": spend, "env": {}, "envStep": 0.5,
         "cutJob": {"dir": job_arg, "tightened": tightened},
     }
+    # Loudness Director's QC measured on cut.mp4, for the Deliver page.
+    for check in ((cut or {}).get("qc") or {}).get("checks") or []:
+        detail = check.get("detail") if isinstance(check, dict) else None
+        if isinstance(detail, dict) and "integrated_lufs" in detail:
+            project["loudness"] = {"lufs": detail["integrated_lufs"],
+                                   "tp": detail.get("true_peak_dbtp"),
+                                   "measured": "Director's QC on cut.mp4"}
+            break
 
     out_dir.mkdir(parents=True, exist_ok=True)
     render = job_dir / "cut.mp4"

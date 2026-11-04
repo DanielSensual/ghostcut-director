@@ -120,6 +120,10 @@ def _brief(st: dict) -> dict:
 MUSE_UNAVAILABLE = "Muse unavailable, using the built-in planner."  # ONBOARD
 
 
+def _human_size(n: int) -> str:
+    return f"{n / 1e6:.1f} MB" if n >= 1e6 else f"{max(1, round(n / 1e3))} KB"
+
+
 class Engine:
     def __init__(self, demo: Path = DEMO, render=None, job_dir: Path | str | None = None, settings_path: Path | str | None = None):  # ONBOARD
         self._settings_path: Path | None = Path(settings_path) if settings_path is not None else None  # ONBOARD: lazy, never read here
@@ -370,6 +374,32 @@ class Engine:
     def _cutjob_idle(self, what: str) -> None:
         if self._cutjob_state.get("state") == "running":
             raise Busy(CUTJOB_BUSY.format(what))
+
+    # Deliverables a director cut job already wrote, for the Deliver page.
+    JOB_FILES = (("cut.dressed.mp4", "Dressed cut", "cards, music bed and ghost pops"),
+                 ("cut.mp4", "Master · horizontal", "captioned, finished, −14 LUFS"),
+                 ("cut.clean.mp4", "Clean master", "no captions or title, for your editor"),
+                 ("vertical.mp4", "Vertical 9:16", "SAM 3.1 reframe, captioned"),
+                 ("timeline.fcpxml", "Final Cut Pro / Resolve", "FCPXML, every cut editable"),
+                 ("timeline.otio.json", "OpenTimelineIO", "for Premiere and other editors"))
+
+    def job_files(self) -> dict:
+        if self.job_dir is None:
+            return {"files": []}
+        files = [{"name": n, "label": a, "note": b,
+                  "size": _human_size((self.job_dir / n).stat().st_size)}
+                 for n, a, b in self.JOB_FILES if (self.job_dir / n).is_file()]
+        return {"dir": str(self.job_dir), "files": files}
+
+    def job_reveal(self, name: str = "") -> dict:
+        if self.job_dir is None:
+            raise ValueError("No job is open")
+        names = {n for n, _, _ in self.JOB_FILES}
+        target = self.job_dir / name if name in names else self.job_dir
+        if not target.exists():
+            raise ValueError(f"{name} is not in the job folder")
+        subprocess.Popen(["open", "-R", str(target)] if target.is_file() else ["open", str(target)])
+        return {"ok": True, "path": str(target)}
 
     def open_job(self, path: str) -> dict:
         job = Path(path or "")
@@ -1851,6 +1881,10 @@ class Handler(SimpleHTTPRequestHandler):
             return e.cancel_render()
         if path == "/api/render/revert":
             return e.revert_render()
+        if path == "/api/job/files":
+            return e.job_files()
+        if path == "/api/job/reveal":
+            return e.job_reveal(str(body.get("name") or ""))
         if path == "/api/job/open":
             if not str(body.get("path") or ""):
                 raise ValueError("Missing path")
