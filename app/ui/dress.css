@@ -2,7 +2,7 @@
 .dress-panel {
   position: fixed; right: 16px; top: 72px; z-index: 40; width: min(360px, calc(100vw - 32px));
   max-height: calc(100vh - 96px); overflow: auto; padding: 12px 14px;
-  background: var(--glass, #161a23); color: var(--text, #e8e8ea);
+  background: #141821; backdrop-filter: blur(14px); color: var(--text, #e8e8ea);
   border: 1px solid var(--line, #2a2f3a); border-radius: 14px; box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
   font-size: 13px;
 }
