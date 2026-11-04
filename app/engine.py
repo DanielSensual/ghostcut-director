@@ -779,9 +779,9 @@ class Engine:
             info = cm.provider_info(name)
         except cm.ConnectError as e:
             raise ValueError(str(e)) from e
-        if info.id == "elevenlabs":
+        if len(info.env_vars) == 1:
             if not (key or "").strip():
-                raise ValueError("connect: missing 'key' for elevenlabs")
+                raise ValueError(f"connect: missing 'key' for {info.id}")
             parts = (key or "",)
         else:
             if not (key_id or "").strip():
@@ -793,6 +793,8 @@ class Engine:
             cm.set_provider_key(info.id, parts)
         except cm.ConnectError as e:
             raise ValueError(str(e)) from e
+        if info.id == "meta":
+            cm.export_keychain_key("meta")  # the Meta client reads MODEL_API_KEY, so hand it the saved key now
         return {"providers": cm.list_providers()}
 
     def connections_remove(self, provider: str) -> dict:
@@ -1998,7 +2000,24 @@ def serve(port: int = 7791, demo: Path = DEMO, render=None,
     return ThreadingHTTPServer(("127.0.0.1", port), partial(handler, directory=str(ROOT)))
 
 
+def export_saved_keys() -> str:
+    """Hand a Muse key saved in Connections (Keychain) to the Meta client, which reads MODEL_API_KEY.
+
+    Called by the two entry points (this file and app/main.py), not by serve(), so tests never touch the
+    real Keychain. A key set in the environment wins. Returns the source in effect; never the key.
+    """
+    src = str(ROOT / "src")
+    if src not in sys.path:
+        sys.path.insert(0, src)
+    try:
+        from director import connect as cm
+        return cm.export_keychain_key("meta")
+    except Exception:  # noqa: BLE001 - no director package or Keychain backend: the environment still works
+        return "none"
+
+
 if __name__ == "__main__":
+    export_saved_keys()
     rest = list(sys.argv[1:])
     job = None
     if "--job" in rest:

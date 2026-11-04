@@ -129,6 +129,7 @@
 .gc-tour-btn { padding: 6px 13px; border-radius: 8px; border: 1px solid var(--line2); color: var(--muted); font-size: var(--t-sm); }
 .gc-tour-btn:hover { color: var(--text); }
 .gc-tour-btn.primary { border-color: transparent; color: #fff; }
+.gc-tour-warn { color: var(--amber, #f2c14e); }
 .gc-tour-btn:disabled { opacity: .4; cursor: default; }
 
 @media (prefers-reduced-motion: no-preference) {

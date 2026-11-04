@@ -101,25 +101,34 @@
       },
       function () {
         var box = h("div", {}, h("p", { class: "muted" }, "Checking connections…"));
-        body.replaceChildren(h("h3", {}, "Connect your tools (optional)"),
-          h("p", {}, "Keys stay on this Mac. Nothing is required to import."), box);
-        (async function () {
-          var eleven = "ElevenLabs not connected — music and sound effects (optional).";
-          var museLine = "Ghost is running on rules — its built-in planner reads every request, offline.";
+        body.replaceChildren(h("h3", {}, "Connect Muse"),
+          h("p", {}, "Muse is the brain of the edit: it reads what you ask for, picks the takes and chooses the angles. Paste your Meta API key once (from dev.meta.ai); it stays in this Mac's Keychain."),
+          box);
+        var check = async function () {
+          var museLine = "Muse is not connected yet. Import still works: Ghost runs on its built-in rules until you add a key.";
+          var eleven = "Optional: ElevenLabs for Dress music and sound effects.";
+          var connected = false;
           try {
             var j = await api("/api/connections");
             var list = (j && j.providers) || [];
+            var meta = list.find(function (p) { return p.id === "meta"; });
+            connected = !!(meta && meta.connected);
+            if (connected) museLine = "Muse is connected. Ghost reads your requests with Spark, and falls back to its built-in rules if Muse is unreachable.";
             var hit = list.find(function (p) { return p.id === "elevenlabs" || /eleven/i.test(p.name || ""); });
-            if (hit && hit.connected) eleven = "ElevenLabs connected — music and sound effects ready.";
-          } catch (e) { eleven = "Connections unavailable offline — connect later if you want music and sound effects."; }
-          try {
-            var s = await api("/api/settings");
-            if (s && s.meta_key) museLine = "A Muse key is set — Ghost reads requests with Spark, and uses the built-in planner whenever Muse is unavailable.";
-          } catch (e) { /* keep rules line */ }
-          var openBtn = h("button", { type: "button", class: "gc-tour-btn" }, "Open Connections");
-          openBtn.onclick = function () { try { if (ctx.openConn) ctx.openConn(); } catch (e) { /* dialog unavailable */ } };
-          box.replaceChildren(h("p", {}, eleven), h("p", {}, museLine), h("p", {}, openBtn));
-        })();
+            if (hit && hit.connected) eleven = "ElevenLabs connected: music and sound effects are ready for Dress.";
+          } catch (e) { museLine = "Connections are unavailable offline. Add your Muse key later from Connections."; }
+          var openBtn = h("button", { type: "button", class: "gc-tour-btn" }, connected ? "Manage keys" : "Add your Muse key");
+          openBtn.onclick = function () {
+            try { if (ctx.openConn) ctx.openConn(); } catch (e) { /* dialog unavailable */ }
+            // Re-check while this step is showing, so the line turns green once the key is saved.
+            var timer = setInterval(function () {
+              if (!document.body.contains(box)) { clearInterval(timer); return; }
+              if (!document.querySelector(".modal:not([hidden])")) { clearInterval(timer); check(); }
+            }, 800);
+          };
+          box.replaceChildren(h("p", { class: connected ? "" : "gc-tour-warn" }, museLine), h("p", {}, openBtn), h("p", { class: "muted" }, eleven));
+        };
+        check();
       },
       function () {
         var box = h("div", {}, h("p", { class: "muted" }, "Looking for drives…"));

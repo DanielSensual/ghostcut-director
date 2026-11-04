@@ -49,6 +49,7 @@ def main() -> None:
         if not job:
             raise SystemExit("main: --job needs a directory")
     port = free_port()
+    engine.export_saved_keys()
     httpd = engine.serve(port, job=job)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     brand_the_process()

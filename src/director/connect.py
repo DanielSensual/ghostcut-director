@@ -9,7 +9,9 @@ repo, a job file, a log line, a URL or an error message, and no surface
 ever shows a saved key back.
 
 Designed by Muse Code on muse-wonder-1.0, built by Muse Code on
-muse-spark-1.3 from docs/muse-code/FINISH-DESIGN.md.
+muse-spark-1.3 from docs/muse-code/FINISH-DESIGN.md. The `meta` provider
+(Muse's own key, tested by `metaapi`, exported to `MODEL_API_KEY` for the
+Meta client) was added by Claude Code on submission day.
 """
 from __future__ import annotations
 
@@ -40,6 +42,15 @@ class ProviderInfo:
 
 
 PROVIDERS: dict[str, ProviderInfo] = {
+    "meta": ProviderInfo(
+        id="meta",
+        display_name="Meta (Muse)",
+        env_vars=("MODEL_API_KEY",),
+        keychain_accounts=("meta-model-api",),
+        capabilities=("muse", "sam"),
+        available=True,
+        unavailable_reason="",
+    ),
     "elevenlabs": ProviderInfo(
         id="elevenlabs",
         display_name="ElevenLabs",
@@ -87,7 +98,7 @@ def provider_info(provider: str) -> ProviderInfo:
     except KeyError:
         raise ConnectError(
             f"connect: unknown provider '{provider}' "
-            "(known: elevenlabs, higgsfield)"
+            f"(known: {', '.join(PROVIDERS)})"
         ) from None
 
 
@@ -156,11 +167,53 @@ def _read_keychain(info: ProviderInfo) -> tuple[str, ...] | None:
     return tuple(parts)
 
 
+# Keys this process copied from the Keychain into its environment (env var ->
+# value), for clients that read only the environment: the Meta client reads
+# MODEL_API_KEY. A copied key still reports as a Keychain key, and removing it
+# takes the copy out of the environment again.
+_EXPORTED: dict[str, str] = {}
+
+
+def _is_exported(info: ProviderInfo, parts: tuple[str, ...]) -> bool:
+    return all(_EXPORTED.get(var) == part for var, part in zip(info.env_vars, parts))
+
+
+def _drop_exported(info: ProviderInfo) -> None:
+    for var in info.env_vars:
+        if var in _EXPORTED:
+            if os.environ.get(var, "").strip() == _EXPORTED[var]:
+                os.environ.pop(var, None)
+            _EXPORTED.pop(var, None)
+
+
+def export_keychain_key(provider: str) -> str:
+    """Copy a Keychain key into the provider's env vars for this process.
+
+    Only when they are unset (or hold a copy made here, which is refreshed):
+    a key the editor set in the environment always wins. Returns the source
+    in effect afterwards: "env", "keychain" or "none". Never returns the key.
+    """
+    info = provider_info(provider)
+    env = _read_env(info)
+    if env is not None and not _is_exported(info, env):
+        return "env"
+    parts = _read_keychain(info)
+    if parts is None:
+        _drop_exported(info)
+        return "none"
+    for var, part in zip(info.env_vars, parts):
+        os.environ[var] = part
+        _EXPORTED[var] = part
+    return "keychain"
+
+
 def key_status(provider: str) -> KeyStatus:
     """Env first, then Keychain. Never returns key material."""
     info = provider_info(provider)
-    if _read_env(info) is not None:
-        return KeyStatus(provider, True, "env", info.env_vars[0])
+    env = _read_env(info)
+    if env is not None:
+        source = "keychain" if _is_exported(info, env) else "env"
+        return KeyStatus(provider, True, source, info.env_vars[0])
     if _read_keychain(info) is not None:
         return KeyStatus(provider, True, "keychain", info.env_vars[0])
     return KeyStatus(provider, False, "none", info.env_vars[0])
@@ -214,6 +267,9 @@ def remove_provider_key(provider: str) -> KeyStatus:
     message.
     """
     info = provider_info(provider)
+    env = _read_env(info)
+    if env is not None and _is_exported(info, env):
+        _drop_exported(info)  # a Keychain key copied here: remove it like one
     if _read_env(info) is not None:
         if keychain_available():
             try:
@@ -280,7 +336,11 @@ def test_provider(provider: str) -> TestResult:
     if parts is None:
         return TestResult(provider, False, _not_connected_message(info))
     try:
-        if provider == "elevenlabs":
+        if provider == "meta":
+            from . import metaapi as provider_mod
+
+            result = provider_mod.test_connection(parts[0])
+        elif provider == "elevenlabs":
             from . import elevenlabs as provider_mod
 
             result = provider_mod.test_connection(parts[0])
@@ -291,7 +351,7 @@ def test_provider(provider: str) -> TestResult:
         else:  # pragma: no cover (registry dispatch is exhaustive)
             raise ConnectError(
                 f"connect: unknown provider '{provider}' "
-                "(known: elevenlabs, higgsfield)"
+                "(known: meta, elevenlabs, higgsfield)"
             )
     except ConnectError:
         raise

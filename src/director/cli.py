@@ -440,12 +440,12 @@ def command_connect(args: argparse.Namespace) -> dict:
     if verb == "add":
         info = connect_mod.provider_info(args.provider)
         key, key_id, key_secret = args.key, args.key_id, args.key_secret
-        if info.id == "elevenlabs":
+        if len(info.env_vars) == 1:
             if key_id is not None or key_secret is not None:
                 raise connect_mod.ConnectError(
-                    "connect: elevenlabs takes --key, not --key-id/--key-secret")
+                    f"connect: {info.id} takes --key, not --key-id/--key-secret")
             if key is None:
-                key = _getpass.getpass("ElevenLabs API key (input hidden): ")
+                key = _getpass.getpass(f"{info.display_name} API key (input hidden): ")
             parts = (key,)
         else:
             if key is not None:
@@ -1234,16 +1234,16 @@ def build_parser() -> argparse.ArgumentParser:
     connect_list.add_argument("--json", action="store_true", dest="connect_json",
                               help="Print the providers list as JSON")
     connect_add = connect_sub.add_parser("add", help="Save a key to the macOS Keychain")
-    connect_add.add_argument("provider", help="elevenlabs or higgsfield")
+    connect_add.add_argument("provider", help="meta, elevenlabs or higgsfield")
     connect_add.add_argument("--key", default=None,
-                             help="ElevenLabs API key (else prompted, hidden)")
+                             help="Meta or ElevenLabs API key (else prompted, hidden)")
     connect_add.add_argument("--key-id", default=None, help="Higgsfield key ID")
     connect_add.add_argument("--key-secret", default=None, help="Higgsfield key secret")
     connect_test = connect_sub.add_parser("test", help="Run a provider's cheap test call")
     connect_test.add_argument("provider", nargs="?",
-                              help="elevenlabs or higgsfield (default: every connection)")
+                              help="meta, elevenlabs or higgsfield (default: every connection)")
     connect_remove = connect_sub.add_parser("remove", help="Delete the saved key")
-    connect_remove.add_argument("provider", help="elevenlabs or higgsfield")
+    connect_remove.add_argument("provider", help="meta, elevenlabs or higgsfield")
     connect_parser.set_defaults(func=command_connect)
 
     finish_parser = sub.add_parser("finish", help="Clean, mix and master the cut's audio")
