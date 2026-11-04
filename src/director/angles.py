@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 import shutil
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from pathlib import Path
 
@@ -1047,6 +1047,28 @@ def shot_face_centres(shots: list[Shot], clips_by_label: dict[str, SyncClip],
 
 # ---------------------------------------------------------------- render (list only; run_command does the work)
 
+def timeline_audio(audio: SyncClip, shots: list[Shot],
+                   clips_by_label: dict[str, SyncClip]) -> SyncClip:
+    """The audio clip with the cut's frame rate filled in. Pure.
+
+    An audio recorder has no frame rate, and every frame computation used to
+    fall back to 30 fps: the final take's 23.976 cameras were rendered at
+    30 fps with repeated frames (judder), and the push-in shots came out
+    1.25x their planned frame counts. The cut now runs at the most common
+    frame rate among the cameras it shows.
+    """
+    if audio.fps and audio.fps > 0:
+        return audio
+    rates: dict[float, float] = {}
+    for shot in shots:
+        clip = clips_by_label.get(shot.camera)
+        if clip is not None and clip.fps and clip.fps > 0:
+            rates[clip.fps] = rates.get(clip.fps, 0.0) + (shot.end_s - shot.start_s)
+    if not rates:
+        return audio
+    return replace(audio, fps=max(rates, key=lambda r: rates[r]))
+
+
 def _out_fps(audio: SyncClip) -> str:
     if audio.fps and audio.fps > 0:
         fr = snap_frame_rate(audio.fps)
@@ -1139,6 +1161,7 @@ def render_commands(shots: list[Shot], clips_by_label: dict[str, SyncClip], audi
     """
     if not shots:
         raise ValueError("nothing to render")
+    audio = timeline_audio(audio, shots, clips_by_label)
     if not push_in >= 0:
         raise ValueError(f"--push-in must be >= 0, have {push_in}")
     if grade is not None:
@@ -1219,6 +1242,7 @@ def render(shots: list[Shot], clips_by_label: dict[str, SyncClip],
             raise ToolingError(f"Clip file missing for camera {shot.camera}")
     if not Path(audio.path).exists():
         raise ToolingError(f"Audio file missing: {audio.path}")
+    audio = timeline_audio(audio, shots, clips_by_label)
     if push_in > 0 and face_centres is None:
         parts_dir = Path(out).with_name(Path(out).stem + ".parts")
         face_centres = shot_face_centres(shots, clips_by_label, grade,

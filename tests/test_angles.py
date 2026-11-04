@@ -374,3 +374,24 @@ class TightenedLinesTests(unittest.TestCase):
             self.assertLessEqual(a.end_s, b.start_s)
         self.assertEqual(sum(l.word_end - l.word_start for l in lines), len(words))
         self.assertTrue(all(l.end_s <= 185.38 or l.start_s >= 185.89 for l in lines))
+
+
+class TimelineRateTests(unittest.TestCase):
+    def test_audio_recorder_cut_runs_at_the_cameras_frame_rate(self) -> None:
+        # Live 2026-11-03: a lav reference (no frame rate) made every render 30 fps,
+        # so 23.976 cameras got repeated frames and push-in shots 1.25x their frames.
+        from director.angles import Shot, SyncClip, render_commands, timeline_audio
+        lav = SyncClip("A", "/m/lav.wav", 0.0, fps=0.0)
+        clips = {"A": lav,
+                 "B": SyncClip("B", "/m/sony.mp4", 0.0, fps=23.976, width=3840, height=2160),
+                 "C": SyncClip("C", "/m/dji.mov", 0.0, fps=23.976, width=5120, height=2700)}
+        shots = [Shot(0, 0.0, 5.0, "B", "/m/sony.mp4", 0.0, 5.0, [0], "medium", "ok", "muse"),
+                 Shot(1, 5.0, 10.0, "C", "/m/dji.mov", 5.0, 10.0, [1], "wide", "ok", "muse")]
+        self.assertAlmostEqual(timeline_audio(lav, shots, clips).fps, 23.976)
+        parts, _, _ = render_commands(shots, clips, lav, Path("/tmp/cut.mp4"), push_in=4.0,
+                                      face_centres={0: (0.5, 0.5), 1: (0.5, 0.5)})
+        joined = " ".join(" ".join(cmd) for cmd in parts)
+        self.assertIn("fps=24000/1001", joined)
+        self.assertNotIn("fps=30", joined)
+        frames = [int(cmd[cmd.index("-frames:v") + 1]) for cmd in parts[:2]]
+        self.assertEqual(frames, [120, 120])  # 5 s at 23.976 fps
