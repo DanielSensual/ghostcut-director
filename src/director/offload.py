@@ -7,7 +7,10 @@ repeat scan probes only what changed), `plan_offload` lays out
 `<destination>/<YYYY-MM-DD> <project>/<camera>/` copies (sidecars beside
 their clips, identical files skipped), and `run_offload` copies through
 `*.part` files that are renamed only after a streamed checksum verifies
-against the source. The source card is only ever read. `offload.json`
+against the source. The source card is only ever read: a plan whose
+copies could land on a source card, or that would copy two files to
+one destination, is refused when it is made and again before
+`run_offload` creates anything (`check_plan_safety`). `offload.json`
 in the shoot folder records every file.
 
 By default a plan covers only the most recent shoot day found on the
@@ -37,6 +40,7 @@ import shutil
 import subprocess
 import threading
 import time
+import unicodedata
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import date as _Date
@@ -308,6 +312,9 @@ class OffloadPlan:
     cards_info: list[dict] = field(default_factory=list)
     selected_count: int = 0
     total_count: int = 0
+    # Every source card root, resolved when the plan was made;
+    # run_offload re-checks the copies against them.
+    source_roots: list[str] = field(default_factory=list)
 
     @property
     def total_bytes(self) -> int:
@@ -881,6 +888,177 @@ def _human(n: int) -> str:
     return f"{value:.1f} TB"
 
 
+# ---------------------------------------------------------- safety
+# The card is only ever read. A plan is refused when its copies could
+# land on a source card or two files would be copied to one place:
+# when it is made, and again in run_offload before anything is
+# created, since a plan can go stale (a folder swapped for a symlink)
+# or be edited by hand. Nothing is renamed or overwritten to make room.
+
+def _resolved(path) -> Path:
+    """`path` made absolute with every symlink followed."""
+    p = Path(path).expanduser()
+    try:
+        return p.resolve()
+    except (OSError, RuntimeError):
+        return Path(os.path.abspath(p))
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    """True when resolved `path` is resolved `root` or lies inside it.
+
+    Besides the spelling, the existing ancestors of `path` are matched
+    against `root` by device and inode, so another spelling of the same
+    folder (letter case on a case-insensitive card) still counts.
+    """
+    if path.is_relative_to(root):
+        return True
+    try:
+        want = root.stat()
+    except OSError:
+        return False
+    for probe in (path, *path.parents):
+        try:
+            st = probe.stat()
+        except OSError:
+            continue
+        if (st.st_dev, st.st_ino) == (want.st_dev, want.st_ino):
+            return True
+    return False
+
+
+def _same_place(a: Path, b: Path) -> bool:
+    if a == b:
+        return True
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
+def _outermost(paths) -> list[Path]:
+    """Resolved roots, de-duplicated, any root inside another dropped."""
+    found = sorted({_resolved(p) for p in paths
+                    if p is not None and str(p) != ""},
+                   key=lambda p: (len(p.parts), str(p)))
+    roots: list[Path] = []
+    for path in found:
+        if not any(path.is_relative_to(r) for r in roots):
+            roots.append(path)
+    return roots
+
+
+def _card_roots(plan: OffloadPlan) -> list[Path]:
+    """Every source card root a plan reads from, resolved now.
+
+    The roots resolved when the plan was made, every card listed on it
+    and, as a floor for a plan edited by hand, each source file's own
+    folder.
+    """
+    raw: list = list(plan.source_roots or [])
+    raw += [info.get("volume") for info in (plan.cards_info or [])
+            if isinstance(info, dict)]
+    raw += list(plan.skipped_volumes or [])
+    raw += [Path(e.source).parent for e in plan.entries]
+    return _outermost(raw)
+
+
+def _check_off_cards(destination, shoot_dir, entries,
+                     roots: list[Path]) -> None:
+    """Refuse copies that could land on a source card.
+
+    Refused: the destination or the shoot folder equal to or inside a
+    card root, a card root inside the shoot folder, and (for a plan
+    edited by hand) any file's destination or its .part on a card.
+    """
+    for given in (destination, shoot_dir):
+        path = _resolved(given)
+        for root in roots:
+            if not _is_within(path, root):
+                continue
+            if _same_place(path, root):
+                where = f"is the source card itself ({root})"
+            else:
+                where = f"is inside the source card {root}"
+            raise OffloadError(
+                f"offload: the destination {given} {where} — pick another "
+                "drive; nothing is ever written to a card")
+    shoot = _resolved(shoot_dir)
+    for root in roots:
+        if _is_within(root, shoot):
+            raise OffloadError(
+                f"offload: the source card {root} is inside the shoot "
+                f"folder {shoot_dir} — pick another destination; nothing "
+                "is ever written to a card")
+
+    def on_card(raw: Path, root: Path) -> OffloadError:
+        return OffloadError(
+            f"offload: {raw} would be written on the source card {root} — "
+            "plan the transfer again; nothing is ever written to a card")
+
+    # Each file (and its .part) by its resolved path; the inode walk
+    # once per folder they land in.
+    folders: dict[Path, Path] = {}
+    for entry in entries:
+        for raw in (Path(entry.destination),
+                    Path(f"{entry.destination}.part")):
+            path = _resolved(raw)
+            for root in roots:
+                if path.is_relative_to(root):
+                    raise on_card(raw, root)
+            folders.setdefault(path.parent, raw)
+    for folder, raw in folders.items():
+        for root in roots:
+            if _is_within(folder, root):
+                raise on_card(raw, root)
+
+
+def _check_unique_destinations(entries, roots: list[Path]) -> None:
+    """Refuse two entries that would be copied to one destination.
+
+    Destinations compare resolved, Unicode-normalized and case-folded:
+    camera SSDs (APFS, exFAT) treat names that differ only in case as
+    one file. The plan is refused; nothing is renamed to make room.
+    """
+    seen: dict[str, PlanEntry] = {}
+    for entry in entries:
+        key = unicodedata.normalize(
+            "NFC", str(_resolved(entry.destination))).casefold()
+        first = seen.setdefault(key, entry)
+        if first is entry:
+            continue
+        a, b = _resolved(first.source), _resolved(entry.source)
+        if a == b:
+            raise OffloadError(
+                f"offload: {first.source} would be copied twice to "
+                f"{first.destination} — the same card or folder was named "
+                "twice; nothing was copied, name each card once")
+        card_a = next((r for r in roots if a.is_relative_to(r)), None)
+        card_b = next((r for r in roots if b.is_relative_to(r)), None)
+        if card_a is not None and card_a == card_b:
+            advice = (f"both are on {card_a}: transfer one shoot day at a "
+                      "time, or copy one of them by hand")
+        else:
+            advice = ("transfer the cards one at a time, each under its "
+                      "own project name")
+        raise OffloadError(
+            f"offload: {first.source} and {entry.source} would both be "
+            f"copied to {first.destination}, so one copy would replace the "
+            f"other — nothing was copied; {advice}")
+
+
+def check_plan_safety(plan: OffloadPlan) -> None:
+    """Raise OffloadError when a plan could write to a source card.
+
+    Also refuses two entries bound for one destination. plan_offload
+    runs the same checks; run_offload and the engine's Transfer run
+    this again before anything is created.
+    """
+    roots = _card_roots(plan)
+    _check_off_cards(plan.destination, plan.shoot_dir, plan.entries, roots)
+    _check_unique_destinations(plan.entries, roots)
+
+
 def plan_offload(cards, destination, project: str | None = None,
                  shoot_date=None, include_all: bool = False) -> OffloadPlan:
     """Plan copies into <destination>/<date> <project>/<camera label>/.
@@ -962,6 +1140,14 @@ def plan_offload(cards, destination, project: str | None = None,
                                      camera_label=label,
                                      checksum_algo=CHECKSUM_ALGO))
     entries.sort(key=lambda e: (e.camera_label, str(e.destination).lower()))
+    # Refuse before anything is hashed or written: copies that could
+    # land on a source card, or two files bound for one destination.
+    source_roots = [str(p) for p in _outermost(
+        [scan.volume for scan in scans]
+        + [clip.volume for _, clip, _ in rows if clip.volume is not None])]
+    roots = _outermost(source_roots + [e.source.parent for e in entries])
+    _check_off_cards(dest_root, shoot_dir, entries, roots)
+    _check_unique_destinations(entries, roots)
     # Skip-if-identical: same size + same streamed checksum already there.
     for entry in entries:
         try:
@@ -1012,7 +1198,8 @@ def plan_offload(cards, destination, project: str | None = None,
         older_summary=older_summary_text(len(excluded_rows), older_start,
                                          older_end),
         skipped_volumes=skipped_volumes, cards_info=cards_info,
-        selected_count=len(selected_rows), total_count=len(rows))
+        selected_count=len(selected_rows), total_count=len(rows),
+        source_roots=source_roots)
     if plan.bytes_to_copy > free:
         raise OffloadError(
             f"offload: not enough space on {dest_root}: need "
@@ -1024,7 +1211,13 @@ def plan_offload(cards, destination, project: str | None = None,
 # ---------------------------------------------------------- copying
 
 def run_offload(plan: OffloadPlan, progress=None) -> OffloadResult:
-    """Copy a plan via *.part files, verifying each before its rename."""
+    """Copy a plan via *.part files, verifying each before its rename.
+
+    The plan is checked again first (check_plan_safety), so a stale or
+    hand-edited plan that could write to a source card, or copy two
+    files to one destination, creates nothing.
+    """
+    check_plan_safety(plan)
     shoot_dir = Path(plan.shoot_dir)
     shoot_dir.mkdir(parents=True, exist_ok=True)
     entries = list(plan.entries)

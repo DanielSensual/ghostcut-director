@@ -853,6 +853,10 @@ this from the run log).
   "Also on the cards: 107 older clips, Oct 19 – Oct 29 (not copied)".
   A cached replan in the same process took 0.05 s.
 
+### Safety fixes after verification (Claude Code, 2026-11-04)
+
+- Astra F01/F02: `plan_offload` refuses, and `run_offload` plus Transfer re-check before creating anything (`check_plan_safety`), a destination equal to or inside a source card (or a card inside the shoot folder) and two files bound for one destination, naming both sources; nothing is renamed or overwritten.
+
 # Build log: gaze cuts inside a line (`angles` gazecut) (2026-11-04)
 
 | Step | By | What |
