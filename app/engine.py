@@ -56,9 +56,8 @@ VOICE_MODEL = "muse-spark-1.3"
 VOICE_MAX_USD = 2.00
 CONNECTIONS_MAX_BODY = 64 * 1024
 NO_CONNECT = "Connections are unavailable in this app build (director package not found)."
-# KITCHEN: sampler tick (seconds) for the re-render progress sampler.
+# KITCHEN: sampler tick (seconds) for the re-render progress sampler (tests patch it smaller).
 KITCHEN_TICK_S = 0.5
-_KITCHEN_TICK_S = KITCHEN_TICK_S
 
 
 def sample_parts(parts_dir: Path, started_at: float, total: int | None) -> dict:
@@ -1104,10 +1103,12 @@ class Engine:
             total = None
         parts_dir = job / "cut.next.parts"
         stop = threading.Event()
+        # KITCHEN: the ETA averages the finished shots only, timed from the first part, so a long
+        # planning phase (angle re-pick, gaze sampling) does not inflate it.
+        shots_since: list[float] = []
 
         def _sampler() -> None:  # KITCHEN
-            while not stop.wait(min(float(globals().get("_KITCHEN_TICK_S", 0.5)),
-                                    float(globals().get("KITCHEN_TICK_S", 0.5)))):
+            while not stop.wait(float(KITCHEN_TICK_S)):
                 try:
                     snap = sample_parts(parts_dir, started_at, total)
                 except Exception:  # noqa: BLE001 - next tick retries
@@ -1122,9 +1123,11 @@ class Engine:
                         pct = 99 if phase == "join" else None
                 else:
                     pct = None
+                if phase in ("shots", "join") and not shots_since:
+                    shots_since.append(time.time())
                 if done >= 1 and tot:
                     if tot > done:
-                        elapsed = max(0.0, time.time() - started_at)
+                        elapsed = max(0.0, time.time() - (shots_since[0] if shots_since else started_at))
                         eta_s: int | None = round((elapsed / done) * (tot - done))
                     else:
                         eta_s = 0

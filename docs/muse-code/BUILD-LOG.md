@@ -955,3 +955,70 @@ it up here.", 8 samples per camera) give continuous yaw C ≈ 10–14° and B �
 reverse; the held-turn segments are C 160.62–162.51 and B 162.51–164.40, and the shot list opens C 0.00–3.69 ("My mic,
 my drone has no microphone") then B — the cut the owner asked for. Every shot carries one reason. Full suite outside
 the sandbox: 771 tests, OK.
+
+# Build log: KITCHEN — the ghost kitchen render screen (2026-11-04)
+
+| Step | By | What |
+|---|---|---|
+| Brief | Project owner, with Claude Code | `KITCHEN-BRIEF.md`: an interactive 3D loading screen over the Edit player while a cut job re-renders, driven by real progress, then the new cut appears without a reload. Written after the owner's review of the app on submission day. The `index.html` hooks and the vendored three.js were pre-applied in `5407a3a`. |
+| Build (partial) | Meta **Muse Code** on **`muse-wonder-1.0`** | Commit `5e5aef2`, untested when the run stopped with API error 402 (Meta API credit exhausted): `sample_parts()` and the sampler thread in `_rerender_worker` (`app/engine.py`), all of `app/ui/kitchen.js` (scene, ghosts, pot, falling cards, splash, sparkles, letter blocks, raycast click/drag/double-click, two-note Web Audio bing, captions, stage/cycle choreography, the cutjob/dress/legacy status shapes, preview, plating beat, sad-ghost fail, CSS fallback), all of `app/ui/kitchen.css`, and the `startCutjobRerender` and `showProgress` hooks in `app/ui/app.js`. It had not reached the `pollCutjob` hand-off, the tests, or the docs. |
+| Finish | **Claude Code** (Opus) | Kept Muse's code and fixed it rather than rewriting it. Engine: one tick constant (`KITCHEN_TICK_S`) instead of two, and the ETA now averages finished shots timed from the first part instead of from the worker's start, so a long planning phase does not inflate it. `kitchen.js`: falling cards now use the still from their shot's position in the cut (`thumbs` passed from `P.duration`) instead of thumbnail N for shot N; a generation token so a late three.js import after stop/finish never builds a second scene and render loop; `fail()` made idempotent (the poller and a failed status both call it) with a sad droop in the loop; `join` drops the last shot's card; the triangle budget trimmed (resting scene 2,670, measured). `app.js`: the `pollCutjob` hand-off (below). Wrote `tests/test_kitchen.py` (17 tests), the README paragraph and row, and this section. |
+
+Muse Code token use: TBD (the owner fills this from the run log).
+
+## Build notes
+
+- **Progress.** `sample_parts(parts_dir, started_at, total)` is pure: fresh `shot_*.mp4` (mtime ≥ `started_at − 2 s`)
+  count, the newest is the one encoding, a fresh `audio_*` or `parts.txt` means every shot is done (`join`), no folder
+  or no fresh shot is `plan`, and a fresh count above the stale `angles.json` total raises the total. The sampler ticks
+  every 0.5 s, merges `phase, done, total, pct, eta_s` under the lock only while `state == "running"`, and is stopped
+  and joined before the worker writes `done` or `failed` (and again in `finally`). `state` and `message` are unchanged.
+- **Hand-off (`pollCutjob`).** Every status goes to `Kitchen.update(st)` before the running return, and the render bar
+  shows the real `shot n of N · pct · time left` when the engine reports it. On `done` the page no longer reloads: it
+  fetches `/api/project`, `applyResult`, sets a cache-busted `video.src`/`poster` (the `demo/video.mp4${VQ}` literal is
+  untouched), refreshes the duration, `renderWords(); lockEdits(); layout()`, waits for `canplay` (4 s cap), then
+  `Kitchen.finish()` plates the cut and leaves the first frame paused. Any error in that chain falls back to the old
+  `location.reload()`. On `failed`, `Kitchen.fail(message)` plus the existing error bar.
+- **Muse unavailable.** The kitchen itself never calls the Meta API, ElevenLabs, xAI or Whisper; it reads only the
+  local engine's status and the job's own thumbnails, so a 402 changes nothing on screen. The re-render it watches
+  re-picks angles with Muse on a tightened job; `angles.pick_with_muse` already falls back to the rule per failed batch
+  (and to the rule outright when `guestlist` is missing), so with the credit gone the kitchen shows "Picking the
+  angles" a little longer and the cut still renders with rule picks. No kitchen code path depends on Muse.
+- **Fallbacks.** Reduced motion, a failed `import()`, or a `WebGLRenderer` that throws (also a render error mid-loop)
+  shows the CSS kitchen: `window.GhostMark(64, "cook")` when ONBOARD's mascot exists, else a ghost glyph, with the
+  same captions and readout and no animation loop.
+- **CPU.** Manual rAF capped at 30 fps, pixel ratio ≤ 1.5, antialias off, low-power context, paused while the page or
+  `#view-edit` is hidden, `ResizeObserver` on `.player`, geometry/materials/renderer disposed on finish, fail and stop.
+- **Accepted gaps.** Thumbnail URLs carry no version for cut jobs, so a heuristic browser cache can show the old
+  timeline thumbs until a reload. The Words list is redrawn but reads the transcript captured at page load
+  (`const T = P.transcript` sits outside the functions this build may edit), so new words appear after a reload.
+  The legacy `showProgress` hook is a no-op unless something started the kitchen (only the cut-job path does); the
+  offload-cut poller is not hooked (stretch, ONBOARD owns that page).
+- **Vendored code.** `app/ui/vendor/three.module.min.js` is three.js 0.170, MIT (`three.LICENSE`), third-party and not
+  hackathon work. The scene, the choreography, the sampler and the hand-off are new.
+
+## Tests
+
+`tests/test_kitchen.py` (17, offline, no socket, no server): `sample_parts` on `os.utime`-dated files (no folder,
+stale leftovers, the 2 s slack, 3 fresh = 2 done, `audio_000.m4a` / `parts.txt` = join, a raised total); the worker
+with `cutjob.rerender` faked (progress fields additive, `done` and `failed` final with no late tick, `plan` has no
+percentage); the page hooks and the `pollCutjob` hand-off; the vendored module (MIT header, no `import`); kitchen.js
+offline/safe (no URLs, no `eval`, no machine paths, reduced motion); and kitchen.js run in a node vm against a stub DOM,
+three ways: with the real vendored three.js and a stand-in `WebGLRenderer` (the scene builds, renders frames, stays at
+2,670 triangles at rest, disposes), without three, and with reduced motion (both the CSS kitchen), checking the
+readouts (`shots 7/23 · 30% · about 4 min left`, plan/join captions, stage and legacy shapes, the `preview ·` prefix,
+failure message, no-ops before start).
+
+Full suite outside the sandbox (`.venv/bin/python -m unittest discover -s tests -p 'test_*.py'`): 811 tests, OK (287 s), no errors or skips-as-failures; before this build the same suite was 794 tests (811 minus the 17 new ones).
+
+## Not verified
+
+- The WebGL visuals, colours, lighting and the plating beat: the sandbox has no GPU, so nobody has looked at the scene.
+- A real re-render end to end in the app (no server, render or browser was started), including the in-place swap
+  and the `canplay` wait.
+- The Web Audio bing and pointer interactions in a browser.
+
+## Live test
+
+Left for the owner's agent: open the Edit tab at `#edit/kitchen` (preview), then run Render on a cut job and watch the
+kitchen hand off to the new cut; record which one the recording shows (WebGL or the CSS fallback) in the README.

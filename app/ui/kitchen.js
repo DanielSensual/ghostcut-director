@@ -72,6 +72,9 @@
   let previewTimers = [];
   let audioCtx = null;
   let finishing = false;
+  let failing = false;
+  let gen = 0; // bumps on every start/stop so a late three.js import never builds a second scene
+  let thumbCount = 0; // demo/thumbs holds one still per 2 s of the cut; shots map onto it by position
   let fallbackEl = null;
   let dragGhost = null;
   let dragMoved = false;
@@ -99,6 +102,12 @@
     el.classList.toggle("kitchen-shimmer", !!shimmer);
   };
   const thumbUrl = (index) => `demo/thumbs/${String(Math.max(1, index)).padStart(4, "0")}.jpg`;
+  // Shot d of N (1-based) -> the still from the middle of its stretch of the cut, when the cut's length is known.
+  const cardThumb = (d) => {
+    const tot = lastTotal || 0;
+    if (!thumbCount || !tot) return Math.max(1, d);
+    return Math.max(1, Math.min(thumbCount, 1 + Math.floor(((Math.max(1, d) - 0.5) / tot) * thumbCount)));
+  };
 
   // ---------- CSS fallback (reduced motion / no WebGL / no vendor) ----------
   function showFallback() {
@@ -249,16 +258,16 @@
     renderer.outputColorSpace = T.SRGBColorSpace;
     shared = {
       geo: {
-        capsule: new T.CapsuleGeometry(0.42, 0.55, 3, 10),
-        hemSphere: new T.SphereGeometry(0.13, 6, 5),
-        eye: new T.SphereGeometry(0.055, 6, 5),
+        capsule: new T.CapsuleGeometry(0.42, 0.55, 3, 8),
+        hemSphere: new T.SphereGeometry(0.13, 6, 4),
+        eye: new T.SphereGeometry(0.055, 5, 3),
         hatBrim: new T.CylinderGeometry(0.46, 0.46, 0.09, 12),
         hatTop: new T.CylinderGeometry(0.34, 0.38, 0.3, 10),
-        hatPuff: new T.SphereGeometry(0.3, 8, 6),
+        hatPuff: new T.SphereGeometry(0.3, 7, 5),
         spoonHandle: new T.CylinderGeometry(0.03, 0.03, 0.7, 5),
         box: new T.BoxGeometry(1, 1, 1),
         card: new T.BoxGeometry(0.92, 0.52, 0.03),
-        bubble: new T.SphereGeometry(0.07, 6, 5),
+        bubble: new T.SphereGeometry(0.07, 6, 4),
         spark: new T.OctahedronGeometry(0.07, 0),
         letter: new T.BoxGeometry(0.18, 0.18, 0.18),
       },
@@ -314,14 +323,14 @@
     potBody.position.y = 0.55; potGroup.add(potBody);
     const potBottom = new T.Mesh(new T.CylinderGeometry(0.8, 0.8, 0.08, 18), shared.mat.pot);
     potBottom.position.y = 0.14; potGroup.add(potBottom);
-    const rimRing = new T.Mesh(new T.TorusGeometry(0.95, 0.07, 6, 20), shared.mat.potRim);
+    const rimRing = new T.Mesh(new T.TorusGeometry(0.95, 0.07, 4, 18), shared.mat.potRim);
     rimRing.rotation.x = Math.PI / 2; rimRing.position.y = 0.98; potGroup.add(rimRing);
     const glowDisc = new T.Mesh(new T.CircleGeometry(0.88, 18), shared.mat.glow);
     glowDisc.rotation.x = -Math.PI / 2; glowDisc.position.y = 0.96; potGroup.add(glowDisc);
     potGroup.position.set(0, 0.1, 0.35);
     scene.add(potGroup);
     // rising bubbles
-    for (let i = 0; i < 10; i++) {
+    for (let i = 0; i < 8; i++) {
       const b = new T.Mesh(shared.geo.bubble, shared.mat.bubble);
       b.userData.seed = Math.random();
       b.position.set((Math.random() - 0.5) * 1.2, 1.05, 0.35 + (Math.random() - 0.5) * 0.8);
@@ -383,9 +392,9 @@
   }
   function splash() {
     if (!scene || !THREE) return;
-    for (let i = 0; i < 6; i++) {
+    for (let i = 0; i < 4; i++) {
       const m = new THREE.Mesh(shared.geo.bubble, shared.mat.bubble);
-      const a = (i / 6) * Math.PI * 2;
+      const a = (i / 4) * Math.PI * 2 + Math.random();
       m.position.set(Math.cos(a) * 0.3, 1.12, 0.35 + Math.sin(a) * 0.3);
       m.userData.vel = new THREE.Vector3(Math.cos(a) * 0.6, 1.1 + Math.random() * 0.5, Math.sin(a) * 0.6);
       m.userData.life = 0.55;
@@ -404,7 +413,7 @@
     scene.add(mesh);
     fallingCards.push({ mesh, vy: 0, index });
     try {
-      new T.TextureLoader().load(thumbUrl(index), (tex) => {
+      new T.TextureLoader().load(thumbUrl(cardThumb(index)), (tex) => {
         try { tex.colorSpace = T.SRGBColorSpace; } catch (e) { /* older */ }
         mat.map = tex; mat.color.set(0xffffff); mat.needsUpdate = true;
       }, undefined, () => { /* plain card fallback stays */ });
@@ -530,7 +539,10 @@
         g.userData.spoon.rotation.y = currentAction === "stir" ? Math.sin(t * 3.2) * 0.55 : Math.sin(t * 1.2) * 0.15;
         g.userData.spoon.rotation.z = currentAction === "stir" ? Math.cos(t * 3.2) * 0.25 : 0;
       }
-      if (currentAction === "peek" && gi > 0) {
+      if (currentAction === "sad") {
+        g.position.y = baseY - 0.18 + Math.sin(t * 1.1 + g.userData.phase) * 0.03;
+        g.rotation.x = 0.35;
+      } else if (currentAction === "peek" && gi > 0) {
         g.position.y = (g.userData.baseY || y) + Math.sin(t * 2.2 + gi) * 0.05 - 0.12;
         g.rotation.x = 0.28;
       } else if (gi > 0) g.rotation.x *= 0.9;
@@ -641,7 +653,7 @@
 
   // ---------- public API ----------
   function update(st) {
-    if (!active || finishing || !st || typeof st !== "object") return;
+    if (!active || finishing || failing || !st || typeof st !== "object") return;
     const prefix = isPreview ? "preview \u00b7 " : "";
     if (st.state === "failed") { fail(st.message || "Re-render failed"); return; }
     // stage-style status (offload cut): choreography by stage
@@ -672,7 +684,10 @@
         setCaption("Joining the plates");
         setReadout(`${prefix}Joining the plates`, true);
         setAction("plate");
-        if (st.total != null) { lastTotal = st.total; lastDone = st.total; }
+        if (st.total != null) {
+          if (lastDone >= 0 && st.total > lastDone) dropMany(lastDone, st.total);
+          lastTotal = st.total; lastDone = st.total;
+        }
         return;
       }
       captionMode = "rotate";
@@ -713,7 +728,12 @@
     const ov = overlay(); if (!ov) return;
     mode = (opts && opts.mode) || "cutjob";
     isPreview = mode === "preview";
-    active = true; finishing = false;
+    thumbCount = Math.max(0, Math.floor(+(opts && opts.thumbs) || 0));
+    if (!thumbCount) {
+      try { const d = +(window.PROJECT && window.PROJECT.duration); if (d > 0) thumbCount = Math.floor(d / 2); } catch (e) { thumbCount = 0; }
+    }
+    active = true; finishing = false; failing = false;
+    const myGen = ++gen;
     lastDone = -1; lastTotal = null; lastPhase = null; dressIndex = -1;
     captionMode = "rotate"; captionIndex = 0; cycleIndex = 0; lastCycleAt = performance.now();
     clockStart = performance.now(); lastFrame = 0; accumulator = 0;
@@ -728,7 +748,7 @@
     hideFallback();
     // lazy three.js: dynamic import keeps Edit's first load untouched
     import("./vendor/three.module.min.js").then((m) => {
-      if (!active || finishing) return;
+      if (!active || finishing || failing || myGen !== gen) return;
       THREE = m;
       try {
         buildScene();
@@ -736,7 +756,7 @@
         clockStart = performance.now();
         raf = requestAnimationFrame(loop);
       } catch (e) { showFallback(); }
-    }).catch(() => { if (active) showFallback(); });
+    }).catch(() => { if (active && myGen === gen) showFallback(); });
   }
   function finish() {
     if (!active || finishing) return Promise.resolve();
@@ -748,7 +768,7 @@
         if (ov) ov.hidden = true;
         disposeScene();
         hideFallback();
-        active = false; finishing = false; mode = null; isPreview = false;
+        active = false; finishing = false; failing = false; mode = null; isPreview = false; gen++;
         try { const v = $id("video"); if (v && v.pause) v.pause(); } catch (e) { /* ignore */ }
         resolve();
       };
@@ -781,20 +801,20 @@
     });
   }
   function fail(msg) {
-    if (!active || finishing) return;
+    if (!active || finishing || failing) return;
+    failing = true;
     clearKitchenTimers();
-    previewTimers.forEach((id) => clearTimeout(id)); previewTimers = [];
     captionMode = "stage";
+    setAction("sad");
     const text = msg ? String(msg) : "Something went wrong in the kitchen";
     setCaption(text);
     setReadout((isPreview ? "preview \u00b7 " : "") + text, false);
-    ghosts.forEach((g) => { g.rotation.x = 0.35; });
-    // sad-ghost beat: hold the message briefly, then restore the poster
+    // sad-ghost beat: hold the message about 2 s, then hide and leave the untouched cut's frame in the player
     previewTimers.push(setTimeout(() => {
       if (!active || finishing) return;
       const ov = overlay(); if (ov) ov.hidden = true;
       disposeScene(); hideFallback();
-      active = false; mode = null; isPreview = false;
+      active = false; failing = false; mode = null; isPreview = false; gen++;
     }, 2000));
   }
   function stop() {
@@ -802,7 +822,7 @@
     clearKitchenTimers();
     const ov = overlay(); if (ov) { ov.hidden = true; ov.classList.remove("kitchen-fading"); }
     disposeScene(); hideFallback();
-    active = false; finishing = false; mode = null; isPreview = false;
+    active = false; finishing = false; failing = false; mode = null; isPreview = false; gen++;
   }
   function preview() {
     if (active) stop();

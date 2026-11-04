@@ -1043,7 +1043,7 @@
       return;
     }
     // KITCHEN: start the ghost kitchen over the player, poster behind it.
-    try { if (window.Kitchen) Kitchen.start({mode:"cutjob"}); } catch { /* kitchen is optional */ }
+    try { if (window.Kitchen) Kitchen.start({ mode: "cutjob", thumbs: Math.floor(P.duration / 2) }); } catch { /* kitchen is optional */ }
     try { video.pause(); } catch { /* ignore */ }
     video.poster = `demo/poster.jpg${VQ}`;
     cutjobRunning = true;
@@ -1061,6 +1061,13 @@
   async function pollCutjob() {
     try {
       const st = await api("/api/cutjob/rerender");
+      // KITCHEN: every status feeds the scene, before the running return; real shot progress drives the bar too.
+      try { if (window.Kitchen) Kitchen.update(st); } catch { /* kitchen is optional */ }
+      if (st.state === "running" && st.pct != null) {
+        $("#renderFill").style.width = `${Math.max(2, Math.min(99, +st.pct))}%`;
+        barText(["Re-rendering cut.mp4", st.total ? `shot ${Math.min(st.total, (st.done || 0) + 1)} of ${st.total}` : "", `${Math.round(st.pct)}%`,
+          st.eta_s > 0 ? `${fmt(st.eta_s)} left` : ""].filter(Boolean).join(" · "));
+      }
       if (st.state === "running") return;
       clearInterval(cutjobTimer);
       cutjobTimer = 0;
@@ -1068,9 +1075,29 @@
       if (st.state === "done") {
         bar.className = "renderbar ok";
         $("#renderFill").style.width = "100%";
-        barText(`${st.message} · loading the new cut…`);
-        setTimeout(() => location.reload(), 1500);
+        // KITCHEN: no reload; swap the fresh project in place, then let the kitchen plate the new cut.
+        try {
+          barText(`${st.message} · plating the new cut…`);
+          const j = await api("/api/project");
+          ({ project: P, edits: EDITS, engine: ENGINE } = j);
+          applyResult(j);
+          const ready = new Promise((res) => { video.addEventListener("canplay", res, { once: true }); setTimeout(res, 4000); });
+          video.poster = `demo/poster.jpg?v=${Date.now()}`;
+          video.src = `demo/video.mp4?v=${Date.now()}`;
+          $("#tcDur").textContent = fmt(P.duration);
+          renderWords(); lockEdits();
+          layout();
+          await ready;
+          if (window.Kitchen) await Kitchen.finish();
+          try { video.currentTime = 0; } catch { /* first frame stays */ }
+          barText(`${st.message} · the new cut is in the player`);
+          barActs(h("button", { title: "Dismiss", onclick: closeBar }, "×"));
+        } catch {
+          barText(`${st.message} · loading the new cut…`);
+          setTimeout(() => location.reload(), 1500);
+        }
       } else {
+        try { if (window.Kitchen) Kitchen.fail(st.message || "Re-render failed"); } catch { /* KITCHEN: optional */ }
         bar.className = "renderbar bad";
         $("#renderFill").style.width = "0";
         barText(st.message || "Re-render failed");
