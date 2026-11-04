@@ -1058,7 +1058,7 @@ error tells the editor to type instead. The Muse path stays primary whenever a w
   log. `index.html` was not edited (its lines were pre-applied in `5407a3a`).
 - Not done (stretch): real card thumbnails, cheaper `offload_shoot`, recent-jobs list, per-card transfer breakdown,
   mascot moods reacting to events, Reset tour.
-- Not verified: the page and tour were not opened in a browser or the Mac window (no servers on this machine during the
+- Not verified at build completion (see the later live test): the page and tour were not opened in a browser or the Mac window (no servers on this machine during the
   build), so layout, glass/backdrop rendering and motion are unchecked; no live ElevenLabs or Meta call (the 402 path is
   tested with a mocked client raising); the background `director cut` itself was not run, and its own Muse stages'
   behaviour on a 402 is outside this brief.
@@ -1141,7 +1141,9 @@ kitchen first, and resets the ghosts' action). Checked and sound: the vendored m
 served as `text/javascript`, the 30 fps accumulator, the hidden-tab/hidden-view pause, the reduced-motion fallback,
 the sampler stop/join ordering, and no Meta/ElevenLabs/xAI/Whisper call anywhere in the kitchen. Full suite: 811 OK.
 
-## Not verified
+## Not verified at build completion
+
+This records the build-time scope; the later live-test section supersedes the items it explicitly checks.
 
 - The WebGL visuals, colours, lighting and the plating beat: the sandbox has no GPU, so nobody has looked at the scene.
 - A real re-render end to end in the app (no server, render or browser was started), including the in-place swap
@@ -1228,7 +1230,9 @@ feature has an offline path that stands on its own:
   `cut.mp4` byte-identical).
 - Full suite (outside the Muse sandbox, run once at the end): 834 tests, OK (794 on the tree before this build plus the 40 new ones; no `ps`/socket errors outside the sandbox).
 
-## Not verified
+## Not verified at build completion
+
+This records the build-time scope; the later live-test section supersedes the items it explicitly checks.
 
 - Nothing was rendered from the real job and no frame of a dressed cut was looked at: the pill's centring on the text
   (`\an5` with the drawing from `m 0 …`), the ghost's place beside the pill, caption collisions at the top corners and the
@@ -1271,3 +1275,12 @@ two cards with the ghost, a music bed and the bing) and looked at two frames. Fi
 - `plan` fell back to the built-in planner only on `DressUnavailable`; any error from the Muse path now falls back.
 - A plan made only from typed notes had no bing asset; render now synthesises the offline bing.
 - The panel opened mid-render now swaps to the dressed video when the render finishes.
+
+
+# Build log: DELIVER — real job outputs and measured loudness (2026-11-04)
+
+Built by Claude Code with the owner in `9def8b9` (commit author DanielSensual, with a Claude Opus 5.5 co-author trailer).
+`app/engine.py` lists existing job deliverables and reveals allow-listed names in Finder; `app/cutjob.py` carries
+QC's measured loudness into the project; `app/ui/app.js` shows those files, sizes and measurements instead of the
+prototype export controls for cut jobs. `tests/test_deliver.py` covers the real file list, no-job state and reveal allow-list.
+The current release still needs an independent check before promising that every malformed QC object opens successfully.

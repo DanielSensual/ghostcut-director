@@ -109,6 +109,7 @@ From [docs/muse-code/BUILD-LOG.md](docs/muse-code/BUILD-LOG.md) and the git log,
 | Voice notes without Muse (offline resolver, Whisper fall-through on a 402) | Built by Claude Code (Opus) after the Meta API credit ran out on submission day; see BUILD-LOG.md, "VOICE-OFFLINE" |
 | Ghost kitchen render screen (interactive, offline) | Muse Code (partial) + Claude Code: started by Muse Code on muse-wonder-1.0 from `KITCHEN-BRIEF.md`, after my review of the app on submission day (`5e5aef2`, cut off mid-build when the Meta API credit ran out); finished, fixed and tested by Claude Code. three.js 0.170 (MIT) is vendored third-party code |
 | The Director app, Render, and the test-run scripts in `scripts/` | Built by Claude Code with me (imported into this repository) |
+| Deliver: existing job files, Finder reveal and measured QC loudness | Built by Claude Code with me (`9def8b9`); `app/engine.py`, `app/cutjob.py`, `app/ui/app.js`, `tests/test_deliver.py` |
 | The briefs in `docs/muse-code/` | Me, with Claude Code |
 | Dress the cut: title cards, ElevenLabs music and SFX, ghost pop-up (`director dress`) | Muse Code (partial) + Claude Code: Muse Code on muse-wonder-1.0 built the core from `DRESS-BRIEF.md` (after my review of the app on submission day) and was cut off when its Meta API credit ran out; Claude Code finished, fixed and tested it, and added the built-in card planner used when Muse is unavailable. Music and SFX generated with ElevenLabs during the event; the ghost sprite is the owner's own brand art |
 
