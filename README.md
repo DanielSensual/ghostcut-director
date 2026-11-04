@@ -27,7 +27,7 @@ Most of this repository is work that Meta's Muse Code designed and built during 
 
 What Muse Code cost, at list rates with cached input at the cached rate where the log says so: sync about $5.19 in total ($2.11 design + $2.07 build + $0.67 scoring fix + $0.34 drift fix; BUILD-LOG.md, "`director sync` (2026-11-02)"), reframe about $2.34 ($1.46 + $0.88; BUILD-LOG.md, "`director reframe` (2026-11-02)"), angles at most about $6.20 and grade at most about $9.60, both counted with no cache discount (BUILD-LOG.md, "`ghostcut angles` (2026-11-01)" and "`ghostcut grade` (2026-11-01)"). The lip-reading sync method took 65 calls and 9.07M input tokens (8.84M cached) on `muse-spark-1.3` (BUILD-LOG.md, "Lips method").
 
-The Meta calls go through the optional `guestlist` package: `pip install -e ".[muse]"`, key from the `MODEL_API_KEY` environment variable only. Everything else runs without it.
+The Meta calls go through the optional `guestlist` package: `pip install -e ".[muse]"`, configure its key with `MODEL_API_KEY`. The separately installed client also supports a saved machine key, so unsetting that variable alone does not disable model calls. Use `--no-muse --no-sam` for an offline cut.
 
 ## What it does
 
@@ -47,9 +47,9 @@ Re-running the same command resumes: stages whose inputs did not change are skip
 - **Grade** — a per-camera `.cube` from the published S-Log3 and HLG curves, then exposure, white balance and contrast matched on skin inside the face box (whole-frame match with a warning when no face is found); cameras Director cannot read take a supplied LUT, e.g. `--lut 'DJI_*=dlog.cube'`; `--grade-reference 'DJI_*'` picks the camera to match to.
 - **Angle per line** — the gaze rule first (the camera the speaker addresses, from Apple Vision yaw sampled about every 0.5 s — the helper's continuous landmark yaw when it reports one, the coarse yaw otherwise — wins the line, and a held turn of address inside a line cuts to the addressed camera on the nearest word gap), then Muse Spark from one frame per covering camera; mechanical checks overrule and are recorded in `angles.json`, each shot with one reason; shot-by-shot render under the production audio gives `cut.mp4`; `--push-in 3` to `6` adds a slow push-in on every shot.
 - **Finishing** — the cut's voice cleaned locally (mic-air de-plosive on by default, `--no-deplosive` to skip; ElevenLabs isolation with `--finish-isolate` when connected), optional ElevenLabs sound design placed by Muse Spark with `--finish-sound`, ducked under the voice, mastered two-pass to −14 LUFS / −1 dBTP (`--finish-loudness -16` for the quieter target); `--no-finish` skips the stage.
-- **Captions and title** — karaoke captions burned into `vertical.mp4` (house style by default, `--captions-preset bold` for caps promos; `--captions-horizontal` also burns `cut.mp4`), `captions.srt`/`captions.ass` written beside them, un-captioned files kept as `*.clean.mp4`, and a serif title hook over the first 3.5 s (`--title "…"` or `--title auto` for one checked Muse Spark proposal); `--no-captions` skips the stage.
 - **Timelines** — the same shots as `timeline.fcpxml` for Final Cut Pro and `timeline.otio.json` for OTIO/Resolve tools, referencing the camera originals (`--no-export` skips). Two notes: the timelines open showing log/HLG picture — apply the per-camera `.cube` files from the job folder (`cut.json` says which cube belongs to which camera) — and each timeline clip carries its own camera's audio, so I re-lay the production audio at the offset in `angles.json`/`cut.json` (`audio.offset_s`); the rendered `cut.mp4`/`vertical.mp4` already have it laid correctly.
 - **Vertical** — SAM 3.1 follows the speaker per shot for the 9:16 `vertical.mp4`, with a smoothed crop path in `reframe.json` (`--no-vertical` skips; `--no-sam` centres every shot).
+- **Captions and title** — karaoke captions burned into `vertical.mp4` (house style by default, `--captions-preset bold` for caps promos; `--captions-horizontal` also burns `cut.mp4`), `captions.srt`/`captions.ass` written beside them, un-captioned files kept as `*.clean.mp4`, and a serif title hook over the first 3.5 s (`--title "…"` or `--title auto` for one checked Muse Spark proposal); `--no-captions` skips the stage.
 - **Whole-cut QC** — mechanical checks (durations, black share, loudness, size) plus one Muse Spark pass over a proxy of the finished cut; findings land in `cut.json` (`--no-qc` skips).
 
 The same stages run by hand, one command at a time — see the commands reference below.
@@ -75,7 +75,7 @@ These numbers are copied from the live-test sections of [docs/muse-code/BUILD-LO
 
 ## Built during the hackathon
 
-[GhostCut](https://github.com/DanielSensual/ghostcut) existed before the event. It is a pinned dependency here — the commit from before the event plus its in-event export fixes (`be52bc8`, see `pyproject.toml`) — and I did not build it for this entry. Everything in this repository was built during the Meta Global AI Developer Hackathon, Oct 26 – Nov 4, 2026: the `director` command line, the Mac app in `app/`, the tests, the briefs and designs in `docs/muse-code/`, and this README.
+[GhostCut](https://github.com/DanielSensual/ghostcut) existed before the event. It is a pinned dependency here — the commit from before the event plus its in-event export fixes (`be52bc8`, see `pyproject.toml`) — and I did not build it for this entry. The Director application code was built during the Meta Global AI Developer Hackathon, Oct 26 – Nov 4, 2026: the `director` command line, the Mac app in `app/`, the tests, the briefs and designs in `docs/muse-code/`, and this README. The public history starts on Nov 2 with an import of earlier in-event work. Vendored three.js and Poppins are third-party dependencies under their own licences; the owner’s brand artwork is separately licensed in `docs/brand/NOTICE.md`.
 
 Sync and reframe were also built earlier in the event by Claude Code, inside GhostCut, where they are still public. The versions in this repository are Muse Code's rewrites: it received only the briefs, never that code, and its run logs show no reads outside this repository and its installed packages. Both rewrites were checked against the same real recordings (BUILD-LOG.md, "Live test" under "`director sync`" and "`director reframe`").
 
@@ -125,7 +125,7 @@ A finished `director cut` job opens directly: beats become sections, shots becom
 
 I can also talk back to a cut. In the app I hold the mic button (or hold `V`) and say "use the other take here" or "tighten every pause"; from the command line, `director voice memo.m4a --job job1` does the same with a memo file (add `--apply`, then `--render` to re-render). Notes are anchored by playhead time, a spoken timecode, quoted words, or the opening/closing beat ("at the very start", "at the end"), and resolved into checked edit proposals — the same checks, the same apply path, the same render. A note can cut a phrase inside a kept span ("cut both places where I mention B-roll"); "both"/"all"/"every" takes every match, one ambiguous mention still asks. Standing preferences ("always open on the wide") persist per job in `taste.json` and are read on the next pick or note. The Mac window cannot reach the microphone, so recording there shows a banner pointing at the same page in a browser, where recording works.
 
-While a cut job re-renders, the player turns into the ghost kitchen: an interactive 3D scene (WebGL through the vendored three.js when the machine has it) where a chef ghost and two or three helpers cook the cut. Every shot ffmpeg finishes drops a film card with that part of the cut's thumbnail into the pot, and the readout under it is the engine's real progress (`shots 7/23 · 31% · about 4 min left`, read from the render's parts folder), with "Picking the angles" and "Joining the plates" before and after the shots. Click a ghost and it giggles, drag it along the counter, double-click it to dance. When the render is done the new cut is swapped in without reloading the page and the kitchen plates it into the player. It makes no network or Meta API calls, so it works the same with Muse unavailable; with reduced motion, or without WebGL or the `vendor/` folder, it falls back to a CSS kitchen with the same captions and readout. Open the Edit tab at `#edit/kitchen` for a 25-second preview on a simulated status stream; its readout is marked "preview ·". The recording shows: TBD from the owner's check (WebGL or the CSS fallback). three.js 0.170 is third-party MIT code (`app/ui/vendor/three.LICENSE`); the scene, the choreography, the progress sampler and the hand-off are new.
+While a cut job re-renders, the player turns into the ghost kitchen: an interactive 3D scene (WebGL through the vendored three.js when the machine has it) where a chef ghost and two or three helpers cook the cut. Every shot ffmpeg finishes drops a film card with that part of the cut's thumbnail into the pot, and the readout under it is the engine's real progress (`shots 7/23 · 31% · about 4 min left`, read from the render's parts folder), with "Picking the angles" and "Joining the plates" before and after the shots. Click a ghost and it giggles, drag it along the counter, double-click it to dance. When the render is done the new cut is swapped in without reloading the page and the kitchen plates it into the player. It makes no network or Meta API calls, so it works the same with Muse unavailable; with reduced motion, or without WebGL or the `vendor/` folder, it falls back to a CSS kitchen with the same captions and readout. Open the Edit tab at `#edit/kitchen` for a 25-second preview on a simulated status stream; its readout is marked "preview ·". The live check recorded in BUILD-LOG.md used the WebGL scene and verified the preview and dressed-cut hand-off. three.js 0.170 is third-party MIT code (`app/ui/vendor/three.LICENSE`); the scene, the choreography, the progress sampler and the hand-off are new.
 
 ## Import with Ghost
 
@@ -143,6 +143,18 @@ director cut "/path/to/drive/2026-11-04 Launch Talk" --out-dir launch-job
 ```
 
 Cards land in `<destination>/<YYYY-MM-DD> <project or "Shoot">/<camera label>/` with original file names and sidecars (Sony `M01.XML`, subtitle files) beside their clips; files already there with the same size and checksum are skipped, and the plan refuses with the numbers when the destination lacks the space.
+
+## Dress the finished cut
+
+Dress adds checked title cards, an optional ElevenLabs music bed ducked under the voice, and ghost pop-ups with sound. It reads the finished cut and writes `cut.dressed.mp4`; `cut.mp4` stays unchanged. The app’s ✦ Dress panel plans, reviews and renders the same result, and accepts notes such as “add a card that says … where I say …” or “no music”. The recorded real-footage render took about 50 seconds for a 130-second cut (BUILD-LOG.md, “DRESS”).
+
+```bash
+director dress plan --job job1 --no-muse --max-provider-usd 0
+director dress show --job job1
+director dress render --job job1
+```
+
+`--no-muse` selects the built-in card planner. It does not disable ElevenLabs generation by itself: `--max-provider-usd 0` prevents new paid audio generation; already cached assets can still be reused. Render uses cached assets only and makes no provider calls. `--ai-video` is declared but not implemented.
 
 ## Commands reference
 
@@ -162,6 +174,7 @@ Every `director` subcommand, from `src/director/cli.py`. File names below are pl
 | `director captions` | Burn karaoke captions and a title hook into a finished job's videos | `--job job1`, `--title "…"` or `--title auto`, `--no-title`, `--preset bold`, `--captions-horizontal` |
 | `director voice NOTE` | Turn a voice memo into checked edit proposals against a job or a hand-run pipeline | `--job job1`, `--apply`, `--render` (with `--job`), `--sync/--words/--angles/--tighten` (hand-run), `--yes`, `--max-usd 2.00` |
 | `director connect list\|add\|test\|remove` | Show, save, test, or delete outside-service keys (ElevenLabs, Higgsfield) | `director connect list`, `director connect add elevenlabs`, `director connect test`, `director connect remove elevenlabs` |
+| `director dress plan\|show\|render` | Plan checked title cards and optional sound, inspect the plan, or render `cut.dressed.mp4` | `--job job1`, `--no-muse` (plan), `--max-provider-usd 0` (plan: no new paid audio), `--model MODEL` (plan) |
 | `director offload [CARD…]` | Copy camera cards to the destination drive with checksum verification; writes `offload.json` | `--to DEST`, `--project NAME`, `--yes` |
 
 Running the stages by hand uses the same files `director cut` writes. For example:
@@ -193,6 +206,8 @@ The app's Connections panel (top bar) is the same registry. Generated audio is b
 
 ## Honest limitations
 
+- **Submission-day Meta outage.** The event’s Meta credit ran out on Nov 4 and calls returned HTTP 402. Import intent and Dress cards use built-in planners; voice notes fall through to local Whisper and checked rules. Angle picks can use local gaze rules, QC reports that its Muse watch is unavailable, and `--no-sam` centres the vertical crop. Typed Edit chat still needs Muse. These fallbacks do not provide all of the model-backed behaviour described above. Import’s Make the cut flow has not been verified end to end during the outage.
+
 - **macOS-only pieces.** Lip-reading sync and the gaze rule use Apple Vision through a shipped Swift helper (`src/director/lips_helper.swift`, built with `swiftc` on first use). Without `swiftc` or Vision they skip with a warning and the other sync methods still run. Local Whisper is `mlx_whisper`, so clip transcription on other platforms needs `--transcripts` or supplied `--words`. The rest of the pipeline runs on Linux — CI runs the test suite and `director demo` on Ubuntu.
 - **The timelines carry the angles, not the recorder.** The FCPXML/OTIO export carries every camera angle as a clip, but GhostCut's pre-event exporter has no audio-only lane, so a separate audio recorder does not appear as its own track. I re-lay the production audio in the editor at the offset recorded in `angles.json`/`cut.json`; the rendered `cut.mp4` and `vertical.mp4` are unaffected.
 - **The push-in render is slow.** `--push-in` renders each shot through a 4× upscale so the zoom does not stair-step, which costs real time on long cuts. It is off by default.
@@ -213,4 +228,4 @@ Tests self-skip when their prerequisites (numpy, Pillow, ffmpeg, the macOS card 
 
 ## Licence
 
-MIT (see [LICENSE](LICENSE)).
+Application code: MIT (see [LICENSE](LICENSE)). Vendored three.js retains its MIT notice, Poppins uses the SIL Open Font License in `assets/fonts/OFL.txt`, and the brand artwork is excluded from MIT under `docs/brand/NOTICE.md`.
