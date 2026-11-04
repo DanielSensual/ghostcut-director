@@ -955,3 +955,39 @@ it up here.", 8 samples per camera) give continuous yaw C ≈ 10–14° and B �
 reverse; the held-turn segments are C 160.62–162.51 and B 162.51–164.40, and the shot list opens C 0.00–3.69 ("My mic,
 my drone has no microphone") then B — the cut the owner asked for. Every shot carries one reason. Full suite outside
 the sandbox: 771 tests, OK.
+
+## VOICE-OFFLINE (2026-11-04, Claude Code)
+
+Built by Claude Code (Opus) after the Muse credit ran out: from the afternoon of submission day the Meta Model API
+answered every call (Muse Spark, Muse Voice Transcribe) with HTTP 402 `billing_not_configured`. Voice notes ("hold
+to talk" in the Edit tab, `director voice`) now keep working end to end without Muse. Muse stays the primary path;
+nothing below runs while it answers.
+
+- **Hearing.** `transcribe_wav` already fell through to local `mlx_whisper` on any Meta failure; a 402 comes back at
+  once and the transcribe call has no retries. It now also says why, in the payload's `warnings`: "Muse unavailable
+  (402), heard with local Whisper" (`muse_unavailable_reason` maps 402/billing, 401/403/429/5xx, connection errors,
+  a missing key, the spend hard stop and a missing guestlist to a short reason).
+- **Understanding.** When the one Spark call in `resolve_notes` fails for one of those reasons, or guestlist is not
+  installed, `resolve_offline` reads the notes with rules (`offline_reply_notes`) that emit reply notes in exactly
+  the `RESOLVE_SCHEMA` shape, so `_assemble_entries` → `verify_resolved` still do the real work (quoted-phrase
+  ranges, "both/all/every", cut-edge and camera anchors, every cutlist check). Covered: "cut where I say …",
+  "cut the part where I say …", "cut both places / every mention of …", "remove …", typed quotes (`cut "…"`),
+  "at the very start / at the end use the drone / the Sony / camera B", "use camera B here" (playhead),
+  "tighten the pauses", "always/never …" (preference), and a note that does several of these at once. Camera names
+  come from the clip files (DJI_ → drone, C0001 → Sony, IMG_ → iPhone) as well as labels; the B in "B-roll" is never
+  camera B. A misheard edge in a quote falls back to the longest run of its words that is in the cut. Anything
+  else comes back unresolved with "I couldn't understand that note without Muse; try: cut where I say …" — never an
+  exception. Each offline note says "Resolved offline by rules (Muse unavailable: 402)"; spend is $0. Any other Spark
+  failure (a bad reply) still raises as before. `resolve_typed` runs a typed note through the same rules.
+- **Frame check.** `confirm_visual_notes` skips its Spark vision call on a billing/network failure (or when the notes
+  were resolved offline): the angle change is kept with a soft "Frame check skipped (Muse unavailable: 402)" check
+  and one warning, instead of being downgraded to a note.
+- **App.** `Engine._store_voice` returns the warnings, appends the "Muse unavailable" lines to the card's reply, and
+  names the model "offline rules (Muse unavailable)" when the rules resolved the note; Ghost's voice request
+  (`offload_voice`) carries the Whisper warning too. `app/ui` is unchanged.
+- **Not covered offline:** "use the other take" (swap_take), "make it under three minutes", and the typed chat box in
+  the Edit tab (`/api/muse`), which is a separate Spark call on the B-roll/card project and still needs Muse.
+- Tests: `tests/test_voice_offline.py`, 27 new, offline (the guestlist stand-ins from `test_voice` raise the 402;
+  Whisper is stubbed): every phrasing above on a fixture shaped like the hackathon job, the 402 fall-through in
+  `transcribe_wav` (one Meta call, no retries) and `resolve_notes`, Muse still primary when it answers, other failures
+  still raising, the skipped frame check, `run()` end to end with both calls returning 402, and the app's card text.
