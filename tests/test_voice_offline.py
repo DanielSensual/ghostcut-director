@@ -424,7 +424,8 @@ class RunOfflineTests(OfflineFixture):
             sys.path.insert(0, str(APP))
         import engine  # noqa: E402
 
-        fake = SimpleNamespace(proposals={}, gen=1, _tighten_sha=lambda: "")
+        fake = SimpleNamespace(proposals={}, gen=1, _tighten_sha=lambda: "",
+                               _dress_notes=lambda notes: notes)
         payload = {"engine": "whisper", "resolver": "rules",
                    "spend_usd": 0.0, "notes": [{"id": "n1", "ops": []}],
                    "warnings": [

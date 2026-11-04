@@ -107,7 +107,6 @@ From [docs/muse-code/BUILD-LOG.md](docs/muse-code/BUILD-LOG.md) and the git log,
 | First-run tutorial, Import page and Ghost mascot (`import.js`, `onboard.js`, `ghost/mascot.js`) | Muse Code (partial) + Claude Code: started by Muse Code on muse-wonder-1.0 from `ONBOARD-BRIEF.md`, after my review of the app on submission day; Muse's Meta API credit ran out mid-build and Claude Code (Opus) finished and tested it. The mascot SVG is new; the brand icon is my own ChatGPT-made art, not Muse's |
 | Card offload (`director offload`, Ghost on the Import tab) | Built by Muse Code on muse-wonder-1.0 from OFFLOAD-BRIEF.md, after the owner's review of the app on submission day |
 | Voice notes without Muse (offline resolver, Whisper fall-through on a 402) | Built by Claude Code (Opus) after the Meta API credit ran out on submission day; see BUILD-LOG.md, "VOICE-OFFLINE" |
-
 | Ghost kitchen render screen (interactive, offline) | Muse Code (partial) + Claude Code: started by Muse Code on muse-wonder-1.0 from `KITCHEN-BRIEF.md`, after my review of the app on submission day (`5e5aef2`, cut off mid-build when the Meta API credit ran out); finished, fixed and tested by Claude Code. three.js 0.170 (MIT) is vendored third-party code |
 | The Director app, Render, and the test-run scripts in `scripts/` | Built by Claude Code with me (imported into this repository) |
 | The briefs in `docs/muse-code/` | Me, with Claude Code |
