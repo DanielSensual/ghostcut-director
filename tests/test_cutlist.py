@@ -402,5 +402,174 @@ class OperationTests(unittest.TestCase):
                            "reason": "editor: angle override"}])
 
 
+class DropWordsTests(unittest.TestCase):
+    """VOICEFIX: a phrase-level cut inside a kept span, and its restore."""
+
+    def _broll(self) -> tuple[list[TimedWord], dict]:
+        # Beat 0 keeps "It can also add B-roll, roll, captions too."
+        # (one span); beat 1 keeps "Next beat." The dropped middle
+        # mirrors the real "It can also add B-roll, roll," cut.
+        words = [_w("It", 10.0, 10.3), _w("can", 10.4, 10.6),
+                 _w("also", 10.7, 11.0), _w("add", 11.1, 11.4),
+                 _w("B-roll,", 11.5, 11.9), _w("roll,", 12.0, 12.3),
+                 _w("captions", 12.5, 12.9), _w("too.", 13.0, 13.3),
+                 _w("Next", 20.0, 20.3), _w("beat.", 20.4, 20.7)]
+        payload = _payload(
+            [_beat(0, "what it does",
+                   [_att(0, [0], 10.0, 13.3, "It can also add B-roll.")]),
+             _beat(1, "next",
+                   [_att(0, [1], 20.0, 20.7, "Next beat.")])],
+            [_utt(0, 10.0, 13.3, "It can also add B-roll.", 0, 8),
+             _utt(1, 20.0, 20.7, "Next beat.", 8, 10)])
+        cutlist.recompute_spans(payload, words, pause_limit_s=3.0)
+        self.assertEqual(len(payload["kept_spans"]), 2)
+        return words, payload
+
+    def test_drop_words_splits_span_with_midpoint_edges(self) -> None:
+        words, payload = self._broll()
+        before_out = payload["duration_out_s"]
+        payload, checked = cutlist.apply_operations(
+            payload, words,
+            [{"op": "drop_words", "word_start": 3, "word_end": 6,
+              "why": "cut the B-roll mention"}],
+            source="voice")
+        self.assertFalse(checked[0]["blocked"])
+        kept = [s for s in payload["kept_spans"] if s["beat_id"] == 0]
+        self.assertEqual(len(kept), 2)
+        # Edges sit mid-gap, capped at EDGE_SILENCE_MAX_S of silence.
+        self.assertAlmostEqual(kept[0]["end_s"], (11.0 + 11.1) / 2)
+        self.assertAlmostEqual(kept[1]["start_s"], (12.3 + 12.5) / 2)
+        # No kept piece contains any dropped word's [start, end].
+        for span in kept:
+            for word in (words[3], words[4], words[5]):
+                overlap = (min(span["end_s"], word.end_s)
+                           - max(span["start_s"], word.start_s))
+                self.assertLessEqual(overlap, 0.0)
+        dropped = [s for s in payload["removed_spans"]
+                   if s["kind"] == "editor_drop"]
+        self.assertEqual(len(dropped), 1)
+        self.assertEqual((dropped[0]["beat_id"], dropped[0]["attempt_id"]),
+                         (0, 0))
+        self.assertEqual(dropped[0]["utterance_ids"], [0])
+        # Kept + removed still tile exactly; the cut got shorter.
+        tiled = sorted(payload["kept_spans"] + payload["removed_spans"],
+                       key=lambda s: s["start_s"])
+        for prev, span in zip(tiled, tiled[1:]):
+            self.assertAlmostEqual(span["start_s"], prev["end_s"])
+        self.assertLess(payload["duration_out_s"], before_out)
+        self.assertEqual(len(payload["edits_applied"]), 1)
+        self.assertEqual(payload["edits_applied"][0]["op"], "drop_words")
+
+    def test_drop_then_restore_round_trip(self) -> None:
+        words, payload = self._broll()
+        before = [(s["start_s"], s["end_s"]) for s in payload["kept_spans"]]
+        payload, checked = cutlist.apply_operations(
+            payload, words,
+            [{"op": "drop_words", "word_start": 3, "word_end": 6}],
+            source="voice")
+        self.assertFalse(checked[0]["blocked"])
+        self.assertEqual(len(payload["kept_spans"]), 3)
+        payload, checked = cutlist.apply_operations(
+            payload, words,
+            [{"op": "restore_words", "word_start": 3, "word_end": 6}],
+            source="voice")
+        self.assertFalse(checked[0]["blocked"])
+        after = [(s["start_s"], s["end_s"]) for s in payload["kept_spans"]]
+        self.assertEqual(after, before)
+        self.assertEqual(payload["word_exclusions"], [])
+        self.assertEqual(len(payload["edits_applied"]), 2)
+
+    def test_drop_words_at_span_edge_leaves_one_piece(self) -> None:
+        words, payload = self._broll()
+        payload, checked = cutlist.apply_operations(
+            payload, words,
+            [{"op": "drop_words", "word_start": 0, "word_end": 3}],
+            source="voice")
+        self.assertFalse(checked[0]["blocked"])
+        kept = [s for s in payload["kept_spans"] if s["beat_id"] == 0]
+        self.assertEqual(len(kept), 1)
+        self.assertAlmostEqual(kept[0]["start_s"], (11.0 + 11.1) / 2)
+
+    def test_drop_words_checks_block(self) -> None:
+        words, payload = self._broll()
+        ops = [
+            {"op": "drop_words", "word_start": 3.5, "word_end": 6},
+            {"op": "drop_words", "word_start": 6, "word_end": 3},
+            {"op": "drop_words", "word_start": 0, "word_end": 99},
+            {"op": "drop_words", "word_start": 7, "word_end": 9},
+            {"op": "drop_words", "word_start": 0, "word_end": 8},
+            {"op": "restore_words", "word_start": 3, "word_end": 6},
+        ]
+        _payload2, checked = cutlist.apply_operations(
+            copy.deepcopy(payload), words, ops, source="voice")
+        self.assertEqual(len(checked), 6)
+        self.assertTrue(all(op["blocked"] for op in checked))
+        texts = [op["checks"][-1]["text"] for op in checked]
+        self.assertIn("cuts inside a word", texts[0])
+        self.assertEqual(texts[1], "Bad word range 6–3")
+        self.assertIn("past the last word", texts[2])
+        self.assertEqual(texts[3],
+                         "Words 7–9 are not all in one kept span")
+        self.assertEqual(texts[4], "That is the whole of beat B0 — "
+                                   "drop the beat instead")
+        self.assertEqual(texts[5], "No dropped words 3–6 to restore")
+
+    def test_drop_words_blocks_a_sub_minimum_piece(self) -> None:
+        words = [_w("ah", 10.0, 10.1), _w("cut", 10.3, 10.4),
+                 _w("this.", 20.0, 20.4)]
+        payload = _payload(
+            [_beat(0, "short",
+                   [_att(0, [0], 10.0, 20.4, "ah cut this.")])],
+            [_utt(0, 10.0, 20.4, "ah cut this.", 0, 3)])
+        cutlist.recompute_spans(payload, words, pause_limit_s=3.0)
+        _payload2, checked = cutlist.apply_operations(
+            payload, words,
+            [{"op": "drop_words", "word_start": 1, "word_end": 2}],
+            source="voice")
+        self.assertTrue(checked[0]["blocked"])
+        self.assertIn("under the 0.35s minimum",
+                      checked[0]["checks"][-1]["text"])
+        # Nothing applied: no exclusion, no audit entry.
+        self.assertEqual(payload.get("word_exclusions", []), [])
+        self.assertEqual(payload["edits_applied"], [])
+
+    def test_drop_words_duplicate_is_a_noop_and_overlap_blocks(self) -> None:
+        words, payload = self._broll()
+        payload, checked = cutlist.apply_operations(
+            payload, words,
+            [{"op": "drop_words", "word_start": 3, "word_end": 6}],
+            source="voice")
+        self.assertFalse(checked[0]["blocked"])
+        payload, checked = cutlist.apply_operations(
+            payload, words,
+            [{"op": "drop_words", "word_start": 3, "word_end": 6},
+             {"op": "drop_words", "word_start": 5, "word_end": 7}],
+            source="voice")
+        self.assertFalse(checked[0]["blocked"])
+        self.assertEqual(checked[0]["checks"][-1]["text"],
+                         "Words 3–6 are already dropped")
+        self.assertTrue(checked[1]["blocked"])
+        self.assertIn("overlap the earlier drop",
+                      checked[1]["checks"][-1]["text"])
+        self.assertEqual(len(payload["word_exclusions"]), 1)
+
+    def test_word_exclusions_survive_a_take_swap(self) -> None:
+        # Word-keyed drops outlive span renumbering: swap the take away
+        # and back and the drop is still there.
+        words, payload = self._broll()
+        payload, checked = cutlist.apply_operations(
+            payload, words,
+            [{"op": "drop_words", "word_start": 3, "word_end": 6}],
+            source="voice")
+        self.assertFalse(checked[0]["blocked"])
+        self.assertEqual(len(payload["kept_spans"]), 3)
+        payload["beats"][0]["status"] = "dropped_editor"
+        cutlist.recompute_spans(payload, words, pause_limit_s=3.0)
+        payload["beats"][0]["status"] = "kept"
+        cutlist.recompute_spans(payload, words, pause_limit_s=3.0)
+        self.assertEqual(len(payload["kept_spans"]), 3)
+        self.assertEqual(len(payload["word_exclusions"]), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

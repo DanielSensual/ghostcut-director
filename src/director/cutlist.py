@@ -45,8 +45,8 @@ REASON_KINDS = ("alternate", "flub", "restart", "crew_talk", "aside",
                 "editor_drop", "too_short", "unclassified")
 
 OPERATIONS = ("swap_take", "drop_beat", "restore_beat", "drop_span",
-              "restore_span", "set_angle", "clear_angle", "set_pause_limit",
-              "add_note")
+              "restore_span", "drop_words", "restore_words", "set_angle",
+              "clear_angle", "set_pause_limit", "add_note")
 
 _NO_BEAT = "No beat B{bid} in this cut"
 
@@ -124,7 +124,7 @@ def load_tighten(path: Path) -> dict:
                 confidence = 0.0
             attempt["confidence"] = min(1.0, max(0.0, confidence))
     for key in ("angle_overrides", "edits_applied", "span_exclusions",
-                "editor_notes", "warnings"):
+                "word_exclusions", "editor_notes", "warnings"):
         if not isinstance(data.get(key), list):
             data[key] = []
     return data
@@ -219,6 +219,25 @@ def recompute_spans(payload: dict, words: Sequence[WordLike], *,
             for uid in attempt.get("utterance_ids", []) or []:
                 utt_to_attempt[int(uid)] = (beat, index)
 
+    # Word exclusions (drop_words): word-index ranges, stable across
+    # re-picks, unlike span ids. Words listed here never enter a kept
+    # run; the gap they leave behind classifies as editor_drop.
+    word_exclusions: list[tuple[int, int, str]] = []
+    for entry in payload.get("word_exclusions", []) or []:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            start = int(entry.get("word_start", -1))
+            end = int(entry.get("word_end", -1))
+        except (TypeError, ValueError):
+            continue
+        if 0 <= start < end:
+            word_exclusions.append(
+                (start, end, str(entry.get("reason", "dropped by editor"))))
+    excluded_words: set[int] = set()
+    for start, end, _reason in word_exclusions:
+        excluded_words.update(range(start, end))
+
     kept: list[dict] = []
     middles: dict[tuple[float, float], tuple[str, str, int, int,
                                              list[int]]] = {}
@@ -247,17 +266,42 @@ def recompute_spans(payload: dict, words: Sequence[WordLike], *,
                 continue
             indices.extend(range(start, end))
         indices = sorted({i for i in indices
-                          if 0 <= i < len(words) and _is_anchor(i)})
+                          if 0 <= i < len(words) and _is_anchor(i)
+                          and i not in excluded_words})
         if not indices:
             continue
-        # Split the pick's kept words into runs at trimmed pauses and at
-        # excluded (unclassified) utterances. Anchor gaps only: Muse-only
-        # words between two anchors ride along inside the run.
+        # Split the pick's kept words into runs at trimmed pauses, at
+        # excluded (unclassified) utterances, and at dropped words.
+        # Anchor gaps only: Muse-only words between two anchors ride
+        # along inside the run.
         runs: list[list[int]] = [[indices[0]]]
         bounds: list[tuple[float, float, str, str, list[int]]] = []
         for prev_i, i in zip(indices, indices[1:]):
             prev_w, word = words[prev_i], words[i]
             gap = word.start_s - prev_w.end_s
+            dropped_between = sorted(j for j in range(prev_i + 1, i)
+                                     if j in excluded_words)
+            if dropped_between:
+                # A phrase-level cut: the new edges sit mid-gap beside
+                # the dropped words, under the edge-silence rule.
+                first_dropped = words[dropped_between[0]]
+                last_dropped = words[dropped_between[-1]]
+                close = min((prev_w.end_s + first_dropped.start_s) / 2,
+                            prev_w.end_s + EDGE_SILENCE_MAX_S)
+                open_ = max((last_dropped.end_s + word.start_s) / 2,
+                            word.start_s - EDGE_SILENCE_MAX_S)
+                runs.append([i])
+                gap_uids = sorted({word_to_utt[j]
+                                   for j in range(prev_i + 1, i)
+                                   if j in word_to_utt})
+                reasons = {reason for start, end, reason in word_exclusions
+                           if any(start <= j < end
+                                  for j in dropped_between)}
+                reason = (next(iter(reasons)) if len(reasons) == 1
+                          else "dropped by editor")
+                bounds.append((close, open_, "editor_drop", reason,
+                               gap_uids))
+                continue
             continuous = all(not _is_anchor(j)
                              for j in range(prev_i + 1, i))
             if continuous and gap <= pause_limit_s:
@@ -597,13 +641,117 @@ def _passed(text: str) -> dict:
     return {"ok": True, "text": text, "hard": False}
 
 
+def _word_exclusion_ranges(payload: dict) -> list[tuple[int, int]]:
+    """Existing word exclusions as (word_start, word_end) pairs."""
+    out: list[tuple[int, int]] = []
+    for entry in payload.get("word_exclusions", []) or []:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            start = int(entry.get("word_start", -1))
+            end = int(entry.get("word_end", -1))
+        except (TypeError, ValueError):
+            continue
+        if 0 <= start < end:
+            out.append((start, end))
+    return out
+
+
+def _validate_word_range(payload: dict, op: dict,
+                         words: Sequence[WordLike] | None) -> list[dict]:
+    """The drop_words/restore_words checks: whole words, one kept span,
+    no sub-minimum piece, no beat emptied silently."""
+    name = op.get("op", "")
+    word_start, word_end = op.get("word_start", -1), op.get("word_end", -1)
+    if (isinstance(word_start, bool) or isinstance(word_end, bool)
+            or not isinstance(word_start, int)
+            or not isinstance(word_end, int)):
+        return [_blocked(
+            f"Word range {word_start!r}–{word_end!r} cuts inside a word; "
+            f"use whole word indices")]
+    if not 0 <= word_start < word_end:
+        return [_blocked(f"Bad word range {word_start}–{word_end}")]
+    if name == "restore_words":
+        if (word_start, word_end) in _word_exclusion_ranges(payload):
+            return [_passed(f"Restore words {word_start}–{word_end}")]
+        return [_blocked(
+            f"No dropped words {word_start}–{word_end} to restore")]
+    for start, end in _word_exclusion_ranges(payload):
+        if (start, end) == (word_start, word_end):
+            return [_passed(
+                f"Words {word_start}–{word_end} are already dropped")]
+        if start < word_end and word_start < end:
+            return [_blocked(
+                f"Words {word_start}–{word_end} overlap the earlier "
+                f"drop {start}–{end}")]
+    if words is None:
+        return [_passed(f"Drop words {word_start}–{word_end}")]
+    words = list(words)
+    if word_end > len(words):
+        return [_blocked(
+            f"Words {word_start}–{word_end} run past the last word "
+            f"({len(words)} words)")]
+    kept = [s for s in payload.get("kept_spans", []) or []
+            if isinstance(s, dict)]
+    mids = [(w.start_s + w.end_s) / 2 for w in words[word_start:word_end]]
+    holder = next(
+        (s for s in kept
+         if all(float(s["start_s"]) <= mid <= float(s["end_s"])
+                for mid in mids)),
+        None)
+    if holder is None:
+        return [_blocked(
+            f"Words {word_start}–{word_end} are not all in one kept span")]
+    # Simulate the drop: the new pieces must clear the minimum and the
+    # beat must keep something — a whole beat goes via drop_beat.
+    sim = copy.deepcopy(payload)
+    sim.setdefault("word_exclusions", []).append(
+        {"word_start": word_start, "word_end": word_end,
+         "reason": "dropped by editor"})
+    pause_limit = payload.get("pause_limit_s", 0.8)
+    try:
+        pause_limit = float(pause_limit)
+    except (TypeError, ValueError):
+        pause_limit = 0.8
+    recompute_spans(sim, words, pause_limit_s=pause_limit)
+    beat_id = holder.get("beat_id", -1)
+    before = [s for s in kept if s.get("beat_id") == beat_id]
+    after = [s for s in sim.get("kept_spans", []) or []
+             if isinstance(s, dict) and s.get("beat_id") == beat_id]
+    if before and not after:
+        return [_blocked(f"That is the whole of beat B{beat_id} — "
+                         f"drop the beat instead")]
+    old_ranges = {(round(float(s["start_s"]), 3),
+                   round(float(s["end_s"]), 3)) for s in kept}
+    for span in sim.get("kept_spans", []) or []:
+        if not isinstance(span, dict):
+            continue
+        key = (round(float(span["start_s"]), 3),
+               round(float(span["end_s"]), 3))
+        duration = key[1] - key[0]
+        if key not in old_ranges and duration < MIN_KEPT_SPAN_S:
+            return [_blocked(
+                f"Dropping words {word_start}–{word_end} would leave a "
+                f"{duration:.2f}s kept piece, under the "
+                f"{MIN_KEPT_SPAN_S:.2f}s minimum")]
+    return [_passed(f"Drop words {word_start}–{word_end} from beat B{beat_id}")]
+
+
 def validate_operation(payload: dict, op: dict, *,
-                       covers: dict[int, list[str]] | None = None
+                       covers: dict[int, list[str]] | None = None,
+                       words: Sequence[WordLike] | None = None
                        ) -> list[dict]:
-    """The checks for one op: [{"ok", "text", "hard"}]. A hard failure blocks."""
+    """The checks for one op: [{"ok", "text", "hard"}]. A hard failure blocks.
+
+    `drop_words` needs `words` for its full checks (span containment,
+    the minimum-piece rule); without them only the range itself is
+    checked and the rest runs at apply time.
+    """
     name = op.get("op", "")
     if name not in OPERATIONS:
         return [_blocked(f"Unknown operation '{name}'")]
+    if name in ("drop_words", "restore_words"):
+        return _validate_word_range(payload, op, words)
     beats = {b.get("id"): b for b in payload.get("beats", []) or []
              if isinstance(b, dict)}
     if name in ("swap_take", "drop_beat", "restore_beat", "set_angle",
@@ -757,6 +905,18 @@ def _apply_op(payload: dict, op: dict, *, source: str) -> None:
         payload["span_exclusions"] = [
             e for e in payload.get("span_exclusions", []) or []
             if not (isinstance(e, dict) and e.get("span_id") == span_id)]
+    elif name == "drop_words":
+        key = (op.get("word_start", -1), op.get("word_end", -1))
+        if key not in _word_exclusion_ranges(payload):
+            payload.setdefault("word_exclusions", []).append({
+                "word_start": key[0], "word_end": key[1],
+                "reason": "dropped by editor"})
+    elif name == "restore_words":
+        key = (op.get("word_start", -1), op.get("word_end", -1))
+        payload["word_exclusions"] = [
+            e for e in payload.get("word_exclusions", []) or []
+            if not (isinstance(e, dict)
+                    and (e.get("word_start"), e.get("word_end")) == key)]
     elif name == "set_angle":
         bid = op.get("beat_id", -1)
         payload["angle_overrides"] = [
@@ -799,7 +959,8 @@ def apply_operations(payload: dict, words: Sequence[WordLike],
     checked: list[dict] = []
     for op in ops:
         op = dict(op)
-        checks = validate_operation(payload, op, covers=covers)
+        checks = validate_operation(payload, op, covers=covers,
+                                    words=list(words))
         blocked = any(not check["ok"] and check["hard"] for check in checks)
         entry = dict(op)
         entry["blocked"] = blocked

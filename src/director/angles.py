@@ -626,6 +626,24 @@ def _merge_short(shots: list[Shot], clips: list[SyncClip],
         else:
             prev, nxt = shots[idx - 1], shots[idx + 1]
             side, nb = ("prev", prev) if prev.end_s - prev.start_s >= nxt.end_s - nxt.start_s else ("next", nxt)
+        short_angle = [o for o in short.overrules if o.startswith("angle_override:")]
+        if short_angle and not any(o.startswith("angle_override:") for o in nb.overrules):
+            # An editor override on the disappearing shot wins over the
+            # minimum-shot rule: the merged shot takes the override's
+            # camera when it covers the merged lines, else the short
+            # shot stays so the explicit choice is not destroyed.
+            clip = by_label.get(short.camera)
+            merged_ids = sorted(nb.line_ids + short.line_ids)
+            if clip is not None and all(covers(clip, lines_by_id[lid]) for lid in merged_ids):
+                nb.camera = short.camera
+                nb.clip_path = clip.path
+                for note in short_angle:
+                    if note not in nb.overrules:
+                        nb.overrules.append(note)
+            else:
+                short.overrules.append("min_shot_kept:" + "+".join(f"L{lid}" for lid in short.line_ids))
+                kept.add(short.id)
+                continue
         if side == "prev":
             nb.line_ids = sorted(nb.line_ids + short.line_ids)
             nb.start_s = min(nb.start_s, short.start_s)

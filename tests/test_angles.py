@@ -166,6 +166,54 @@ class MergeTests(unittest.TestCase):
         self.assertEqual(kept.camera, "B")
         self.assertTrue(any(o.startswith("min_shot_kept") for o in kept.overrules))
 
+    def test_angle_override_survives_min_shot_merge(self) -> None:
+        # The real opening: a 0.7 s first line with an editor override
+        # folds into the next shot, which takes the override's camera.
+        clips = self._clips()
+        lines = [_line(0, 0.0, 0.7, ["B", "C"]),
+                 _line(1, 1.0, 5.0, ["B", "C"]),
+                 _line(2, 5.5, 9.0, ["B", "C"])]
+        opening = _pick(0, "C", method="editor")
+        opening.overruled.append("angle_override:B0")
+        shots = apply_checks([opening, _pick(1, "B"), _pick(2, "B")],
+                             lines, clips, min_shot_s=2.0)
+        self.assertEqual(len(shots), 1)
+        self.assertEqual(shots[0].camera, "C")
+        self.assertIn("angle_override:B0", shots[0].overrules)
+        self.assertTrue(any("min_shot_merge" in o
+                            for o in shots[0].overrules))
+
+    def test_angle_override_kept_when_it_cannot_cover_the_merge(self) -> None:
+        # C covers the short opening line only; folding it into B would
+        # destroy the editor's explicit choice, so the short shot stays.
+        clips = [_clip("B", 0.0, 100.0), _clip("C", 0.0, 1.0)]
+        lines = [_line(0, 0.0, 0.7, ["B", "C"]),
+                 _line(1, 1.0, 5.0, ["B"]),
+                 _line(2, 5.5, 9.0, ["B"])]
+        opening = _pick(0, "C", method="editor")
+        opening.overruled.append("angle_override:B0")
+        shots = apply_checks([opening, _pick(1, "B"), _pick(2, "B")],
+                             lines, clips, min_shot_s=2.0)
+        kept = next(s for s in shots if s.line_ids == [0])
+        self.assertEqual(kept.camera, "C")
+        self.assertTrue(any(o.startswith("min_shot_kept")
+                            for o in kept.overrules))
+
+    def test_min_shot_merge_prefers_the_surviving_shots_override(self) -> None:
+        # Both sides carry an override: the surviving shot keeps its own.
+        clips = self._clips()
+        lines = [_line(0, 0.0, 0.7, ["B", "C"]),
+                 _line(1, 1.0, 5.0, ["B", "C"]),
+                 _line(2, 5.5, 9.0, ["B", "C"])]
+        first = _pick(0, "C", method="editor")
+        first.overruled.append("angle_override:B0")
+        second = _pick(1, "B", method="editor")
+        second.overruled.append("angle_override:B1")
+        shots = apply_checks([first, second, _pick(2, "B")],
+                             lines, clips, min_shot_s=2.0)
+        merged = next(s for s in shots if 0 in s.line_ids)
+        self.assertEqual(merged.camera, "B")
+
     def test_single_camera_single_shot(self) -> None:
         clips = [_clip("A", 0.0, 100.0)]
         lines = [_line(0, 0.0, 8.0, ["A"]), _line(1, 8.5, 20.0, ["A"])]

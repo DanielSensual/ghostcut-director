@@ -72,9 +72,14 @@ DEVELOPER = (
     "— nothing else exists. \"Use the other take\", \"the second version\", "
     "\"go back to the first one\" mean swap_take to the named alternate of "
     "the beat the note is anchored to. \"Lose\", \"cut\", \"drop\" a part mean "
-    "drop_beat or drop_span for the beat it belongs to. \"Go to the wide / "
+    "drop_beat or drop_span for the beat it belongs to. \"Cut the part "
+    "where I say X\", \"cut every/both mention(s) of X\" mean drop_words "
+    "with the quoted words in quote and word_start/word_end -1 (Director "
+    "finds the words — never invent word numbers). \"Go to the wide / "
     "the close-up / the iPhone angle\" mean set_angle for that beat to the "
-    "camera whose shot size or label matches. \"That pause is too long\" or "
+    "camera whose shot size or label matches. \"At the very start / the "
+    "opening / the first shot\" and \"at the end\" anchor to the opening "
+    "or closing beat. \"That pause is too long\" or "
     "\"tighten the pauses\" mean set_pause_limit (0.5 if a number is not "
     "given, or the number of seconds spoken). \"Make it under three "
     "minutes\" means retime_target. \"Always\", \"never\", \"this client "
@@ -121,12 +126,13 @@ RESOLVE_SCHEMA = {
             "ops": {"type": "array", "items": {
                 "type": "object", "additionalProperties": False,
                 "required": ["op", "beat_id", "attempt_id", "span_id",
-                             "camera", "pause_limit_s", "target_s", "text",
-                             "why"],
+                             "camera", "pause_limit_s", "target_s",
+                             "word_start", "word_end", "text", "why"],
                 "properties": {
                     "op": {"type": "string", "enum": [
                         "swap_take", "drop_beat", "restore_beat",
-                        "drop_span", "restore_span", "set_angle",
+                        "drop_span", "restore_span", "drop_words",
+                        "restore_words", "set_angle",
                         "clear_angle", "set_pause_limit", "add_note",
                         "add_taste", "retime_target"]},
                     "beat_id": {"type": "integer"},
@@ -135,6 +141,8 @@ RESOLVE_SCHEMA = {
                     "camera": {"type": "string"},
                     "pause_limit_s": {"type": "number"},
                     "target_s": {"type": "number"},
+                    "word_start": {"type": "integer"},
+                    "word_end": {"type": "integer"},
                     "text": {"type": "string"},
                     "why": {"type": "string"},
                 },
@@ -154,8 +162,8 @@ VISUAL_SCHEMA = {
 }
 
 CUTLIST_OPS = ("swap_take", "drop_beat", "restore_beat", "drop_span",
-               "restore_span", "set_angle", "clear_angle",
-               "set_pause_limit", "add_note")
+               "restore_span", "drop_words", "restore_words", "set_angle",
+               "clear_angle", "set_pause_limit", "add_note")
 VOICE_ONLY_OPS = ("add_taste", "retime_target")
 BEAT_OPS = ("swap_take", "drop_beat", "restore_beat", "set_angle",
             "clear_angle")
@@ -712,24 +720,105 @@ def normalize_quote_token(text: str) -> str:
     return re.sub(r"[^a-z0-9']+", "", (text or "").lower()).strip("'")
 
 
+_TOKEN_SPLIT_RE = re.compile(r"[-\u2010-\u2015]")
+
+
+def _quote_want_tokens(quote: str) -> list[str]:
+    """The quote's normalised tokens; hyphens split ("B-roll" -> b, roll).
+
+    Pure. Both sides split, so "B roll" and "B-roll" match either way.
+    """
+    want: list[str] = []
+    for chunk in (quote or "").split():
+        for piece in _TOKEN_SPLIT_RE.split(chunk):
+            token = normalize_quote_token(piece)
+            if token:
+                want.append(token)
+    return want
+
+
+def match_quote_ranges(words: list, quote: str) -> list[tuple[int, int]]:
+    """(word_start, word_end) of every consecutive-token match. Pure.
+
+    Needs QUOTE_MIN_WORDS content (non-filler) tokens; one word is not
+    an anchor, it is a coincidence.
+    """
+    stream: list[tuple[str, int]] = []
+    for index, word in enumerate(words):
+        text = word.text if hasattr(word, "text") else word
+        for chunk in str(text or "").split():
+            for piece in _TOKEN_SPLIT_RE.split(chunk):
+                token = normalize_quote_token(piece)
+                if token:
+                    stream.append((token, index))
+    want = _quote_want_tokens(quote)
+    content = [t for t in want if t not in transcribe_mod.FILLER_TOKENS]
+    if len(content) < QUOTE_MIN_WORDS:
+        return []
+    out: list[tuple[int, int]] = []
+    for i in range(len(stream) - len(want) + 1):
+        if [token for token, _ in stream[i:i + len(want)]] == want:
+            found = (stream[i][1], stream[i + len(want) - 1][1] + 1)
+            if found not in out:
+                out.append(found)
+    return out
+
+
 def match_quote(words: list, quote: str) -> list[int]:
     """Start word indices where the quote matches consecutively. Pure.
 
     Needs QUOTE_MIN_WORDS content (non-filler) tokens; one word is not
     an anchor, it is a coincidence.
     """
-    norms = [normalize_quote_token(w.text if hasattr(w, "text") else w)
-             for w in words]
-    want = [t for t in (normalize_quote_token(t) for t in quote.split())
-            if t]
-    content = [t for t in want if t not in transcribe_mod.FILLER_TOKENS]
-    if len(content) < QUOTE_MIN_WORDS:
-        return []
-    out: list[int] = []
-    for i in range(len(norms) - len(want) + 1):
-        if norms[i:i + len(want)] == want:
-            out.append(i)
+    return [start for start, _ in match_quote_ranges(words, quote)]
+
+
+def match_kept_ranges(job: JobContext, quote: str) -> list[tuple[int, int]]:
+    """Global word ranges where the quote matches inside one kept span.
+
+    Pure. A match straddling a cut is not contiguous in the cut and is
+    dropped; untightened jobs keep every word.
+    """
+    ranges = match_quote_ranges(job.words, quote)
+    if job.tighten is None or not ranges:
+        return ranges
+    spans = [(float(s.get("start_s", 0.0)), float(s.get("end_s", 0.0)))
+             for s in job.tighten.get("kept_spans", []) or []
+             if isinstance(s, dict)]
+    out: list[tuple[int, int]] = []
+    for word_start, word_end in ranges:
+        mids = [(job.words[j].start_s + job.words[j].end_s) / 2
+                for j in range(word_start, word_end)]
+        if any(all(start <= mid <= end for mid in mids)
+               for start, end in spans):
+            out.append((word_start, word_end))
     return out
+
+
+TAKE_ALL_RE = re.compile(r"\b(both|all|every)\b", re.IGNORECASE)
+
+_CUT_START_RE = re.compile(
+    r"\b(?:very start|at the start|from the start|"
+    r"start of the (?:cut|video|film)|the opening|opening|opening shot|"
+    r"first shot|first line|open on|opens on|(?:at )?the beginning)\b")
+_CUT_END_RE = re.compile(
+    r"\b(?:at the (?:very )?end|very end|the last shot|last shot|"
+    r"the final shot|final shot|closing|end of the (?:cut|video|film)|"
+    r"the end\b(?! of\b))")
+
+
+def match_cut_edge(text: str) -> str | None:
+    """A "where in the cut" phrase to "start", "end" or None. Pure.
+
+    Bare "the end" anchors; "the end of <that bit>" does not — it is
+    relative to something else, not to the cut.
+    """
+    lowered = (text or "").lower()
+    if _CUT_START_RE.search(lowered):
+        return "start"
+    if _CUT_END_RE.search(lowered):
+        return "end"
+    return None
 
 
 def kept_words(job: JobContext) -> list:
@@ -1074,6 +1163,18 @@ def resolve_prompt(job: JobContext, note_turns: list[list[Turn]],
                 f"{pick_text} alternates: {alternates} removed: {removed}")
     else:
         lines.append("(not tightened: no takes, angles only)")
+    clip_hints: dict[str, str] = {}
+    for item in job.sync.get("clips", []) or []:
+        if not isinstance(item, dict) or not item.get("label"):
+            continue
+        cam = item.get("camera") or {}
+        parts = [str(cam.get("make") or ""), str(cam.get("model") or "")]
+        stem = Path(str(cam.get("path") or "")).name
+        if stem:
+            parts.append(stem)
+        hint = " ".join(p for p in parts if p)
+        if hint:
+            clip_hints[str(item["label"])] = hint
     for shot in job.angles.get("shots", []) or []:
         if not isinstance(shot, dict):
             continue
@@ -1084,9 +1185,13 @@ def resolve_prompt(job: JobContext, note_turns: list[list[Turn]],
             continue
         beat = shot.get("beat_id", -1)
         beat_text = f" beat B{beat}" if isinstance(beat, int) and beat >= 0 else ""
+        size = str(shot.get("shot_size", ""))
+        hint = clip_hints.get(str(shot.get("camera") or ""), "")
+        if hint:
+            size = f"{size}; {hint}" if size else hint
         lines.append(
             f"shot {shot.get('id')} out {start:.1f}-{end:.1f}s camera "
-            f"{shot.get('camera')} ({shot.get('shot_size', '')})"
+            f"{shot.get('camera')} ({size})"
             f"{beat_text}")
     lines.append("TRANSCRIPT:")
     lines.extend(_transcript_lines(job) or ["(no words kept)"])
@@ -1126,6 +1231,14 @@ def op_label(op: dict) -> str:
         return f"Drop span {op.get('span_id', '')}"
     if name == "restore_span":
         return f"Restore span {op.get('span_id', '')}"
+    if name in ("drop_words", "restore_words"):
+        verb = "Drop" if name == "drop_words" else "Restore"
+        label = (f"{verb} words {op.get('word_start', -1)}–"
+                 f"{op.get('word_end', -1)}")
+        text = str(op.get("text", "")).strip()
+        if text:
+            label += f" (“{text[:60]}”)"
+        return label
     if name == "set_angle":
         return f"Camera {op.get('camera', '')} for beat {tag}"
     if name == "clear_angle":
@@ -1189,7 +1302,8 @@ def _validate_untightened(job: JobContext, op: dict, at_s: float | None
     """Checks for one op against a job with no tighten.json. Pure."""
     name = op.get("op", "")
     if name in ("swap_take", "drop_beat", "restore_beat", "drop_span",
-                "restore_span", "clear_angle", "retime_target"):
+                "restore_span", "drop_words", "restore_words",
+                "clear_angle", "retime_target"):
         return [_blocked(NOT_TIGHTENED_MESSAGE)]
     if name == "set_pause_limit":
         value = op.get("pause_limit_s", -1)
@@ -1273,6 +1387,123 @@ def _fmt_clock(seconds: float) -> str:
     return f"{total // 60}:{total % 60:02d}"
 
 
+def _range_candidates(job: JobContext,
+                      ranges: list[tuple[int, int]]) -> list[dict]:
+    """Word ranges to ambiguous candidates (carrying their ranges). Pure."""
+    out: list[dict] = []
+    for word_start, word_end in ranges:
+        if not 0 <= word_start < word_end <= len(job.words):
+            continue
+        word = job.words[word_start]
+        if job.tighten is not None:
+            at = cutlist.source_to_output(job.tighten, word.start_s)
+            bid = cutlist.beat_at_source(job.tighten, word.start_s)
+        else:
+            at, bid = word.start_s, -1
+        if at is None:
+            continue
+        snippet = " ".join(w.text for w in
+                           job.words[word_start:word_start + 8])
+        out.append({"beat_id": bid if bid is not None else -1,
+                    "at_s": round(at, 3),
+                    "label": f"{at:.1f}s — {snippet}",
+                    "word_start": word_start, "word_end": word_end})
+    out.sort(key=lambda c: c["at_s"])
+    return out
+
+
+def _fill_word_op(job: JobContext, op: dict,
+                  found: tuple[int, int]) -> dict:
+    """A drop_words op with its resolved range (and phrase). Pure."""
+    op = dict(op)
+    op["word_start"], op["word_end"] = found
+    if not str(op.get("text", "")).strip():
+        op["text"] = " ".join(
+            w.text for w in job.words[found[0]:found[1]])
+    return op
+
+
+def _resolve_word_op_ranges(job: JobContext, *, raw_text: str, heard: str,
+                            quote: str, ops: list[dict]
+                            ) -> tuple[list[dict], list[dict], str,
+                                       tuple[float, int | None] | None]:
+    """Quote to word ranges for drop_words ops. Pure.
+
+    Returns (ops, word_candidates, message, anchor). Spark cannot know
+    span ids or word numbers, so it sends the quoted words and Director
+    finds them: one match fills the op; "both"/"all"/"every" expand one
+    op per match; several matches without them ask. A drop_span whose
+    span id names nothing but whose quote lands inside kept lines is a
+    phrase cut mislabelled, and is converted. The anchor is (output
+    time, beat) of the first resolved range, for the note's own anchor.
+    """
+    if job.tighten is None:
+        return list(ops), [], "", None
+    cleaned = quote.strip()
+    ranges = match_kept_ranges(job, cleaned) if cleaned else []
+    take_all = bool(TAKE_ALL_RE.search(f"{raw_text} {heard}"))
+    kept_ids = {str(s.get("id")) for s in
+                job.tighten.get("kept_spans", []) or []
+                if isinstance(s, dict)}
+    out: list[dict] = []
+    word_candidates: list[dict] = []
+    notes: list[str] = []
+    anchor: tuple[float, int | None] | None = None
+    for op in ops:
+        name = op.get("op", "")
+        if (name == "drop_span" and ranges
+                and str(op.get("span_id", "")) not in kept_ids):
+            op = {**op, "op": "drop_words", "span_id": "",
+                  "word_start": -1, "word_end": -1}
+            name = "drop_words"
+            notes.append(f"Matched “{cleaned}” inside kept lines — "
+                         f"dropping the words")
+        if name != "drop_words":
+            out.append(op)
+            continue
+        word_start, word_end = op.get("word_start", -1), op.get("word_end", -1)
+        if (word_start != -1 and word_end != -1):
+            # Indices already filled (the app re-sends them); the checks
+            # decide, here or in cutlist.
+            out.append(op)
+            continue
+        if not ranges:
+            if cleaned:
+                text = f"No words match “{cleaned}” in this cut"
+                label = f"Drop “{cleaned[:60]}”"
+            else:
+                text = "I couldn't tell which words to cut"
+                label = "Drop words"
+            out.append({**op, "blocked": True, "checks": [_blocked(text)],
+                        "label": label})
+            continue
+        if len(ranges) > 1 and not take_all:
+            for cand in _range_candidates(job, ranges):
+                key = (cand["word_start"], cand["word_end"])
+                if key not in {(c["word_start"], c["word_end"])
+                               for c in word_candidates}:
+                    word_candidates.append(cand)
+            word_candidates.sort(key=lambda c: c["at_s"])
+            out.append({**op, "blocked": True,
+                        "checks": [_blocked(
+                            f"Ambiguous — pick one of "
+                            f"{len(word_candidates)} moments")],
+                        "label": f"Drop “{cleaned[:60]}”"})
+            continue
+        for found in ranges:
+            out.append(_fill_word_op(job, op, found))
+        if anchor is None:
+            # The note's own anchor: the first range's output time, and
+            # its beat when exactly one range resolved (several ranges
+            # place no single beat).
+            first = _range_candidates(job, ranges[:1])
+            if first:
+                bid = first[0]["beat_id"]
+                anchor = (first[0]["at_s"],
+                          bid if len(ranges) == 1 and bid >= 0 else None)
+    return out, word_candidates, " ".join(notes), anchor
+
+
 def verify_resolved(job: JobContext, notes: list[dict],
                     *, source: str = "file") -> list[ResolvedNote]:
     """Muse proposes, these decide: anchors, checks, retargets. Pure
@@ -1331,6 +1562,17 @@ def verify_resolved(job: JobContext, notes: list[dict],
                 cursor = at
             continue
 
+        # Word ranges before anchors: Spark sends quoted words, never
+        # word numbers, so the quote resolves to ranges here.
+        quote_text = str(entry.get("quote", ""))
+        (ops_in, word_candidates, word_note,
+         word_anchor) = _resolve_word_op_ranges(
+            job, raw_text=raw, heard=heard, quote=quote_text, ops=ops_in)
+        if word_note:
+            message = f"{message} {word_note}".strip() if message \
+                else word_note
+        word_ambiguous = bool(word_candidates)
+
         needs_beat = any(op.get("op") in BEAT_OPS for op in ops_in)
         needs_place = needs_beat or any(op.get("op") == "add_note"
                                         for op in ops_in)
@@ -1385,6 +1627,13 @@ def verify_resolved(job: JobContext, notes: list[dict],
                 elif len(matches) > 1:
                     candidates = _matches_to_candidates(job, matches)
         if kind == "none" and needs_place and not candidates:
+            edge = match_cut_edge(f"{raw} {heard}")
+            if edge is not None:
+                at_edge = 0.0 if edge == "start" else output_duration(job)
+                kind, at = "beat", at_edge
+                found = _beat_in_window(job, at_edge)
+                bid = found if found is not None else -1
+        if kind == "none" and needs_place and not candidates:
             shot, advanced = match_camera_reference(
                 job, f"{raw} {heard}",
                 after_s=cursor if playhead is None and spoken_tc is None
@@ -1412,6 +1661,14 @@ def verify_resolved(job: JobContext, notes: list[dict],
                     message = (message.rstrip()
                                + " (advanced from the previous note)")
 
+        if word_candidates:
+            candidates = sorted(word_candidates + candidates,
+                                key=lambda c: c["at_s"])
+        if kind == "none" and word_anchor is not None:
+            kind, at = "quote", word_anchor[0]
+            if bid is None and word_anchor[1] is not None:
+                bid = word_anchor[1]
+
         # Confidence floor (§6.4 step 3): report, never guess.
         if confidence < CONFIDENCE_FLOOR:
             resolved.append(_finish("unresolved", kind, at,
@@ -1422,7 +1679,7 @@ def verify_resolved(job: JobContext, notes: list[dict],
             continue
 
         # Ambiguity: candidates listed, apply waits for the editor's pick.
-        if candidates and needs_beat:
+        if candidates and (needs_beat or word_ambiguous):
             ordered: list[dict] = []
             for op in ops_in:
                 if op.get("op") in BEAT_OPS:
@@ -1433,6 +1690,9 @@ def verify_resolved(job: JobContext, notes: list[dict],
                         f"Ambiguous — pick one of {len(candidates)} "
                         "moments")]
                     op["label"] = op_label(op)
+                    ordered.append(op)
+                elif op.get("checks") is not None:
+                    # The word-range step already decided this op.
                     ordered.append(op)
                 else:
                     ordered.extend(_check_ops(job, [op], at))
@@ -1532,7 +1792,13 @@ def verify_resolved(job: JobContext, notes: list[dict],
                 "why": str(entry.get("message", "")),
             })
 
-        checked = _check_ops(job, final_ops, at)
+        checked = []
+        for op in final_ops:
+            if op.get("checks") is not None:
+                # The word-range step already decided this op.
+                checked.append(op)
+            else:
+                checked.extend(_check_ops(job, [op], at))
         # An op naming a vanished beat/attempt stays visible, blocked
         # with cutlist's text — it is never dropped from the list.
         if not checked and not taste_in:
@@ -1576,7 +1842,7 @@ def _check_ops(job: JobContext, ops: list[dict],
             checks = _validate_voice_op(job, op)
         elif name in CUTLIST_OPS:
             checks = cutlist.validate_operation(
-                job.tighten, op, covers=job.covers)
+                job.tighten, op, covers=job.covers, words=job.words)
         else:
             checks = [_blocked(f"Unknown operation '{name}'")]
         op["blocked"] = any(not c["ok"] and c["hard"] for c in checks)
@@ -1811,12 +2077,17 @@ def _downgrade_visual(note: ResolvedNote) -> None:
 # ------------------------------------------------- applying (§8)
 
 _CUTLIST_FIELDS = ("op", "beat_id", "attempt_id", "span_id", "camera",
-                   "pause_limit_s", "at_s", "text", "why")
+                   "pause_limit_s", "at_s", "word_start", "word_end",
+                   "text", "why")
 
 
 def _strip_for_cutlist(op: dict) -> dict:
     """A checked op to the fields `apply_operations` audits. Pure."""
-    return {key: op[key] for key in _CUTLIST_FIELDS if key in op}
+    out = {key: op[key] for key in _CUTLIST_FIELDS if key in op}
+    if out.get("op") not in ("drop_words", "restore_words"):
+        out.pop("word_start", None)
+        out.pop("word_end", None)
+    return out
 
 
 def _next_audit_id(payload: dict) -> str:
@@ -1901,7 +2172,12 @@ def apply_notes(*, job: JobContext, notes: list[dict],
         note = notes[note_pos]
         op = note["ops"][op_pos]
         if op.get("blocked"):
-            continue
+            # Ambiguous ops are always blocked; a picked candidate
+            # retargets and re-validates below, so only picked ones
+            # fall through.
+            if not (note.get("status") == "ambiguous"
+                    and candidates.get(note.get("id", "")) is not None):
+                continue
         if note.get("status") == "ambiguous":
             choice = candidates.get(note.get("id", ""))
             if choice is None:
@@ -1910,6 +2186,16 @@ def apply_notes(*, job: JobContext, notes: list[dict],
             op["beat_id"] = choice
             picked = next((c for c in note.get("candidates", []) or []
                            if c.get("beat_id") == choice), None)
+            if (picked is not None
+                    and op.get("op") in ("drop_words", "restore_words")
+                    and isinstance(picked.get("word_start"), int)
+                    and isinstance(picked.get("word_end"), int)):
+                op["word_start"] = picked["word_start"]
+                op["word_end"] = picked["word_end"]
+                if not str(op.get("text", "")).strip():
+                    op["text"] = " ".join(
+                        w.text for w in
+                        job.words[op["word_start"]:op["word_end"]])
             at = picked.get("at_s") if picked else note.get("at_s")
             fresh = _check_ops(job, [op], at)
             note["ops"][op_pos] = fresh[0]

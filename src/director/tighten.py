@@ -1112,6 +1112,7 @@ def run(*, sync_path: Path, words_path: Path, out_path: Path,
         "angle_overrides": [],
         "edits_applied": [],
         "span_exclusions": [],
+        "word_exclusions": [],
         "editor_notes": [],
         "target": None,
     }
@@ -1132,14 +1133,21 @@ def run(*, sync_path: Path, words_path: Path, out_path: Path,
         payload["span_exclusions"] = [
             dict(e) for e in old.get("span_exclusions", []) or []
             if isinstance(e, dict)]
+        # Word drops are word-index keyed, so they carry over verbatim
+        # like span exclusions (never re-applied by stale ids).
+        payload["word_exclusions"] = [
+            dict(e) for e in old.get("word_exclusions", []) or []
+            if isinstance(e, dict)]
         old_edits = [e for e in old.get("edits_applied", []) or []
                      if isinstance(e, dict)]
         payload["edits_applied"] = [
             dict(e) for e in old_edits
-            if e.get("op") in ("drop_span", "restore_span")]
+            if e.get("op") in ("drop_span", "restore_span", "drop_words",
+                               "restore_words")]
         cutlist.recompute_spans(payload, words, pause_limit_s=pause_limit)
         for entry in old_edits:
-            if entry.get("op") in ("drop_span", "restore_span"):
+            if entry.get("op") in ("drop_span", "restore_span",
+                                   "drop_words", "restore_words"):
                 continue
             op = {k: v for k, v in entry.items()
                   if k not in ("id", "at", "source")}

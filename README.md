@@ -102,6 +102,7 @@ From [docs/muse-code/BUILD-LOG.md](docs/muse-code/BUILD-LOG.md) and the git log,
 | Gaze angle choice and skin match (`look`) | Built by Muse Code on muse-spark-1.3 from LOOK-BRIEF.md, after my review of the final take |
 | Mic-air de-plosive and peak limiter (the `finish` de-plosive, `--no-deplosive`) | Built by Muse Code on muse-spark-1.3 from AIR-BRIEF.md |
 | Slow push-in on every shot (`angles`/`cut --push-in`) | Built by Muse Code on muse-spark-1.3 from PUSH-BRIEF.md, after my review of the final take |
+| Phrase-level voice-note cuts (`drop_words`, quote ranges, cut-edge anchors) | Built by Muse Code on muse-spark-1.3 from VOICEFIX-BRIEF.md, after my review of the final take |
 | The Director app, Render, and the test-run scripts in `scripts/` | Built by Claude Code with me (imported into this repository) |
 | The briefs in `docs/muse-code/` | Me, with Claude Code |
 
@@ -116,7 +117,7 @@ python app/main.py --job job1   # open a finished director cut job
 
 A finished `director cut` job opens directly: beats become sections, shots become talk clips, take picks fill the Why panel, and kept words become the Words tab. Reviewing takes and notes works even before the job has rendered. A project made by the Director test run (`scripts/`) also opens; this repository does not ship one.
 
-I can also talk back to a cut. In the app I hold the mic button (or hold `V`) and say "use the other take here" or "tighten every pause"; from the command line, `director voice memo.m4a --job job1` does the same with a memo file (add `--apply`, then `--render` to re-render). Notes are anchored by playhead time, a spoken timecode, or quoted words, and resolved into checked edit proposals — the same checks, the same apply path, the same render. Standing preferences ("always open on the wide") persist per job in `taste.json` and are read on the next pick or note. The Mac window cannot reach the microphone, so recording there shows a banner pointing at the same page in a browser, where recording works.
+I can also talk back to a cut. In the app I hold the mic button (or hold `V`) and say "use the other take here" or "tighten every pause"; from the command line, `director voice memo.m4a --job job1` does the same with a memo file (add `--apply`, then `--render` to re-render). Notes are anchored by playhead time, a spoken timecode, quoted words, or the opening/closing beat ("at the very start", "at the end"), and resolved into checked edit proposals — the same checks, the same apply path, the same render. A note can cut a phrase inside a kept span ("cut both places where I mention B-roll"); "both"/"all"/"every" takes every match, one ambiguous mention still asks. Standing preferences ("always open on the wide") persist per job in `taste.json` and are read on the next pick or note. The Mac window cannot reach the microphone, so recording there shows a banner pointing at the same page in a browser, where recording works.
 
 ## Commands reference
 

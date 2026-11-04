@@ -678,3 +678,80 @@ Muse Code token use: TBD (the owner fills this from the run log).
   records `push_in: 5.0`, samples one face frame per shot, and renders
   1920x1080 with the exact frame count and duration (102 frames, 3.4 s);
   the pushed render differs from `--push-in 0` at the same duration.
+
+# Build log: voice-note phrase cuts (`voice` fixes) (2026-11-04)
+
+| Step | By | What |
+|---|---|---|
+| Brief | Project owner, with Claude Code | `VOICEFIX-BRIEF.md`: phrase-level cuts, quote-to-range resolution, angle-note anchors, after the owner tested voice notes on the final take. |
+| Build | Meta **Muse Code** on **`muse-spark-1.3`** | The `drop_words`/`restore_words` ops in `cutlist.py`, quote ranges + take-all + cut-edge anchors in `voice.py`, the override-survives-merge rule in `angles.py`, 28 tests. Built straight from the brief (no separate design). |
+| Code review and live test | Claude Code, piloted by the owner | Real footage, below. |
+
+Muse Code token use: TBD (the owner fills this from the run log).
+Live test: TBD (the owner fills this from the real-footage run).
+
+## Build notes (Muse Code)
+
+- `drop_words`/`restore_words` go through `apply_operations` like every
+  other op. Drops live in `payload["word_exclusions"]` as word-index
+  ranges, which are stable across re-picks (unlike span ids), so they
+  also survive take swaps and carry over verbatim on `tighten` re-runs
+  with their history, exactly like span exclusions. `recompute_spans`
+  splits kept runs at dropped words; the new edges sit mid-gap beside
+  the dropped words under the edge-silence rule (0.5 s cap), and the
+  hole classifies as `editor_drop`. The checks: whole-number indices
+  ("cuts inside a word"), all words in one kept span, and — by
+  simulating the drop on a copy — no new kept piece under 0.35 s and
+  no beat emptied silently ("That is the whole of beat B<n> — drop
+  the beat instead"). A duplicate drop passes as an already-dropped
+  no-op; a partial overlap blocks.
+- Quote resolution is mechanical: Spark sends the quoted words with
+  `word_start`/`word_end` -1 (it never invents numbers) and Director
+  finds the ranges. Hyphens split on both sides, so "B roll" and
+  "B-roll" match either way, and a lone "B-roll" clears the two-token
+  floor as two content tokens. One match fills the op; "both"/"all"/
+  "every" expand one op per match; several matches without them ask,
+  with candidates carrying their word ranges so the editor's pick
+  applies that range. A `drop_span` whose span id names nothing but
+  whose quote lands inside kept lines converts to `drop_words` — that
+  was the real run's shape ("Drop span: No kept span in this cut").
+- Cut-edge anchors sit after quote matching and before camera
+  references: "at the very start / the opening / the first shot" lands
+  on output 0 and the first kept beat, "at the end / the last shot /
+  closing" on the duration and the last kept beat. Bare "the end"
+  anchors; "the end of &lt;that bit&gt;" does not. Shot lines in the
+  resolve prompt now name each camera's make, model and file stem, so
+  Spark can map "the drone camera" to the DJI file.
+- `_merge_short`: a short shot carrying an `angle_override` whose
+  surviving neighbour has none gives the merged shot the override's
+  camera (which must cover the merged lines; `clip_path` follows the
+  camera), with the override note carried onto the merged shot. When
+  the override camera cannot cover the merge, the short shot stays
+  (`min_shot_kept`) instead of destroying the explicit choice; when
+  the survivor has its own override, its camera wins as before.
+- `apply_notes` now honours ambiguous candidate picks: a blocked op on
+  an ambiguous note with a picked candidate falls through to retarget
+  and re-validation (word picks also fill the candidate's range).
+  Before, the blocked-skip ran first, so candidate picks never applied
+  — this affected beat-op picks too, and both now have tests.
+- Edge behaviour kept as found: a drop at a span edge shrinks the span
+  instead of splitting it, and the neighbouring gap keeps its previous
+  classification — only mid-span drops yield `editor_drop` spans.
+- Real-job check on a `/tmp` copy of the final-take job (this sandbox
+  blocks network, so stand-in Spark replies built from the two real
+  transcripts drove `verify_resolved` + `apply_notes`; no Meta or
+  Whisper calls, nothing written to the real job): note 1 resolves to
+  `set_angle` B0 → C via the start anchor with no usable quote (and
+  via the quote when one is given); note 2 resolves to `drop_words`
+  74–75 ("B-roll,") on B2 and 279–281 ("B roll") on B5, through both
+  the `drop_words` and the `drop_span` reply shapes, and asks with
+  both candidates when "both" is absent. Applied e1–e3, duration
+  130.14 → 129.18 s; `angles --no-muse` on the copy opens on C with
+  `angle_override:B0`, and the dropped words sit in no kept span. The
+  proposal labels show the exact phrases: the stutter "roll," after
+  "B-roll," and "get in" around "B roll" remain for the editor to
+  judge — the match is the quote, never extended.
+- Full suite: 758 tests (28 new: 7 cutlist, 3 angles, 18 voice),
+  green except the same 11 pre-existing `ps`-sandbox errors in
+  `tests/test_engine_render.py` and `tests/test_render_runner.py`
+  (730 on the pristine tree, same 11).

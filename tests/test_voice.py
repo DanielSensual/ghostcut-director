@@ -150,7 +150,8 @@ def _entry(**over: object) -> dict:
 def _op(name: str, **over: object) -> dict:
     base: dict = {"op": name, "beat_id": -1, "attempt_id": -1,
                   "span_id": "", "camera": "", "pause_limit_s": -1,
-                  "target_s": -1, "text": "", "why": "the note says so"}
+                  "target_s": -1, "word_start": -1, "word_end": -1,
+                  "text": "", "why": "the note says so"}
     base.update(over)
     return base
 
@@ -461,6 +462,21 @@ class AnchorVerifyTests(JobFixture):
                             for c in note.candidates))
         self.assertTrue(note.ops[0]["blocked"])
 
+    def test_candidate_pick_applies_the_beat_op(self) -> None:
+        job = self.context()
+        (note,) = voice_mod.verify_resolved(job, [_entry(
+            raw_text="where I say green lagoon swap the take",
+            heard="swap the take at green lagoon",
+            quote="green lagoon",
+            ops=[_op("swap_take", beat_id=-1, attempt_id=0)])])
+        self.assertEqual(note.status, "ambiguous")
+        result = voice_mod.apply_notes(
+            job=job, notes=[note.as_dict()], pick=[0],
+            candidates={"n1": 0}, source="voice")
+        self.assertEqual(len(result["applied"]), 1)
+        saved = json.loads((self.job / "tighten.json").read_text())
+        self.assertEqual(saved["beats"][0]["pick_attempt"], 0)
+
     def test_playhead_overrules_a_wrong_spark_beat(self) -> None:
         job = self.context()
         (note,) = voice_mod.verify_resolved(job, [_entry(
@@ -493,13 +509,19 @@ class ContractTests(unittest.TestCase):
         self.assertIn("do not pick one quietly", voice_mod.DEVELOPER)
 
     def test_schema_op_enum_is_the_section_6_1_list(self) -> None:
-        ops = voice_mod.RESOLVE_SCHEMA["properties"]["notes"]["items"][
-            "properties"]["ops"]["items"]["properties"]["op"]["enum"]
+        props = voice_mod.RESOLVE_SCHEMA["properties"]["notes"]["items"][
+            "properties"]["ops"]["items"]["properties"]
         self.assertEqual(
-            ops, ["swap_take", "drop_beat", "restore_beat", "drop_span",
-                  "restore_span", "set_angle", "clear_angle",
-                  "set_pause_limit", "add_note", "add_taste",
-                  "retime_target"])
+            props["op"]["enum"],
+            ["swap_take", "drop_beat", "restore_beat", "drop_span",
+             "restore_span", "drop_words", "restore_words", "set_angle",
+             "clear_angle", "set_pause_limit", "add_note", "add_taste",
+             "retime_target"])
+        self.assertIn("word_start", props)
+        self.assertIn("word_end", props)
+
+    def test_developer_prompt_names_the_phrase_cut(self) -> None:
+        self.assertIn("drop_words", voice_mod.DEVELOPER)
 
 
 class ResolveTests(JobFixture):
@@ -906,6 +928,214 @@ class RunTests(JobFixture):
         self.assertEqual(only["message"], voice_mod.NO_SPEECH_FILE)
         saved = json.loads((self.job / "voice.json").read_text())
         self.assertEqual(saved["notes"], payload["notes"])
+
+
+class QuoteRangeTests(unittest.TestCase):
+    """VOICEFIX item 2: hyphen-tolerant quote matching to word ranges."""
+
+    def test_hyphen_matches_split_words_both_ways(self) -> None:
+        split = [voice_mod.Turn(0.0, 1.0, text)
+                 for text in "It can also add B roll captions".split()]
+        self.assertEqual(voice_mod.match_quote_ranges(split, "add B-roll"),
+                         [(3, 6)])
+        joined = [voice_mod.Turn(0.0, 1.0, text)
+                  for text in ["It", "can", "also", "add", "B-roll,",
+                               "captions"]]
+        self.assertEqual(voice_mod.match_quote_ranges(joined, "add B roll"),
+                         [(3, 5)])
+
+    def test_single_hyphenated_word_is_enough_to_anchor(self) -> None:
+        # "B-roll" normalises to two content tokens, clearing the floor.
+        words = [voice_mod.Turn(0.0, 1.0, text)
+                 for text in "get B roll in".split()]
+        self.assertEqual(voice_mod.match_quote(words, "B-roll"), [1])
+        self.assertEqual(voice_mod.match_quote_ranges(words, "B-roll"),
+                         [(1, 3)])
+
+    def test_ranges_are_word_index_pairs(self) -> None:
+        words = [voice_mod.Turn(0.0, 1.0, text)
+                 for text in ("alpha beta green lagoon "
+                              "delta epsilon green lagoon").split()]
+        self.assertEqual(voice_mod.match_quote_ranges(words, "green lagoon"),
+                         [(2, 4), (6, 8)])
+        self.assertEqual(voice_mod.match_quote(words, "green lagoon"),
+                         [2, 6])
+        # One content word is still not an anchor.
+        self.assertEqual(voice_mod.match_quote_ranges(words, "lagoon"), [])
+
+
+class BothMatchesTests(JobFixture):
+    """VOICEFIX: "cut both places where I mention X" drops every match."""
+
+    def _note(self, raw: str) -> dict:
+        return _entry(
+            raw_text=raw, heard=raw, quote="green lagoon",
+            ops=[_op("drop_words", word_start=-1, word_end=-1)])
+
+    def test_both_expands_to_one_drop_per_match(self) -> None:
+        job = self.context()
+        (note,) = voice_mod.verify_resolved(job, [self._note(
+            "Cut both places where I mention green lagoon")])
+        self.assertEqual(note.status, "resolved")
+        self.assertEqual([(op["word_start"], op["word_end"])
+                          for op in note.ops], [(4, 6), (8, 10)])
+        self.assertTrue(all(not op["blocked"] for op in note.ops))
+        self.assertEqual(note.ops[0]["label"],
+                         "Drop words 4–6 (“green lagoon.”)")
+
+    def test_all_and_every_also_take_every_match(self) -> None:
+        job = self.context()
+        for raw in ("Cut all the places where I say green lagoon",
+                    "Cut every place where I say green lagoon"):
+            (note,) = voice_mod.verify_resolved(job, [self._note(raw)])
+            self.assertEqual(note.status, "resolved")
+            self.assertEqual(len(note.ops), 2)
+
+    def test_apply_drops_both_phrases(self) -> None:
+        job = self.context()
+        (note,) = voice_mod.verify_resolved(job, [self._note(
+            "Cut both places where I mention green lagoon")])
+        result = voice_mod.apply_notes(
+            job=job, notes=[note.as_dict()], source="voice")
+        self.assertEqual(len(result["applied"]), 2)
+        saved = json.loads((self.job / "tighten.json").read_text())
+        self.assertEqual(saved["word_exclusions"],
+                         [{"word_start": 4, "word_end": 6,
+                           "reason": "dropped by editor"},
+                          {"word_start": 8, "word_end": 10,
+                           "reason": "dropped by editor"}])
+        self.assertLess(saved["duration_out_s"], 3.4)
+        # No kept span keeps any dropped word's [start, end].
+        kept = [w for w in json.loads(
+            (self.job / "words.json").read_text())["words"]]
+        for span in saved["kept_spans"]:
+            for word in (kept[4], kept[5], kept[8], kept[9]):
+                overlap = (min(span["end_s"], word["end"])
+                           - max(span["start_s"], word["start"]))
+                self.assertLessEqual(overlap, 0.0)
+
+    def test_drop_span_with_a_matching_quote_becomes_drop_words(self) -> None:
+        # The real note-2 Spark reply shape: drop_span plus the quote.
+        job = self.context()
+        (note,) = voice_mod.verify_resolved(job, [_entry(
+            raw_text="Cut both places where I mention green lagoon",
+            heard="Cut both mentions of green lagoon",
+            quote="green lagoon",
+            ops=[_op("drop_span", span_id="")])])
+        self.assertEqual(note.status, "resolved")
+        self.assertEqual([op["op"] for op in note.ops],
+                         ["drop_words", "drop_words"])
+        self.assertTrue(all(not op["blocked"] for op in note.ops))
+
+    def test_drop_span_without_a_quote_keeps_its_check(self) -> None:
+        job = self.context()
+        (note,) = voice_mod.verify_resolved(job, [_entry(
+            raw_text="cut that span",
+            heard="cut that span",
+            ops=[_op("drop_span", span_id="")])])
+        (op,) = note.ops
+        self.assertTrue(op["blocked"])
+        self.assertEqual(op["checks"][-1]["text"],
+                         "No kept span  in this cut")
+
+
+class AmbiguousWordTests(JobFixture):
+    """VOICEFIX: one mention of matched words still asks which one."""
+
+    def test_single_mention_asks_with_both_candidates(self) -> None:
+        job = self.context()
+        (note,) = voice_mod.verify_resolved(job, [_entry(
+            raw_text="cut the part where I say green lagoon",
+            heard="cut the part where you say green lagoon",
+            quote="green lagoon",
+            ops=[_op("drop_words", word_start=-1, word_end=-1)])])
+        self.assertEqual(note.status, "ambiguous")
+        self.assertEqual([(c["word_start"], c["word_end"])
+                          for c in note.candidates], [(4, 6), (8, 10)])
+        (op,) = note.ops
+        self.assertTrue(op["blocked"])
+        self.assertIn("Ambiguous — pick one of 2 moments",
+                      op["checks"][-1]["text"])
+
+    def test_candidate_pick_applies_that_range(self) -> None:
+        job = self.context()
+        (note,) = voice_mod.verify_resolved(job, [_entry(
+            raw_text="cut the part where I say green lagoon",
+            heard="cut the part where you say green lagoon",
+            quote="green lagoon",
+            ops=[_op("drop_words", word_start=-1, word_end=-1)])])
+        result = voice_mod.apply_notes(
+            job=job, notes=[note.as_dict()], pick=[0],
+            candidates={"n1": 1}, source="voice")
+        self.assertEqual(len(result["applied"]), 1)
+        saved = json.loads((self.job / "tighten.json").read_text())
+        self.assertEqual(saved["word_exclusions"],
+                         [{"word_start": 8, "word_end": 10,
+                           "reason": "dropped by editor"}])
+
+    def test_quote_matching_nowhere_blocks_with_its_text(self) -> None:
+        job = self.context()
+        (note,) = voice_mod.verify_resolved(job, [_entry(
+            raw_text="cut the part where I say purple planet",
+            heard="cut the part where you say purple planet",
+            quote="purple planet",
+            ops=[_op("drop_words", word_start=-1, word_end=-1)])])
+        (op,) = note.ops
+        self.assertTrue(op["blocked"])
+        self.assertIn("No words match", op["checks"][-1]["text"])
+
+
+class CutEdgeAnchorTests(JobFixture):
+    """VOICEFIX item 3: the opening and the end anchor angle notes."""
+
+    def test_very_start_anchors_the_opening_beat(self) -> None:
+        job = self.context()
+        (note,) = voice_mod.verify_resolved(job, [_entry(
+            raw_text="At the very start, use the drone camera",
+            heard="Use the drone camera at the very start",
+            ops=[_op("set_angle", beat_id=-1, camera="B")])])
+        self.assertEqual(note.status, "resolved")
+        self.assertEqual(note.anchor_kind, "beat")
+        self.assertEqual(note.at_s, 0.0)
+        self.assertEqual(note.beat_id, 0)
+        (op,) = note.ops
+        self.assertEqual(op["beat_id"], 0)
+        self.assertFalse(op["blocked"])
+
+    def test_misheard_quote_falls_through_to_the_start(self) -> None:
+        job = self.context()
+        (note,) = voice_mod.verify_resolved(job, [_entry(
+            raw_text="At the very start where I say my mic use the wide",
+            heard="Use the wide at the very start",
+            quote="my microphone check",
+            ops=[_op("set_angle", beat_id=-1, camera="B")])])
+        self.assertEqual(note.status, "resolved")
+        self.assertEqual(note.beat_id, 0)
+
+    def test_at_the_end_anchors_the_last_beat(self) -> None:
+        job = self.context()
+        (note,) = voice_mod.verify_resolved(job, [_entry(
+            raw_text="use the wide at the end",
+            heard="Use the wide at the end",
+            ops=[_op("set_angle", beat_id=-1, camera="A")])])
+        self.assertEqual(note.status, "resolved")
+        self.assertEqual(note.beat_id, 1)
+        self.assertAlmostEqual(note.at_s or -1, 3.4)
+
+    def test_relative_end_does_not_anchor(self) -> None:
+        job = self.context()
+        (note,) = voice_mod.verify_resolved(job, [_entry(
+            raw_text="cut the end of that sentence",
+            heard="cut the end of that sentence",
+            ops=[_op("add_note", text="trim")])])
+        self.assertIsNone(note.at_s)
+
+    def test_shot_lines_name_their_cameras(self) -> None:
+        job = self.context()
+        prompt = voice_mod.resolve_prompt(job, [[voice_mod.Turn(
+            0.0, 1.0, "use the drone camera")]], [None])
+        self.assertIn("Apple iPhone", prompt)
+        self.assertIn("Sony FX3", prompt)
 
 
 if __name__ == "__main__":
