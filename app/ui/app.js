@@ -1109,10 +1109,11 @@
       const chatBox = h("div", { class: "ghost-chat" });
       const planBox = h("div", {});
       const shootBox = h("div", {});
+      const scanBox = h("div", { class: "ghost-scan" });
       const input = h("textarea", { rows: 2, placeholder: "Ask Ghost… e.g. the footage is on the SD card, transfer it to my SSD" });
       const micB = h("button", { class: "icon mic", type: "button", title: "Hold to talk" }, "🎙");
       const volsBox = h("div", { class: "ghost-vols" });
-      let shootDir = "", offTimer = 0, cutTimer = 0;
+      let shootDir = "", offTimer = 0, cutTimer = 0, scanTimer = 0;
       const say = (who, text) => {
         chatBox.append(h("div", { class: `msg ${who === "you" ? "you" : "muse"}` },
           who === "you" ? text : [h("div", { class: "who" }, "Ghost"), h("div", {}, text)]));
@@ -1184,13 +1185,30 @@
           } catch (e) { say("ghost", e.message); transfer.disabled = false; }
         };
         change.onclick = () => { input.focus(); say("ghost", "Tell me what to change — another card, drive or shoot name — and I will re-plan. Nothing has been copied."); };
+        const includeBtn = (j.older_count > 0 && !j.include_all)
+          ? h("button", { type: "button" }, "Include them") : null;
+        if (includeBtn) includeBtn.onclick = async () => {
+          includeBtn.disabled = true;
+          try {
+            const all = await api("/api/offload/plan", {
+              cards: (j.cards || []).map((c) => c.volume),
+              destination: j.destination, project: j.project,
+              include_all: true });
+            say("ghost", all.reply || "Here is the transfer to plan.");
+            renderPlan(all);
+          } catch (e) { say("ghost", e.message); includeBtn.disabled = false; }
+        };
         planBox.replaceChildren(h("div", { class: "box ghost-plan" },
           h("h3", {}, "Transfer plan"),
-          (j.cards || []).map((c) => h("div", { class: "vol" },
-            `${c.name} · ${c.camera} · ${c.clip_count} clips`, h("span", {}, `${gb(c.total_bytes)} · ${day(c.date_start)} – ${day(c.date_end)}`))),
+          (j.cards || []).map((c) => c.skipped
+            ? h("div", { class: "vol skipped" }, `${c.name} · ${c.camera} · skipped`,
+                h("span", {}, `no clips from ${j.shoot_day_label || day(j.shoot_day)}`))
+            : h("div", { class: "vol" },
+                `${c.name} · ${c.camera} · ${c.clip_count} clips`, h("span", {}, `${gb(c.total_bytes)} · ${day(c.date_start)} – ${day(c.date_end)}`))),
           h("div", { class: "vol" }, `To: ${j.shoot_dir}`, h("span", {}, `${gb(j.bytes_to_copy || 0)} to copy · ${gb(j.free_bytes || 0)} free`)),
+          j.older_summary ? h("p", { class: "ghost-older" }, j.older_summary) : null,
           h("p", { class: j.enough_space ? "" : "err" }, j.enough_space ? "Space check passed. Nothing is copied until you transfer." : "Not enough free space on the destination."),
-          h("div", { class: "acts" }, transfer, change)));
+          h("div", { class: "acts" }, transfer, change, includeBtn)));
       }
       function handleAsk(j) {
         if (j.text) say("ghost", `I heard: ${j.text}`);
@@ -1255,16 +1273,37 @@
         try { await api("/api/job/open", { path: v }); location.reload(); }
         catch (e) { say("ghost", e.message); }
       };
+      function renderVolumes(volumes, scans) {
+        volsBox.replaceChildren(h("div", { class: "box" }, h("h3", {}, "Mounted"),
+          (volumes || []).map((v) => h("div", { class: "vol" }, `${v.name} · ${v.kind} ${v.detail || ""}`, h("span", {}, `${gb(v.free_bytes)} free`)))));
+        scanBox.replaceChildren(...(scans || [])
+          .filter((s) => s.state === "scanning")
+          .map((s) => h("div", { class: "ghost-scanline" },
+            `Scanning ${s.name} · ${s.done || 0}/${s.total || 0}`)));
+      }
+      async function pollScans() {
+        if (!scanBox.isConnected) {
+          if (scanTimer) { clearInterval(scanTimer); scanTimer = 0; }
+          return;
+        }
+        try {
+          const j = await api("/api/offload/scans");
+          renderVolumes(j.volumes || [], j.scans || []);
+        } catch { /* engine away; the next tick retries */ }
+      }
       el.append(h("h2", {}, "Import"),
         h("p", { class: "lede" }, "Ghost moves camera cards to your destination drive and verifies every file. Tell it what to copy — nothing is copied until you transfer."),
-        volsBox, chatBox, planBox, shootBox, form,
+        volsBox, scanBox, chatBox, planBox, shootBox, form,
         h("div", { class: "ghost-open" }, openInput, openBtn));
       say("ghost", LIVE ? "Tell me where the footage is — for example, the footage is on the SD card, transfer it to my SSD." : "Ghost needs the engine: run the app server, then ask here.");
       if (LIVE) {
-        api("/api/offload/volumes").then((j) => {
-          volsBox.replaceChildren(h("div", { class: "box" }, h("h3", {}, "Mounted"),
-            (j.volumes || []).map((v) => h("div", { class: "vol" }, `${v.name} · ${v.kind} ${v.detail || ""}`, h("span", {}, `${gb(v.free_bytes)} free`)))));
-        }).catch(() => {});
+        // Warm the scan cache now, so Ghost's answer is near-instant;
+        // the poll also notices a card that appears while we watch.
+        api("/api/offload/volumes")
+          .then((j) => renderVolumes(j.volumes || [], j.scans || []))
+          .catch(() => {});
+        pollScans();
+        scanTimer = setInterval(pollScans, 1200);
       }
     },
     deliver(el) {

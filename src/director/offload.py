@@ -1,12 +1,20 @@
 """Card offload: mounted volumes -> verified copies on the destination drive.
 
 `list_volumes` guesses what each mounted volume is from its layout,
-`scan_card` inventories every camera clip and audio recording on a card,
-`plan_offload` lays out `<destination>/<YYYY-MM-DD> <project>/<camera>/`
-copies (sidecars beside their clips, identical files skipped), and
-`run_offload` copies through `*.part` files that are renamed only after
-a streamed checksum verifies against the source. The source card is
-only ever read. `offload.json` in the shoot folder records every file.
+`scan_card` inventories every camera clip and audio recording on a card
+(cached, keyed by the card's clip files' names, sizes and mtimes, so a
+repeat scan probes only what changed), `plan_offload` lays out
+`<destination>/<YYYY-MM-DD> <project>/<camera>/` copies (sidecars beside
+their clips, identical files skipped), and `run_offload` copies through
+`*.part` files that are renamed only after a streamed checksum verifies
+against the source. The source card is only ever read. `offload.json`
+in the shoot folder records every file.
+
+By default a plan covers only the most recent shoot day found on the
+cards (the local date of each clip's recorded time) and names the
+folder by that day; what was left out rides on the plan so the caller
+can offer to include it. `shoot_date` plans one named day instead and
+`include_all` plans the whole cards.
 
 The Ghost intent parser at the bottom turns a spoken or typed request
 ("the footage is on the SD card, transfer it to my SSD") into the same
@@ -16,7 +24,8 @@ Deterministic code does all file work in both paths.
 
 Built by Muse Code on muse-wonder-1.0 from
 docs/muse-code/OFFLOAD-BRIEF.md, after the owner's review of the app
-on submission day.
+on submission day. Latest-day planning, the scan cache and the
+OFFLOAD-FIX-BRIEF.md fixes are in the same build.
 """
 from __future__ import annotations
 
@@ -26,10 +35,12 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date as _Date
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".mxf"}
@@ -82,6 +93,68 @@ def _parse_iso(value: str | None) -> datetime | None:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt
+
+
+def local_day(moment: datetime | None) -> _Date | None:
+    """The local calendar date of a recorded time (None stays None)."""
+    if moment is None:
+        return None
+    if moment.tzinfo is None:
+        return moment.date()
+    return moment.astimezone().date()
+
+
+def clip_day(clip) -> _Date | None:
+    """The local shoot day of one clip, from its recorded time."""
+    return local_day(getattr(clip, "recorded_at", None))
+
+
+def format_day_short(day: _Date | None) -> str:
+    """Nov 3-style label for one day (empty string for no day)."""
+    if day is None:
+        return ""
+    return f"{day.strftime('%b')} {day.day}"
+
+
+format_day = format_day_short
+
+
+def format_day_range(start: _Date | None, end: _Date | None) -> str:
+    """Oct 19 – Oct 29-style label for a span of days."""
+    if start is None or end is None:
+        return ""
+    if start == end:
+        return format_day_short(start)
+    return f"{format_day_short(start)} – {format_day_short(end)}"
+
+
+def older_summary_text(count: int, start: _Date | None,
+                       end: _Date | None) -> str | None:
+    """The plan card's left-out line, or None when nothing was left out."""
+    if count <= 0:
+        return None
+    span = format_day_range(start, end)
+    clips = f"{count} older clip{'s' if count != 1 else ''}"
+    if span:
+        return f"Also on the cards: {clips}, {span} (not copied)"
+    return f"Also on the cards: {clips} (not copied)"
+
+
+def _parse_day(value) -> _Date | None:
+    """A YYYY-MM-DD string (or a date) as a date; None when unusable."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return local_day(value)
+    if isinstance(value, _Date):
+        return value
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").date()
+    except ValueError:
+        return None
 
 
 @dataclass(slots=True)
@@ -222,6 +295,19 @@ class OffloadPlan:
     date_str: str
     entries: list[PlanEntry] = field(default_factory=list)
     free_bytes: int = 0
+    # Latest-day planning: the day the folder is named by, what was
+    # left out, and which cards had nothing from that day.
+    shoot_day: str = ""
+    include_all: bool = False
+    older_count: int = 0
+    older_bytes: int = 0
+    older_start: str | None = None
+    older_end: str | None = None
+    older_summary: str | None = None
+    skipped_volumes: list[str] = field(default_factory=list)
+    cards_info: list[dict] = field(default_factory=list)
+    selected_count: int = 0
+    total_count: int = 0
 
     @property
     def total_bytes(self) -> int:
@@ -241,6 +327,21 @@ class OffloadPlan:
                 "destination": str(self.destination),
                 "project": self.project, "date": self.date_str,
                 "date_str": self.date_str,
+                "shoot_day": self.shoot_day,
+                "target_date": self.shoot_day,
+                "include_all": self.include_all,
+                "older_count": self.older_count,
+                "excluded_count": self.older_count,
+                "older_bytes": self.older_bytes,
+                "older_start": self.older_start,
+                "older_end": self.older_end,
+                "older_summary": self.older_summary,
+                "skipped_volumes": list(self.skipped_volumes),
+                "skipped_cards": list(self.skipped_volumes),
+                "cards": [dict(c) for c in self.cards_info],
+                "cards_info": [dict(c) for c in self.cards_info],
+                "selected_count": self.selected_count,
+                "total_count": self.total_count,
                 "entries": [e.as_dict() for e in self.entries],
                 "files": [e.as_dict() for e in self.entries],
                 "total_bytes": self.total_bytes,
@@ -592,12 +693,20 @@ _camera_label = suggest_camera_label
 
 # ---------------------------------------------------------- scanning
 
-def scan_card(volume: Path | str) -> CardScan:
-    """Every camera clip and audio recording on a volume (read-only)."""
-    vol = Path(volume)
-    if not vol.exists():
-        raise OffloadError(f"offload: no such card or folder: {vol}")
-    kind, detail = guess_volume_kind(vol)
+_SCAN_CACHE: dict[str, tuple[tuple, "CardScan"]] = {}
+_CLIP_CACHE: dict[tuple[str, int, int], "ClipInfo"] = {}
+_SCAN_LOCK = threading.Lock()
+
+
+def clear_scan_cache() -> None:
+    """Forget every cached scan (tests; a card remounted fresh)."""
+    with _SCAN_LOCK:
+        _SCAN_CACHE.clear()
+        _CLIP_CACHE.clear()
+
+
+def _media_file_list(vol: Path) -> list[Path]:
+    """Camera clips and audio recordings under a volume (walk only)."""
     found: list[Path] = []
     for dirpath, dirnames, filenames in os.walk(vol):
         # Never descend into system/thumbnail trees or hidden folders.
@@ -614,44 +723,120 @@ def scan_card(volume: Path | str) -> CardScan:
                 continue
             found.append(path)
     found.sort(key=lambda p: str(p).lower())
-    clips: list[ClipInfo] = []
-    for path in found:
+    return found
+
+
+def _fingerprint_of(files: list[Path]) -> tuple:
+    """(path, size, mtime_ns) per clip file: the scan cache key."""
+    rows = []
+    for path in files:
         try:
-            size = path.stat().st_size
-            mtime = path.stat().st_mtime
+            st = path.stat()
+            rows.append((str(path), st.st_size, st.st_mtime_ns))
         except OSError:
-            continue
-        sidecars = _find_sidecars(path)
-        probe = _probe_info(path)
-        xml_make = xml_model = ""
-        xml_created: str | None = None
-        sony_xml = find_sidecar(path)
-        if sony_xml is not None:
-            xml_make, xml_model, xml_created = parse_sony_xml(sony_xml)
-        make = probe.get("make") or xml_make
-        model = probe.get("model") or xml_model
-        recorded: datetime | None = None
-        source = "mtime"
-        probe_dt = _parse_iso(probe.get("creation_time"))
-        if probe_dt is not None:
-            recorded, source = probe_dt, "ffprobe"
+            rows.append((str(path), -1, -1))
+    return tuple(rows)
+
+
+def card_fingerprint(volume: Path | str) -> tuple:
+    """The cache key for a volume's current clip files (walk + stat)."""
+    vol = Path(volume)
+    if not vol.exists():
+        return ()
+    return _fingerprint_of(_media_file_list(vol))
+
+
+def _build_clip(path: Path, vol: Path, size: int, mtime: float) -> ClipInfo:
+    """Probe and sidecar facts for one clip file (the expensive step)."""
+    sidecars = _find_sidecars(path)
+    probe = _probe_info(path)
+    xml_make = xml_model = ""
+    xml_created: str | None = None
+    sony_xml = find_sidecar(path)
+    if sony_xml is not None:
+        xml_make, xml_model, xml_created = parse_sony_xml(sony_xml)
+    make = probe.get("make") or xml_make
+    model = probe.get("model") or xml_model
+    recorded: datetime | None = None
+    source = "mtime"
+    probe_dt = _parse_iso(probe.get("creation_time"))
+    if probe_dt is not None:
+        recorded, source = probe_dt, "ffprobe"
+    else:
+        xml_dt = _parse_iso(xml_created)
+        if xml_dt is not None:
+            recorded, source = xml_dt, "xml"
         else:
-            xml_dt = _parse_iso(xml_created)
-            if xml_dt is not None:
-                recorded, source = xml_dt, "xml"
-            else:
-                recorded = datetime.fromtimestamp(mtime, tz=timezone.utc)
-                source = "mtime"
-        clip_kind = "audio" if path.suffix.lower() in AUDIO_EXTENSIONS else "video"
-        label = suggest_camera_label(make, model, vol, path, clip_kind)
-        clips.append(ClipInfo(source=path, size_bytes=size,
-                              duration_s=probe.get("duration_s"),
-                              recorded_at=recorded, time_source=source,
-                              make=make, model=model, camera_label=label,
-                              kind=clip_kind, sidecars=sidecars, volume=vol))
+            recorded = datetime.fromtimestamp(mtime, tz=timezone.utc)
+            source = "mtime"
+    clip_kind = "audio" if path.suffix.lower() in AUDIO_EXTENSIONS else "video"
+    label = suggest_camera_label(make, model, vol, path, clip_kind)
+    return ClipInfo(source=path, size_bytes=size,
+                    duration_s=probe.get("duration_s"),
+                    recorded_at=recorded, time_source=source,
+                    make=make, model=model, camera_label=label,
+                    kind=clip_kind, sidecars=sidecars, volume=vol)
+
+
+def scan_card(volume: Path | str, progress=None) -> CardScan:
+    """Every camera clip and audio recording on a volume (read-only).
+
+    Scans are cached per volume, keyed by the clip files' names, sizes
+    and mtimes: a repeat scan of an unchanged card probes nothing, and
+    after a change only the new or changed clips are probed. The
+    optional progress callable receives {"volume", "name", "done",
+    "total", "file"} dicts as clips are inventoried.
+    """
+    vol = Path(volume)
+    if not vol.exists():
+        raise OffloadError(f"offload: no such card or folder: {vol}")
+    kind, detail = guess_volume_kind(vol)
+    found = _media_file_list(vol)
+    fingerprint = _fingerprint_of(found)
+    total = len(found)
+
+    def emit(done: int, current: str = "") -> None:
+        if progress is None:
+            return
+        event = {"volume": str(vol), "name": vol.name, "done": done,
+                 "total": total, "file": current}
+        try:
+            progress(event)
+        except TypeError:
+            progress(done, total)
+
+    with _SCAN_LOCK:
+        hit = _SCAN_CACHE.get(str(vol))
+    if hit is not None and hit[0] == fingerprint:
+        emit(total)
+        return hit[1]
+    clips: list[ClipInfo] = []
+    for index, path in enumerate(found):
+        try:
+            stat = path.stat()
+            size, mtime_ns = stat.st_size, stat.st_mtime_ns
+            mtime = stat.st_mtime
+        except OSError:
+            emit(index + 1, path.name)
+            continue
+        key = (str(path), size, mtime_ns)
+        with _SCAN_LOCK:
+            clip = _CLIP_CACHE.get(key)
+        if clip is None:
+            clip = _build_clip(path, vol, size, mtime)
+            with _SCAN_LOCK:
+                _CLIP_CACHE[key] = clip
+        clips.append(clip)
+        emit(index + 1, path.name)
     clips.sort(key=lambda c: (c.recorded_at or datetime.max.replace(tzinfo=timezone.utc),
                               str(c.source).lower()))
-    return CardScan(volume=vol, clips=clips, kind=kind, detail=detail)
+    scan = CardScan(volume=vol, clips=clips, kind=kind, detail=detail)
+    with _SCAN_LOCK:
+        _SCAN_CACHE[str(vol)] = (fingerprint, scan)
+    return scan
+
+
+scan_card_cached = scan_card
 
 
 def _as_scan(item) -> CardScan:
@@ -696,16 +881,48 @@ def _human(n: int) -> str:
     return f"{value:.1f} TB"
 
 
-def plan_offload(cards, destination, project: str | None = None) -> OffloadPlan:
-    """Plan copies into <destination>/<date> <project>/<camera label>/."""
+def plan_offload(cards, destination, project: str | None = None,
+                 shoot_date=None, include_all: bool = False) -> OffloadPlan:
+    """Plan copies into <destination>/<date> <project>/<camera label>/.
+
+    By default only the most recent shoot day on the cards is planned
+    (the local date of each clip's recorded time) and the folder is
+    named by that day. `shoot_date` (a date or YYYY-MM-DD) plans that
+    day instead; `include_all` plans every clip. Cards with no clips
+    in scope are listed as skipped on the plan, and the clips left out
+    are counted on it (`older_count`, `older_summary`).
+    """
     dest_root = Path(destination)
     scans = [_as_scan(c) for c in list(cards or [])]
-    all_clips: list[ClipInfo] = []
+    rows: list[tuple[CardScan, ClipInfo, _Date | None]] = []
     for scan in scans:
-        all_clips.extend(scan.clips)
-    times = [c.recorded_at for c in all_clips if c.recorded_at]
-    if times:
-        date_str = min(times).date().isoformat()
+        for clip in scan.clips:
+            rows.append((scan, clip, clip_day(clip)))
+    dated_days = [day for _, _, day in rows if day is not None]
+    target: _Date | None = None
+    if not include_all:
+        if shoot_date is not None:
+            target = _parse_day(shoot_date)
+            if target is None:
+                raise OffloadError(
+                    f"offload: cannot read shoot date {shoot_date!r} "
+                    "(want YYYY-MM-DD)")
+        elif dated_days:
+            target = max(dated_days)
+    if include_all or target is None:
+        selected_rows = list(rows)
+    else:
+        selected_rows = [row for row in rows if row[2] == target]
+    selected_ids = {id(clip) for _, clip, _ in selected_rows}
+    excluded_rows = [row for row in rows if id(row[1]) not in selected_ids]
+    all_clips = [clip for _, clip, _ in selected_rows]
+    older_days = [day for _, _, day in excluded_rows if day is not None]
+    older_start = min(older_days) if older_days else None
+    older_end = max(older_days) if older_days else None
+    if target is not None:
+        date_str = target.isoformat()
+    elif dated_days:
+        date_str = min(dated_days).isoformat()
     else:
         date_str = datetime.now(timezone.utc).date().isoformat()
     project_name = _sanitize_project(project)
@@ -759,10 +976,43 @@ def plan_offload(cards, destination, project: str | None = None) -> OffloadPlan:
                 entry.skipped = True
         except OSError:
             entry.skipped = False
+    # Per-card summary for the plan card: what each card contributes,
+    # and which cards have nothing from the planned day (skipped).
+    cards_info: list[dict] = []
+    skipped_volumes: list[str] = []
+    for scan in scans:
+        mine = [clip for s, clip, _ in selected_rows if s is scan]
+        mine_days = [clip_day(c) for c in mine]
+        mine_days = [d for d in mine_days if d is not None]
+        vol_entries = [e for e in entries
+                       if any(e.source == c.source for c in mine)
+                       or any(e.source == side for c in mine
+                              for side in c.sidecars)]
+        skipped = not mine
+        if skipped:
+            skipped_volumes.append(str(scan.volume))
+        cards_info.append({
+            "volume": str(scan.volume), "name": Path(scan.volume).name,
+            "clip_count": len(mine), "total_clips": len(scan.clips),
+            "total_bytes": sum(e.size_bytes for e in vol_entries),
+            "date_start": min(mine_days).isoformat() if mine_days else None,
+            "date_end": max(mine_days).isoformat() if mine_days else None,
+            "skipped": skipped})
     free = _free_bytes(dest_root)
-    plan = OffloadPlan(shoot_dir=shoot_dir, destination=dest_root,
-                       project=project_name, date_str=date_str,
-                       entries=entries, free_bytes=free)
+    plan = OffloadPlan(
+        shoot_dir=shoot_dir, destination=dest_root,
+        project=project_name, date_str=date_str,
+        entries=entries, free_bytes=free,
+        shoot_day=target.isoformat() if target is not None else date_str,
+        include_all=bool(include_all),
+        older_count=len(excluded_rows),
+        older_bytes=sum(clip.size_bytes for _, clip, _ in excluded_rows),
+        older_start=older_start.isoformat() if older_start else None,
+        older_end=older_end.isoformat() if older_end else None,
+        older_summary=older_summary_text(len(excluded_rows), older_start,
+                                         older_end),
+        skipped_volumes=skipped_volumes, cards_info=cards_info,
+        selected_count=len(selected_rows), total_count=len(rows))
     if plan.bytes_to_copy > free:
         raise OffloadError(
             f"offload: not enough space on {dest_root}: need "
@@ -934,7 +1184,7 @@ GHOST_MODEL = "muse-spark-1.3"
 INTENT_SCHEMA = {
     "type": "object", "additionalProperties": False,
     "required": ["cards", "destination", "project", "make_cut",
-                 "open_job", "confirm", "reply"],
+                 "open_job", "confirm", "reply", "date", "include_all"],
     "properties": {
         "cards": {"type": "array", "items": {"type": "string"}},
         "destination": {"type": "string"},
@@ -943,6 +1193,8 @@ INTENT_SCHEMA = {
         "open_job": {"type": "string"},
         "confirm": {"type": "boolean"},
         "reply": {"type": "string"},
+        "date": {"type": "string"},
+        "include_all": {"type": "boolean"},
     },
 }
 GHOST_DEVELOPER = (
@@ -952,7 +1204,11 @@ GHOST_DEVELOPER = (
     "(path, kind, camera guess, free space) and the request. Choose cards "
     "only from those volumes, choose the destination only from those "
     "volumes, extract any project name the editor gives, and say whether "
-    "they want the cut started afterwards. Reply in one plain sentence. "
+    "they want the cut started afterwards. By default only the most "
+    "recent shoot day on the cards is copied: leave date empty and "
+    "include_all false unless the editor names a shoot date (return it "
+    "as date in YYYY-MM-DD) or asks for everything / all of it (set "
+    "include_all true). Reply in one plain sentence. "
     "Never invent a volume, a path or footage that is not listed."
 )
 
@@ -967,12 +1223,27 @@ class GhostIntent:
     confirm: bool = False
     reply: str = ""
     method: str = "rule"
+    # Which shoot to plan: one named day (YYYY-MM-DD), everything on
+    # the cards, or (both unset) the most recent shoot day.
+    date: str | None = None
+    include_all: bool = False
+
+    @property
+    def everything(self) -> bool:
+        return self.include_all
+
+    @property
+    def shoot_date(self) -> str | None:
+        return self.date
 
     def as_dict(self) -> dict:
         return {"cards": list(self.cards), "destination": self.destination,
                 "project": self.project, "make_cut": self.make_cut,
                 "open_job": self.open_job, "confirm": self.confirm,
-                "reply": self.reply, "method": self.method}
+                "reply": self.reply, "method": self.method,
+                "date": self.date, "shoot_date": self.date,
+                "include_all": self.include_all,
+                "everything": self.include_all}
 
     __getitem__ = lambda self, k: self.as_dict()[k]  # noqa: E731
 
@@ -989,6 +1260,75 @@ def _vol_get(vol, key: str, default=None):
 def _vol_path(vol) -> str:
     value = _vol_get(vol, "path", "")
     return str(value or "")
+
+
+_MONTHS = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+           "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
+_MONTH_RE = r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*"
+
+
+def _request_date(raw: str) -> str | None:
+    """A shoot date named in a request, as YYYY-MM-DD (or None).
+
+    Handles 2026-11-03, "Nov 3", "November 3rd, 2026" and "3 Nov"; a
+    yearless date resolves to its most recent occurrence, since
+    footage being copied was shot in the past. "yesterday" is the
+    calendar day before today. "today" names no date: the default
+    already plans the most recent shoot day, which is what an editor
+    means by today's shoot even when the cards were shot yesterday.
+    """
+    text = raw or ""
+    m = re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", text)
+    if m:
+        try:
+            return datetime(int(m.group(1)), int(m.group(2)),
+                            int(m.group(3))).date().isoformat()
+        except ValueError:
+            return None
+    today = datetime.now().astimezone().date()
+    found: _Date | None = None
+    m = re.search(_MONTH_RE + r"\s+(\d{1,2})(?:st|nd|rd|th)?"
+                  r"(?:\s*,?\s*(\d{4}))?\b", text, re.I)
+    if m:
+        month, day_n = _MONTHS[m.group(1).lower()[:3]], int(m.group(2))
+        year = int(m.group(3)) if m.group(3) else None
+        found = _dated(month, day_n, year, today)
+    if found is None:
+        m = re.search(r"\b(\d{1,2})(?:st|nd|rd|th)?\s+" + _MONTH_RE +
+                      r"(?:\s*,?\s*(\d{4}))?\b", text, re.I)
+        if m:
+            month = _MONTHS[m.group(2).lower()[:3]]
+            year = int(m.group(3)) if m.group(3) else None
+            found = _dated(month, int(m.group(1)), year, today)
+    if found is not None:
+        return found.isoformat()
+    if re.search(r"\byesterday\b", text, re.I):
+        return (today - timedelta(days=1)).isoformat()
+    return None
+
+
+def _dated(month: int, day_n: int, year: int | None,
+           today: _Date) -> _Date | None:
+    try:
+        if year is not None:
+            return _Date(year, month, day_n)
+        candidate = _Date(today.year, month, day_n)
+    except ValueError:
+        return None
+    if candidate > today:
+        try:
+            candidate = _Date(today.year - 1, month, day_n)
+        except ValueError:
+            return None
+    return candidate
+
+
+def wants_everything(low: str) -> bool:
+    """True for "everything" / "all of it" / "include them" phrasings."""
+    return bool(re.search(
+        r"\beverything\b|\ball of it\b|\ball clips\b|\ball the clips\b|"
+        r"\bwhole card|\bentire card|\ball dates\b|"
+        r"\binclude (them|the older|the rest|older)\b", low))
 
 
 def parse_intent_rule(text: str, volumes) -> GhostIntent:
@@ -1069,6 +1409,12 @@ def parse_intent_rule(text: str, volumes) -> GhostIntent:
     make_cut = bool(re.search(
         r"make the cut|start the cut|cut afterwards|then cut|and cut|"
         r"make.*\bcut\b", low))
+    # Scope: everything on the cards, one named day, or (default) the
+    # most recent shoot day, which plan_offload picks after scanning.
+    include_all = wants_everything(low)
+    req_date = None if include_all else _request_date(raw)
+    if include_all and not cards:
+        cards = list(cameras)
     card_paths = [_vol_path(v) for v in cards]
     if card_paths and destination:
         names = ", ".join(str(_vol_get(v, "name", "")) for v in cards)
@@ -1082,7 +1428,8 @@ def parse_intent_rule(text: str, volumes) -> GhostIntent:
         reply = "Tell me which card to copy and where to put it."
     return GhostIntent(cards=card_paths, destination=destination,
                        project=project, make_cut=make_cut, reply=reply,
-                       method="rule")
+                       method="rule", date=req_date,
+                       include_all=include_all)
 
 
 # Aliases: one parser, the spellings callers and tests reach for.
@@ -1132,13 +1479,17 @@ def _intent_from_spark(text: str, volumes) -> GhostIntent | None:
     if dest not in allowed:
         dest = None
     project = (data.get("project") or "").strip() or None
+    spark_date = (data.get("date") or "").strip() or None
+    if spark_date is not None and _parse_day(spark_date) is None:
+        spark_date = None
     return GhostIntent(cards=cards, destination=dest, project=project,
                        make_cut=bool(data.get("make_cut")),
                        open_job=(data.get("open_job") or None),
                        confirm=bool(data.get("confirm")),
                        reply=(data.get("reply") or "").strip()
                        or "Here is the transfer to plan.",
-                       method="spark")
+                       method="spark", date=spark_date,
+                       include_all=bool(data.get("include_all")))
 
 
 def parse_intent(text: str, volumes) -> GhostIntent:

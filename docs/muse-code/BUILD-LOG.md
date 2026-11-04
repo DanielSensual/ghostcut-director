@@ -808,3 +808,47 @@ Muse Code token use: TBD (the owner fills this from the run log).
   134,775,032 B, all verified (independent BLAKE2b re-hash matches),
   `offload.json` written, source mtimes and sizes unchanged. The SSD
   was not written.
+
+## First live run fixes (2026-11-04, `OFFLOAD-FIX-BRIEF.md`)
+
+Built by Muse Code on `muse-wonder-1.0` from
+`docs/muse-code/OFFLOAD-FIX-BRIEF.md`, after the owner's review of
+the app on submission day. Muse Code token use: TBD (the owner fills
+this from the run log).
+
+- **Today's shoot, not the whole card history.** The first live run
+  planned all 115 clips (89.56 GB) because cards hold weeks of shoots.
+  `plan_offload` now plans only the most recent shoot day on the
+  cards (the local date of each clip's recorded time) and names the
+  folder by that day; `shoot_date` plans a named day and
+  `include_all` the whole cards, honoured by the rule parser, the
+  Spark intent (`date` / `include_all` in the schema) and the CLI
+  (`--date` / `--all`). The plan carries what was left out
+  (`older_count`, `older_summary`, per-card `cards_info` with a
+  `skipped` flag), the plan card shows "Also on the cards: … (not
+  copied)" with an **Include them** button that replans over the
+  whole cards, a card with no clips from the day is listed as
+  skipped, and Ghost's sentence names the day and camera: "Found
+  today's shoot (Nov 3): 8 Sony clips, 22.0 GB on Untitled 1."
+- **Readable Transfer button.** The plan card's `.acts button` rule
+  set the muted grey (`rgb(138,147,168)`) over `.primary`'s white,
+  leaving grey text on the orange background. Primary buttons in the
+  plan card now keep their white label (`.ghost-plan .primary`,
+  `.acts button.primary`); Change, Include them, Make the cut and
+  Open job were checked the same way.
+- **Fast answers.** `scan_card` caches per volume, keyed by the clip
+  files' names, sizes and mtimes (`card_fingerprint`,
+  `clear_scan_cache`): a repeat scan probes nothing, and after a
+  change only new or changed clips are probed. The engine scans
+  mounted cards in background threads when the Import tab opens (and
+  when a card appears), reports live progress on
+  `GET /api/offload/scans`, and the Import tab shows "Scanning
+  Untitled 1 · 40/111" until each card is ready, so a request is
+  answered from the warm cache. Nine new offline tests cover the
+  latest-day default, "everything" and a named date, the left-out
+  summary, the skipped card and the cache hit/miss.
+- Live check (read-only, nothing copied): the owner's request now
+  plans only Nov 3 — 8 Sony clips, 22.02 GB on Untitled 1 into
+  `2026-11-03 Shoot`, with Untitled (4 clips, Oct 29) skipped and
+  "Also on the cards: 107 older clips, Oct 19 – Oct 29 (not copied)".
+  A cached replan in the same process took 0.05 s.

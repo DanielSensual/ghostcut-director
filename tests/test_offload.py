@@ -389,5 +389,246 @@ class EngineTests(unittest.TestCase):
                           {"cards": ["/etc"], "destination": str(dest)})
 
 
+def dated_xml(day: str) -> bytes:
+    return SONY_XML.replace(
+        "2024-03-04T05:06:07+00:00", f"{day}T12:00:00+00:00").encode()
+
+
+def dated_card(root: Path, volume: str, clips) -> Path:
+    """A Sony card whose clips were recorded on the given days."""
+    vol = root / volume
+    for name, day, data in clips:
+        write(vol / "PRIVATE" / "M4ROOT" / "CLIP" / name, data)
+        write(vol / "PRIVATE" / "M4ROOT" / "CLIP"
+              / f"{Path(name).stem}M01.XML", dated_xml(day))
+    return vol
+
+
+def two_day_cards(root: Path):
+    card_a = dated_card(root, "CardA", [
+        ("C0001.MP4", "2026-10-19", b"old-one"),
+        ("C0002.MP4", "2026-10-29", b"old-two"),
+        ("C0003.MP4", "2026-11-03", b"new-one"),
+        ("C0004.MP4", "2026-11-03", b"new-two!!"),
+    ])
+    card_b = dated_card(root, "CardB", [
+        ("C0009.MP4", "2026-10-20", b"other-card"),
+    ])
+    dest = root / "dest"
+    dest.mkdir(exist_ok=True)
+    return card_a, card_b, dest
+
+
+class LatestDayTests(unittest.TestCase):
+    def test_latest_day_default_left_out_and_skipped_card(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            card_a, card_b, dest = two_day_cards(Path(td))
+            plan = offload.plan_offload([card_a, card_b], dest)
+            clips = sorted(e.destination.name for e in plan.entries
+                           if not e.is_sidecar)
+            self.assertEqual(clips, ["C0003.MP4", "C0004.MP4"])
+            self.assertEqual(plan.shoot_dir.name, "2026-11-03 Shoot")
+            self.assertEqual(plan.shoot_day, "2026-11-03")
+            self.assertEqual(plan.selected_count, 2)
+            self.assertEqual(plan.older_count, 3)
+            self.assertEqual(
+                plan.older_summary,
+                "Also on the cards: 3 older clips, "
+                "Oct 19 – Oct 29 (not copied)")
+            by_name = {c["name"]: c for c in plan.cards_info}
+            self.assertFalse(by_name["CardA"]["skipped"])
+            self.assertEqual(by_name["CardA"]["clip_count"], 2)
+            self.assertTrue(by_name["CardB"]["skipped"])
+            self.assertEqual(by_name["CardB"]["clip_count"], 0)
+            self.assertIn(str(card_b), plan.skipped_volumes)
+            as_dict = plan.as_dict()
+            self.assertEqual(as_dict["older_summary"], plan.older_summary)
+            self.assertEqual(as_dict["skipped_cards"], [str(card_b)])
+
+    def test_everything_and_a_named_date(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            card_a, card_b, dest = two_day_cards(Path(td))
+            everything = offload.plan_offload([card_a, card_b], dest,
+                                              include_all=True)
+            self.assertEqual(everything.selected_count, 5)
+            self.assertEqual(everything.older_count, 0)
+            self.assertIsNone(everything.older_summary)
+            self.assertTrue(everything.include_all)
+            named = offload.plan_offload([card_a, card_b], dest,
+                                         shoot_date="2026-10-29")
+            self.assertEqual(
+                [e.destination.name for e in named.entries
+                 if not e.is_sidecar], ["C0002.MP4"])
+            self.assertEqual(named.shoot_dir.name, "2026-10-29 Shoot")
+            self.assertEqual(named.older_count, 4)
+            with self.assertRaises(offload.OffloadError):
+                offload.plan_offload([card_a], dest, shoot_date="Nov 3")
+
+
+class IntentScopeTests(unittest.TestCase):
+    def volumes(self):
+        return IntentTests().volumes()
+
+    def test_everything_and_all_of_it(self) -> None:
+        vols = self.volumes()
+        for phrase in ("transfer everything on the SD card to my SSD",
+                       "copy all of it to my SSD",
+                       "include them, transfer the SD card to my SSD"):
+            intent = offload.parse_intent_rule(phrase, vols)
+            self.assertTrue(intent.include_all, phrase)
+            self.assertTrue(intent.everything, phrase)
+            self.assertIsNone(intent.date, phrase)
+
+    def test_a_named_date(self) -> None:
+        vols = self.volumes()
+        iso = offload.parse_intent_rule(
+            "copy the SD card from 2026-11-03 to my SSD", vols)
+        self.assertEqual(iso.date, "2026-11-03")
+        self.assertEqual(iso.shoot_date, "2026-11-03")
+        named = offload.parse_intent_rule(
+            "transfer the Nov 3 shoot to my SSD", vols)
+        self.assertTrue((named.date or "").endswith("-11-03"))
+        self.assertFalse(named.include_all)
+        plain = offload.parse_intent_rule(
+            "the footage is on the SD card, transfer it to my SSD", vols)
+        self.assertIsNone(plain.date)
+        self.assertFalse(plain.include_all)
+
+
+class ScanCacheTests(unittest.TestCase):
+    def setUp(self) -> None:
+        offload.clear_scan_cache()
+
+    def tearDown(self) -> None:
+        offload.clear_scan_cache()
+
+    def test_cache_hit_then_miss_on_change(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            vol = sony_card(Path(td))
+            calls = {"n": 0}
+            real = offload._probe_info
+
+            def counting(path):
+                calls["n"] += 1
+                return real(path)
+
+            with mock.patch.object(offload, "_probe_info", counting):
+                first = offload.scan_card(vol)
+                self.assertEqual(calls["n"], 2)
+                self.assertEqual(len(first.clips), 2)
+                events: list[dict] = []
+                again = offload.scan_card(vol, events.append)
+                self.assertEqual(calls["n"], 2)  # hit: nothing re-probed
+                self.assertEqual(len(again.clips), 2)
+                self.assertEqual(events[-1]["done"], events[-1]["total"])
+                self.assertEqual(events[-1]["total"], 2)
+                write(vol / "PRIVATE" / "M4ROOT" / "CLIP" / "C0003.MP4",
+                      b"clip-three")
+                write(vol / "PRIVATE" / "M4ROOT" / "CLIP" / "C0003M01.XML",
+                      SONY_XML.encode())
+                grown = offload.scan_card(vol)
+                self.assertEqual(calls["n"], 3)  # only the new clip
+                self.assertEqual(len(grown.clips), 3)
+                big = vol / "PRIVATE" / "M4ROOT" / "CLIP" / "C0001.MP4"
+                big.write_bytes(b"clip-one-bytes-but-longer")
+                offload.scan_card(vol)
+                self.assertEqual(calls["n"], 4)  # changed clip re-probed
+
+    def test_fingerprint_tracks_the_file_list(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            vol = sony_card(Path(td))
+            before = offload.card_fingerprint(vol)
+            self.assertEqual(len(before), 2)
+            write(vol / "PRIVATE" / "M4ROOT" / "CLIP" / "C0003.MP4", b"x")
+            self.assertNotEqual(offload.card_fingerprint(vol), before)
+
+
+class GhostPlanTests(unittest.TestCase):
+    def post(self, eng, path, body):
+        handler = engine.Handler.__new__(engine.Handler)
+        handler.engine = eng
+        return handler._post(path, body or {})
+
+    def engine_with_cards(self, root: Path):
+        vols = root / "volumes"
+        new_card, old_card, _ = two_day_cards(vols)
+        dest = vols / "Extreme SSD"
+        dest.mkdir(parents=True, exist_ok=True)
+        demo = root / "demo"
+        demo.mkdir()
+        eng = engine.Engine(demo, render=FakeRender())
+        eng._offload_root = vols
+        return eng, new_card, old_card, dest
+
+    def test_ghost_sentence_plan_card_and_include_them(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            eng, new_card, old_card, dest = self.engine_with_cards(Path(td))
+            asked = eng.offload_ask(
+                "the footage is on the SD card, transfer it to my SSD")
+            self.assertTrue(
+                asked["reply"].startswith("Found today's shoot (Nov 3):"),
+                asked["reply"])
+            self.assertIn("Sony clips", asked["reply"])
+            self.assertIn("CardA", asked["reply"])
+            self.assertTrue(asked["shoot_dir"].endswith("2026-11-03 Shoot"))
+            by_name = {c["name"]: c for c in asked["cards"]}
+            self.assertEqual(by_name["CardA"]["clip_count"], 2)
+            self.assertFalse(by_name["CardA"]["skipped"])
+            self.assertTrue(by_name["CardB"]["skipped"])
+            self.assertEqual(
+                asked["older_summary"],
+                "Also on the cards: 3 older clips, "
+                "Oct 19 – Oct 29 (not copied)")
+            # Include them: the same plan over the whole cards.
+            included = self.post(
+                eng, "/api/offload/plan",
+                {"cards": [str(new_card), str(old_card)],
+                 "destination": str(dest), "include_all": True})
+            self.assertEqual(included["older_count"], 0)
+            self.assertIsNone(included["older_summary"])
+            self.assertIn("everything", included["reply"])
+            self.assertEqual(
+                len([e for e in included["entries"]
+                     if not e["is_sidecar"]]), 5)
+            # A named date plans that day instead.
+            named = eng.offload_plan([str(new_card), str(old_card)],
+                                     str(dest), shoot_date="2026-10-29")
+            self.assertIn("Oct 29", named["reply"])
+            self.assertTrue(named["shoot_dir"].endswith("2026-10-29 Shoot"))
+
+    def test_background_scan_reaches_ready_and_stays_cached(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            eng, new_card, old_card, dest = self.engine_with_cards(Path(td))
+            eng.offload_volumes()  # Import opens: scans start
+            scans = {}
+            for _ in range(200):
+                scans = {s["name"]: s
+                         for s in eng.offload_scans()["scans"]}
+                if scans and all(s["state"] == "ready"
+                                 for s in scans.values()):
+                    break
+                time.sleep(0.02)
+            self.assertEqual(scans["CardA"]["state"], "ready")
+            self.assertEqual(scans["CardA"]["clip_count"], 4)
+            self.assertEqual(scans["CardB"]["clip_count"], 1)
+            again = {s["name"]: s for s in eng.offload_scans()["scans"]}
+            self.assertEqual(again["CardA"]["state"], "ready")
+
+
+class GhostUiTests(unittest.TestCase):
+    def test_plan_card_buttons_and_scanning_line_are_wired(self) -> None:
+        js = (ROOT / "app" / "ui" / "app.js").read_text()
+        css = (ROOT / "app" / "ui" / "app.css").read_text()
+        self.assertIn("Include them", js)
+        self.assertIn("Scanning ", js)
+        self.assertIn("/api/offload/scans", js)
+        self.assertIn("older_summary", js)
+        # The Transfer button keeps its white label on the orange
+        # primary background inside the plan card's action row.
+        self.assertIn(".ghost-plan .primary", css)
+        self.assertIn(".acts button.primary", css)
+        self.assertTrue(hasattr(engine.Engine, "offload_scans"))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -891,15 +891,24 @@ def command_offload(args: argparse.Namespace) -> dict:
             raise ValueError("offload: no destination drive found; pass --to DEST")
         dest = dests[0].path
     scans = [offload_mod.scan_card(c) for c in cards]
-    plan = offload_mod.plan_offload(scans, dest, project=args.project)
-    for scan in scans:
-        lo, hi = scan.date_range
-        span = ""
-        if lo and hi:
-            span = f", {lo.date().isoformat()} to {hi.date().isoformat()}"
-        gb = scan.total_bytes / 1e9
-        print(f"{scan.volume.name} ({scan.detail or scan.kind}): "
-              f"{len(scan.clips)} clips, {gb:.2f} GB{span}")
+    plan = offload_mod.plan_offload(
+        scans, dest, project=args.project,
+        shoot_date=getattr(args, "date", None),
+        include_all=bool(getattr(args, "all", False)))
+    by_volume = {str(s.volume): s for s in scans}
+    for info in plan.cards_info:
+        scan = by_volume.get(str(info.get("volume")))
+        detail = (scan.detail or scan.kind) if scan else ""
+        name = Path(str(info.get("volume"))).name
+        if info.get("skipped"):
+            print(f"{name} ({detail}): skipped — no clips from "
+                  f"{plan.shoot_day}")
+        else:
+            gb = int(info.get("total_bytes") or 0) / 1e9
+            print(f"{name} ({detail}): {info.get('clip_count')} clips, "
+                  f"{gb:.2f} GB")
+    if plan.older_summary:
+        print(plan.older_summary)
     print(f"Destination: {plan.shoot_dir} "
           f"({plan.bytes_to_copy / 1e9:.2f} GB to copy, "
           f"{plan.free_bytes / 1e9:.2f} GB free)")
@@ -1247,6 +1256,12 @@ def build_parser() -> argparse.ArgumentParser:
                                      "(default: the mounted destination drive)")
     offload_parser.add_argument("--project", default=None,
                                 help="Shoot name for the dated destination folder")
+    offload_parser.add_argument("--date", default=None, metavar="YYYY-MM-DD",
+                                help="Plan this shoot day (default: the most "
+                                     "recent day on the cards)")
+    offload_parser.add_argument("--all", action="store_true",
+                                help="Plan every clip on the cards, not just "
+                                     "the most recent shoot day")
     offload_parser.add_argument("--yes", action="store_true",
                                 help="Copy without asking to confirm")
     offload_parser.set_defaults(func=command_offload)

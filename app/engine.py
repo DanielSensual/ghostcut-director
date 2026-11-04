@@ -93,6 +93,9 @@ class Engine:
         self._offload_intent: dict | None = None
         self._offload_progress: dict = {}
         self._offload_root: Path | None = None
+        self._scan_lock = threading.Lock()
+        self._scan_states: dict[str, dict] = {}
+        self._scan_threads: dict[str, threading.Thread] = {}
         self._cut_bg_state: dict = {"state": "idle", "message": ""}
         self._cut_bg_thread: threading.Thread | None = None
         self._render_cookie: tuple = ()
@@ -506,27 +509,205 @@ class Engine:
         root = getattr(self, "_offload_root", None)
         return mod.list_volumes(root) if root is not None else mod.list_volumes()
 
-    def offload_volumes(self) -> dict:
-        return {"volumes": [v.as_dict() for v in self._volumes()]}
+    # ----- background card scans: warm the cache before Ghost is asked -----
 
-    def _plan_card(self, scans, plan, intent: dict) -> dict:
+    def _scan_public(self) -> list[dict]:
+        with self._scan_lock:
+            return [{"volume": s["volume"], "name": s["name"],
+                     "state": s["state"], "done": s.get("done", 0),
+                     "total": s.get("total", 0),
+                     "clip_count": s.get("clip_count", 0),
+                     "total_bytes": s.get("total_bytes", 0),
+                     "message": s.get("message", "")}
+                    for s in self._scan_states.values()]
+
+    def _start_background_scans(self) -> None:
+        """Scan mounted camera cards in the background (Import opens).
+
+        Each card's scan is cached in director.offload keyed by its
+        clip files' names, sizes and mtimes, so a ready card is only
+        re-scanned when its files changed; a card that appears starts
+        scanning on the next volumes/scans call.
+        """
+        mod = self._offload()
+        for vol in self._volumes():
+            if vol.kind != mod.KIND_CAMERA:
+                continue
+            key = str(vol.path)
+            worker = None
+            with self._scan_lock:
+                live = self._scan_threads.get(key)
+                if live is not None and live.is_alive():
+                    continue
+                state = self._scan_states.get(key)
+                if state is not None and state.get("state") == "ready":
+                    try:
+                        changed = (mod.card_fingerprint(vol.path)
+                                   != state.get("_fingerprint"))
+                    except Exception:  # noqa: BLE001 - rescan on doubt
+                        changed = True
+                    if not changed:
+                        continue
+                self._scan_states[key] = {
+                    "volume": key, "name": vol.name, "state": "scanning",
+                    "done": 0, "total": 0, "clip_count": 0,
+                    "total_bytes": 0, "message": ""}
+                worker = threading.Thread(
+                    target=self._scan_worker, args=(key,),
+                    name=f"offload-scan-{vol.name}", daemon=True)
+                self._scan_threads[key] = worker
+            if worker is not None:
+                worker.start()
+
+    def _scan_worker(self, key: str) -> None:
+        mod = self._offload()
+
+        def progress(event: dict) -> None:
+            with self._scan_lock:
+                state = self._scan_states.get(key)
+                if state is not None:
+                    state["done"] = int(event.get("done") or 0)
+                    state["total"] = int(event.get("total") or 0)
+                    state["state"] = "scanning"
+
+        try:
+            scan = mod.scan_card(Path(key), progress)
+            fingerprint = mod.card_fingerprint(Path(key))
+            with self._scan_lock:
+                state = self._scan_states.get(key) or {
+                    "volume": key, "name": Path(key).name}
+                state.update({"state": "ready", "done": len(scan.clips),
+                              "total": len(scan.clips),
+                              "clip_count": len(scan.clips),
+                              "total_bytes": scan.total_bytes,
+                              "message": "", "_fingerprint": fingerprint})
+                self._scan_states[key] = state
+        except Exception as e:  # noqa: BLE001 - scans endpoint reports it
+            with self._scan_lock:
+                state = self._scan_states.get(key) or {
+                    "volume": key, "name": Path(key).name}
+                state.update({"state": "error",
+                              "message": f"{type(e).__name__}: {e}"})
+                self._scan_states[key] = state
+
+    def offload_scans(self) -> dict:
+        """Live scan progress per mounted card (the Scanning line)."""
+        self._start_background_scans()
+        vols = self._volumes()
+        current = {str(v.path) for v in vols
+                   if v.kind == self._offload().KIND_CAMERA}
+        scans = [s for s in self._scan_public()
+                 if s["volume"] in current]
+        return {"scans": scans,
+                "volumes": [v.as_dict() for v in vols]}
+
+    def _get_scan(self, path: Path):
+        """A card's scan: the background one when it is running or done."""
+        mod = self._offload()
+        key = str(Path(path))
+        with self._scan_lock:
+            worker = self._scan_threads.get(key)
+        if worker is not None and worker.is_alive():
+            worker.join()
+        return mod.scan_card(Path(path))
+
+    def offload_volumes(self) -> dict:
+        self._start_background_scans()
+        return {"volumes": [v.as_dict() for v in self._volumes()],
+                "scans": self._scan_public()}
+
+    def _shoot_sentence(self, scans, plan, named: bool) -> str:
+        """Ghost's one sentence, naming the day and the camera(s)."""
+        from datetime import date as _date
+
+        mod = self._offload()
+        skipped = set(plan.skipped_volumes)
+        included = [s for s in scans if str(s.volume) not in skipped]
+        names = ", ".join(Path(s.volume).name for s in included)
+        count = plan.selected_count
+        nbytes = sum(e.size_bytes for e in plan.entries
+                     if not e.is_sidecar)
+        try:
+            day = _date.fromisoformat(plan.shoot_day or plan.date_str)
+            label = mod.format_day_short(day)
+        except ValueError:
+            label = plan.shoot_day or plan.date_str
+        if count == 0:
+            return (f"No clips from {label} on {names or 'those cards'} — "
+                    "ask for everything to copy the whole cards.")
+        cameras: list[str] = []
+        for scan in included:
+            cam = scan.detail or ""
+            if not cam:
+                labels = sorted({e.camera_label for e in plan.entries
+                                 if not e.is_sidecar
+                                 and Path(e.source).is_relative_to(scan.volume)})
+                cam = ", ".join(labels)
+            if cam and cam not in cameras:
+                cameras.append(cam)
+        if len(cameras) == 1:
+            clips = f"{count} {cameras[0]} clips"
+        elif cameras:
+            clips = f"{count} clips ({', '.join(cameras)})"
+        else:
+            clips = f"{count} clips"
+        size = f"{nbytes / 1e9:.1f} GB"
+        if plan.include_all:
+            return f"Found everything on the cards: {clips}, {size} on {names}."
+        if named:
+            return f"Found the {label} shoot: {clips}, {size} on {names}."
+        return f"Found today's shoot ({label}): {clips}, {size} on {names}."
+
+    def _plan_card(self, scans, plan, intent: dict, reply: str = "") -> dict:
+        by_volume = {str(s.volume): s for s in scans}
         cards = []
-        for scan in scans:
-            lo, hi = scan.date_range
-            cards.append({"volume": str(scan.volume),
-                          "name": Path(scan.volume).name,
-                          "kind": scan.kind, "detail": scan.detail,
-                          "camera": scan.detail or scan.kind,
-                          "clip_count": len(scan.clips),
-                          "total_bytes": scan.total_bytes,
-                          "gb": round(scan.total_bytes / 1e9, 3),
-                          "date_start": lo.isoformat() if lo else None,
-                          "date_end": hi.isoformat() if hi else None})
-        return {"intent": intent, "reply": intent.get("reply", ""),
+        infos = plan.cards_info or [
+            {"volume": str(s.volume), "clip_count": len(s.clips),
+             "total_clips": len(s.clips), "total_bytes": s.total_bytes,
+             "date_start": (s.date_range[0].isoformat()
+                            if s.date_range[0] else None),
+             "date_end": (s.date_range[1].isoformat()
+                          if s.date_range[1] else None),
+             "skipped": False} for s in scans]
+        for info in infos:
+            scan = by_volume.get(str(info.get("volume")))
+            total_bytes = int(info.get("total_bytes") or 0)
+            cards.append({
+                "volume": str(info.get("volume")),
+                "name": (Path(str(info.get("volume"))).name
+                         if info.get("volume") else ""),
+                "kind": scan.kind if scan else "",
+                "detail": scan.detail if scan else "",
+                "camera": (scan.detail or scan.kind) if scan else "",
+                "clip_count": int(info.get("clip_count") or 0),
+                "total_clips": int(info.get("total_clips")
+                                   or info.get("clip_count") or 0),
+                "total_bytes": total_bytes,
+                "gb": round(total_bytes / 1e9, 3),
+                "date_start": info.get("date_start"),
+                "date_end": info.get("date_end"),
+                "skipped": bool(info.get("skipped"))})
+        from datetime import date as _date
+
+        try:
+            day_label = self._offload().format_day_short(
+                _date.fromisoformat(plan.shoot_day or plan.date_str))
+        except ValueError:
+            day_label = plan.shoot_day or plan.date_str
+        return {"intent": intent, "reply": reply or intent.get("reply", ""),
                 "cards": cards,
                 "destination": str(plan.destination),
                 "shoot_dir": str(plan.shoot_dir),
                 "project": plan.project, "date": plan.date_str,
+                "shoot_day": plan.shoot_day or plan.date_str,
+                "shoot_day_label": day_label,
+                "include_all": bool(plan.include_all),
+                "older_count": plan.older_count,
+                "older_bytes": plan.older_bytes,
+                "older_start": plan.older_start,
+                "older_end": plan.older_end,
+                "older_summary": plan.older_summary,
+                "skipped_cards": [c["name"] for c in cards if c["skipped"]],
                 "total_bytes": plan.total_bytes,
                 "bytes_to_copy": plan.bytes_to_copy,
                 "free_bytes": plan.free_bytes,
@@ -535,7 +716,9 @@ class Engine:
                 "volumes": [v.as_dict() for v in self._volumes()]}
 
     def _make_plan(self, card_paths: list[str], destination: str,
-                   project: str | None, intent: dict) -> dict:
+                   project: str | None, intent: dict,
+                   shoot_date: str | None = None,
+                   include_all: bool = False) -> dict:
         mod = self._offload()
         if not card_paths:
             raise ValueError("offload: no camera card in that request")
@@ -543,9 +726,16 @@ class Engine:
             raise ValueError("offload: no destination drive in that request")
         cards = [self._allowed_path(p) for p in card_paths]
         dest = self._allowed_path(destination)
+        want_all = bool(include_all or intent.get("include_all")
+                        or intent.get("everything"))
+        want_date = shoot_date or intent.get("date") or intent.get("shoot_date")
+        if want_all:
+            want_date = None
         try:
-            scans = [mod.scan_card(c) for c in cards]
-            plan = mod.plan_offload(scans, dest, project=project)
+            scans = [self._get_scan(c) for c in cards]
+            plan = mod.plan_offload(scans, dest, project=project,
+                                    shoot_date=want_date,
+                                    include_all=want_all)
         except mod.OffloadError as e:
             raise ValueError(str(e)) from e
         self._offload_plan = plan
@@ -554,7 +744,8 @@ class Engine:
                                "message": f"Ready to copy to {plan.shoot_dir}",
                                "shoot_dir": str(plan.shoot_dir)}
         self._offload_progress = {}
-        return self._plan_card(scans, plan, intent)
+        reply = self._shoot_sentence(scans, plan, named=bool(want_date))
+        return self._plan_card(scans, plan, intent, reply=reply)
 
     def offload_ask(self, text: str) -> dict:
         mod = self._offload()
@@ -579,7 +770,9 @@ class Engine:
             return {"intent": data, "reply": intent.reply,
                     "volumes": [v.as_dict() for v in vols]}
         return self._make_plan(list(intent.cards), str(intent.destination),
-                               intent.project, data)
+                               intent.project, data,
+                               shoot_date=intent.date,
+                               include_all=intent.include_all)
 
     def _resolve_open_job(self, wanted: str) -> Path:
         if wanted and wanted != "yesterday":
@@ -608,13 +801,20 @@ class Engine:
         return candidates[0]
 
     def offload_plan(self, cards: list, destination: str,
-                     project: str | None = None) -> dict:
+                     project: str | None = None,
+                     shoot_date: str | None = None,
+                     include_all: bool = False) -> dict:
         intent = {"cards": [str(c) for c in (cards or [])],
                   "destination": destination, "project": project,
                   "make_cut": False, "open_job": None, "confirm": False,
-                  "reply": "Here is the transfer to plan.", "method": "explicit"}
+                  "reply": "Here is the transfer to plan.", "method": "explicit",
+                  "date": shoot_date, "shoot_date": shoot_date,
+                  "include_all": bool(include_all),
+                  "everything": bool(include_all)}
         return self._make_plan([str(c) for c in (cards or [])],
-                               str(destination or ""), project, intent)
+                               str(destination or ""), project, intent,
+                               shoot_date=shoot_date,
+                               include_all=include_all)
 
     def offload_start(self) -> dict:
         plan = self._offload_plan
@@ -1067,6 +1267,8 @@ class Handler(SimpleHTTPRequestHandler):
             return self._call(self.engine.cutjob_status)
         if url.path == "/api/offload/volumes":
             return self._call(self.engine.offload_volumes)
+        if url.path == "/api/offload/scans":
+            return self._call(self.engine.offload_scans)
         if url.path == "/api/offload/status":
             return self._call(self.engine.offload_status)
         if url.path == "/api/offload/cut/status":
@@ -1186,9 +1388,14 @@ class Handler(SimpleHTTPRequestHandler):
                 raise ValueError("Empty request")
             return e.offload_ask(text)
         if path == "/api/offload/plan":
-            return e.offload_plan(list(body.get("cards") or []),
-                                  str(body.get("destination") or ""),
-                                  body.get("project"))
+            return e.offload_plan(
+                list(body.get("cards") or []),
+                str(body.get("destination") or ""),
+                body.get("project"),
+                shoot_date=(body.get("shoot_date") or body.get("date")),
+                include_all=bool(body.get("include_all")
+                                  or body.get("everything")
+                                  or body.get("include_older")))
         if path == "/api/offload/start":
             return e.offload_start()
         if path == "/api/offload/voice":
