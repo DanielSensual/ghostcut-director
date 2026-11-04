@@ -261,10 +261,18 @@ class Engine:
         self.proposals[pid] = {"kind": "voice", "request": request, "ops": flat,
                                "notes": payload.get("notes", []), "usd": payload.get("spend_usd", 0.0),
                                "gen": self.gen, "tighten_sha": self._tighten_sha()}
-        cached = any("cache" in str(w) for w in payload.get("warnings", []))
-        out = {"id": pid, "reply": f"Heard {len(payload.get('notes', []))} note(s)", "answers": [],
+        warnings = [str(w) for w in payload.get("warnings", []) or []]
+        cached = any("cache" in w for w in warnings)
+        reply = f"Heard {len(payload.get('notes', []))} note(s)"
+        # Muse down (402 / network): the notes were heard by local Whisper and/or resolved by the
+        # offline rules. Say so on the card (model line + reply) instead of failing the request.
+        offline = [w for w in warnings if w.startswith("Muse unavailable")]
+        if offline:
+            reply = f"{reply} · {' · '.join(offline)}"
+        model = "offline rules (Muse unavailable)" if payload.get("resolver") == "rules" else VOICE_MODEL
+        out = {"id": pid, "reply": reply, "answers": [], "warnings": warnings,
                "ops": flat, "notes": payload.get("notes", []), "engine": payload.get("engine", ""),
-               "usd": payload.get("spend_usd", 0.0), "cached": cached, "model": VOICE_MODEL}
+               "usd": payload.get("spend_usd", 0.0), "cached": cached, "model": model}
         # Heard-but-unresolvable: the card shows the heard text with the error.
         if payload.get("error"):
             out["error"] = str(payload["error"])
@@ -1017,8 +1025,9 @@ class Engine:
         wav = dest / f"{saved.stem}.wav"
         _run(vm.extract_audio_command(saved, wav))
         try:
+            heard_warnings: list[str] = []
             turns, _engine, _spend = vm.transcribe_wav(
-                wav, duration_s=duration, work_dir=dest)
+                wav, duration_s=duration, work_dir=dest, warnings=heard_warnings)
         except vm.VoiceError as e:
             raise ValueError(str(e)) from e
         text = " ".join(t.text for t in turns).strip()
@@ -1026,6 +1035,8 @@ class Engine:
             raise ValueError("offload: I didn't hear any speech in that recording")
         planned = self.offload_ask(text)
         planned["text"] = text
+        if heard_warnings:
+            planned["warnings"] = list(planned.get("warnings", []) or []) + heard_warnings
         return planned
 
     def cutjob_status(self) -> dict:

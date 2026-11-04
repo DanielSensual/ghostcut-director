@@ -433,12 +433,17 @@ def _whisper_turns(wav: Path) -> list[Turn]:
 
 def transcribe_wav(wav: Path, *, duration_s: float,
                    allow_whisper: bool = True,
-                   work_dir: Path | None = None) -> tuple[list[Turn], str, float]:
+                   work_dir: Path | None = None,
+                   warnings: list[str] | None = None
+                   ) -> tuple[list[Turn], str, float]:
     """(turns, engine, spend_usd); engine is "meta" or "whisper".
 
     The Meta path reuses `transcribe.diarize_chunk` (single call up to
     CHUNK_MAX_S, silence-chunked above that). Any Meta failure falls to
-    local Whisper when `allow_whisper`; with neither available the §4.2
+    local Whisper when `allow_whisper` — at once, no retries (a 402 is
+    answered immediately and the transcribe call has none) — and, when
+    a `warnings` list is passed, says why: "Muse unavailable (402),
+    heard with local Whisper". With neither available the §4.2
     VoiceError names both.
     """
     wav = Path(wav)
@@ -461,7 +466,7 @@ def transcribe_wav(wav: Path, *, duration_s: float,
             f"({meta_error}); drop --no-whisper for the local Whisper "
             "fallback, or type the note instead") from meta_error
     try:
-        return _whisper_turns(wav), "whisper", 0.0
+        heard = _whisper_turns(wav)
     except VoiceError as error:
         if "not on PATH" in str(error):
             raise VoiceError(
@@ -475,6 +480,11 @@ def transcribe_wav(wav: Path, *, duration_s: float,
         raise VoiceError(
             f"voice: local Whisper failed ({error}); check the recording "
             "or type the note instead") from error
+    if warnings is not None:
+        reason = (muse_unavailable_reason(meta_error)
+                  or type(meta_error).__name__)
+        warnings.append(WHISPER_FALLBACK_WARNING.format(reason=reason))
+    return heard, "whisper", 0.0
 
 
 # ------------------------------------------------- job context (§6.2)
@@ -1894,6 +1904,383 @@ def _assemble_entries(groups: list[list[Turn]], anchors: list[float | None],
     return out
 
 
+# ------------------------------------------------- offline resolver (VOICE-OFFLINE)
+#
+# Built by Claude Code (Opus) after the Meta API credit ran out. When
+# the Spark call fails for billing or network reasons (or guestlist is
+# not installed), notes are read by the rules below instead. They emit
+# reply notes in exactly the RESOLVE_SCHEMA shape, so `_assemble_entries`
+# and `verify_resolved` do the real work: quoted-phrase matching,
+# "both/all/every", word ranges, cut-edge and camera anchors, checks.
+# Muse stays primary; this runs only when it cannot be reached.
+
+OFFLINE_HELP_MESSAGE = (
+    "I couldn't understand that note without Muse; try: cut where I say "
+    "… / remove … / use camera B here / use the drone at the very start")
+OFFLINE_WARNING = ("Muse unavailable ({reason}), resolved offline by rules "
+                   "— check each change before accepting")
+WHISPER_FALLBACK_WARNING = "Muse unavailable ({reason}), heard with local Whisper"
+OFFLINE_CONFIDENCE = 0.8
+
+_HTTP_CODE_RE = re.compile(r"\b(?:HTTP|status(?: code)?|Error code:?)\s*(\d{3})\b",
+                           re.IGNORECASE)
+_BILLING_RE = re.compile(
+    r"billing|payment required|insufficient[_ ](?:quota|funds|credit)|"
+    r"credit balance|out of credit|quota exceeded", re.IGNORECASE)
+_NETWORK_NAMES = ("connect", "timeout", "timedout", "network", "dns",
+                  "remoteprotocol", "readerror", "writeerror")
+
+
+def muse_unavailable_reason(error: BaseException) -> str | None:
+    """Why Muse cannot be reached ("402", "HTTP 503", "network", ...), or
+    None when the failure is something else (a bad reply, a bug). Pure.
+
+    Billing, auth, rate-limit, server and connection failures, a missing
+    key, the spend hard stop and a missing guestlist all count: none of
+    them gets better by asking again during a demo.
+    """
+    if isinstance(error, (ImportError, VoiceUnavailable)):
+        return "no Meta client"
+    if type(error).__name__ == "MuseUnavailable":
+        return "no Meta client"
+    text = f"{type(error).__name__}: {error}"
+    code = getattr(error, "status_code", None)
+    if not isinstance(code, int):
+        response = getattr(error, "response", None)
+        code = getattr(response, "status_code", None)
+    if not isinstance(code, int):
+        found = _HTTP_CODE_RE.search(text)
+        code = int(found.group(1)) if found else None
+    if code == 402 or _BILLING_RE.search(text):
+        return "402"
+    if isinstance(code, int) and (code in (401, 403, 408, 429)
+                                  or code >= 500):
+        return f"HTTP {code}"
+    if type(error).__name__ == "BudgetExceeded":
+        return "spend hard stop"
+    if "MODEL_API_KEY" in text:
+        return "no API key"
+    name = type(error).__name__.lower()
+    if isinstance(error, (ConnectionError, TimeoutError)) or any(
+            part in name for part in _NETWORK_NAMES):
+        return "network"
+    if isinstance(error, OSError):
+        return "network"
+    return None
+
+
+_ALIAS_BY_STEM = (
+    (re.compile(r"^dji[_-]", re.IGNORECASE), ("drone", "dji")),
+    (re.compile(r"^(?:c\d{4}|dsc\d+|a\d{3}_c\d+)", re.IGNORECASE),
+     ("sony",)),
+    (re.compile(r"^img[_-]?\d+", re.IGNORECASE), ("iphone", "phone")),
+    (re.compile(r"^(?:gopr|gx\d+|gh\d+)", re.IGNORECASE), ("gopro",)),
+)
+_ALIAS_BY_MAKE = {
+    "dji": ("drone", "dji"), "sony": ("sony",), "apple": ("iphone", "phone"),
+    "gopro": ("gopro",), "canon": ("canon",), "blackmagic": ("blackmagic",),
+}
+
+
+def camera_aliases(job: JobContext) -> dict[str, list[str]]:
+    """Camera label (only labels that appear in the cut's shots) to the
+    phrases an editor uses for it: "camera B", make, model, and what the
+    file name gives away (DJI_ -> drone, C0001 -> Sony, IMG_ -> iPhone).
+    Pure."""
+    used = _shot_cameras(job)
+    out: dict[str, list[str]] = {}
+    for item in job.sync.get("clips", []) or []:
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get("label") or "")
+        if not label or label not in used:
+            continue
+        cam = item.get("camera") or {}
+        names: list[str] = []
+        for key in ("make", "model"):
+            value = str(cam.get(key) or "").strip().lower()
+            if value:
+                names.append(value)
+                names.extend(_ALIAS_BY_MAKE.get(value, ()))
+        stem = Path(str(cam.get("path") or "")).name
+        for pattern, aliases in _ALIAS_BY_STEM:
+            if pattern.search(stem):
+                names.extend(aliases)
+        if len(label) > 1:
+            names.append(label.lower())
+        out[label] = list(dict.fromkeys(n for n in names if n))
+    for label in used:
+        out.setdefault(label, [label.lower()] if len(label) > 1 else [])
+    return out
+
+
+def _camera_in_text(job: JobContext, text: str) -> str | None:
+    """The camera label a clause names ("camera B", "the drone", "the
+    Sony"), or None. A single-letter label only counts as "camera B",
+    "angle B", "cam B" or "B camera" — never the B in "B-roll". Pure."""
+    lowered = (text or "").lower()
+    for label, names in camera_aliases(job).items():
+        if len(label) <= 2:
+            letter = re.escape(label.lower())
+            if re.search(rf"\b(?:camera|cam|angle|shot)\s+{letter}\b"
+                         rf"|\b{letter}[\s-](?:camera|cam|angle)\b",
+                         lowered):
+                return label
+        for name in names:
+            if re.search(rf"\b{re.escape(name)}\b", lowered):
+                return label
+    return None
+
+
+_SAY_RE = re.compile(
+    r"\b(?:where|when|the (?:part|bit|line|places?|spots?|moments?|times?) "
+    r"(?:where|when)|places? where|times? where)?\s*"
+    r"(?:i|we|you|he|she)\s+(?:say|said|says|mention|mentioned|"
+    r"talk about|talked about|talking about)\b\s*[:,]?\s*(.+)$",
+    re.IGNORECASE)
+_MENTION_RE = re.compile(
+    r"\b(?:every|each|all|both)?\s*(?:mentions?|instances?|times?) of\s+"
+    r"(.+)$", re.IGNORECASE)
+_CUT_VERB_RE = re.compile(
+    r"\b(?:cut|remove|drop|lose|delete|trim|take out|get rid of|kill)\b"
+    r"\s*(?:out\s+)?(.*)$", re.IGNORECASE)
+_ANGLE_VERB_RE = re.compile(
+    r"\b(?:use|switch|go|cut to|change to|show|put|give me|open on|"
+    r"start on|end on|stay on|camera|angle)\b", re.IGNORECASE)
+_PAUSE_RE = re.compile(r"\bpauses?\b|\bgaps?\b|\bdead air\b", re.IGNORECASE)
+_TASTE_RE = re.compile(r"^\s*(?:always|never|this client (?:hates|loves))\b",
+                       re.IGNORECASE)
+_QUOTED_RE = re.compile(
+    r"[\"“”]([^\"“”]{2,})[\"“”]"
+    r"|(?<![A-Za-z])['‘]([^'‘’]{2,})['’](?![A-Za-z])")
+_CLAUSE_SPLIT_RE = re.compile(
+    r"(?<=[.!?;])\s+|\s+(?:and then|and also|then|and)\s+"
+    r"(?=(?:please\s+)?(?:cut|remove|drop|lose|delete|trim|take out|"
+    r"get rid of|use|switch|go to|change to|tighten)\b)",
+    re.IGNORECASE)
+_LEAD_FILLER_RE = re.compile(
+    r"^(?:(?:um|uh|so|okay|ok|please|and|the words?|the line|the phrase|"
+    r"that|this|it says)\b[\s,:]*)+", re.IGNORECASE)
+_TRAIL_FILLER_RE = re.compile(
+    r"(?:[\s,]+(?:please|out of (?:the|this) (?:cut|video)|from (?:the|this) "
+    r"(?:cut|video)|out|again|there|in the cut|thanks|thank you))+[.!?]*$",
+    re.IGNORECASE)
+_PART_RE = re.compile(
+    r"^(?:the\s+)?(?:(?:part|bit|line|section|places?|spots?|moments?|"
+    r"times?)\s+)(?:where|when)\s+", re.IGNORECASE)
+
+
+def _clean_quote(text: str) -> str:
+    quote = (text or "").strip().strip("\"“”‘’'").strip()
+    quote = _LEAD_FILLER_RE.sub("", quote)
+    quote = _TRAIL_FILLER_RE.sub("", quote)
+    return quote.strip(" ,.:;!?\"“”‘’'")
+
+
+def _spoken_phrase(text: str) -> str:
+    """The words a clause quotes: typed quotes first, then "where I say
+    X", "every mention of X", then whatever follows the cut verb. Pure."""
+    quoted = [a or b for a, b in _QUOTED_RE.findall(text or "")]
+    if quoted:
+        return _clean_quote(max(quoted, key=len))
+    found = _SAY_RE.search(text or "")
+    if found:
+        return _clean_quote(found.group(1))
+    found = _MENTION_RE.search(text or "")
+    if found:
+        return _clean_quote(found.group(1))
+    found = _CUT_VERB_RE.search(text or "")
+    if found:
+        rest = _PART_RE.sub("", found.group(1).strip())
+        rest = re.sub(r"^(?:where\s+)?(?:i|we)\s+(?:say|said)\s*[:,]?\s*",
+                      "", rest, flags=re.IGNORECASE)
+        return _clean_quote(rest)
+    return ""
+
+
+def _best_quote(job: JobContext, phrase: str, *, unique: bool = False
+                ) -> str:
+    """The phrase itself when it matches the cut's words, else the longest
+    run of its words that does (a misheard edge or a stutter in the note
+    should not lose the cut). `unique` prefers a run matching once (an
+    anchor); otherwise any match. Returns "" when nothing matches. Pure."""
+    tokens = [t for t in re.split(r"\s+", phrase.strip()) if t]
+    if not tokens:
+        return ""
+    if match_kept_ranges(job, phrase):
+        if not unique or len(match_kept_ranges(job, phrase)) == 1:
+            return phrase
+    fallback = ""
+    for size in range(len(tokens) - 1, 0, -1):
+        for start in range(0, len(tokens) - size + 1):
+            window = " ".join(tokens[start:start + size])
+            ranges = match_kept_ranges(job, window)
+            if not ranges:
+                continue
+            if not unique or len(ranges) == 1:
+                return window
+            fallback = fallback or window
+    return fallback
+
+
+def _offline_op(name: str, **over: object) -> dict:
+    op: dict = {"op": name, "beat_id": -1, "attempt_id": -1, "span_id": "",
+                "camera": "", "pause_limit_s": -1, "target_s": -1,
+                "word_start": -1, "word_end": -1, "text": "",
+                "why": "offline rules (Muse unavailable)"}
+    op.update(over)
+    return op
+
+
+def _offline_note(index: int, *, heard: str, kind: str = "none",
+                  quote: str = "", status: str = "resolved",
+                  message: str = "", ops: list[dict] | None = None,
+                  taste: list[str] | None = None,
+                  confidence: float = OFFLINE_CONFIDENCE) -> dict:
+    return {"note_index": index, "heard": heard, "confidence": confidence,
+            "anchor_kind": kind, "at_s": -1, "quote": quote, "beat_id": -1,
+            "status": status, "message": message, "ops": list(ops or []),
+            "taste": list(taste or [])}
+
+
+def _clauses(text: str) -> list[str]:
+    """One note's commands. A clause with no command in it ("At the very
+    start, where I say X.") is context for the command after it. Pure."""
+    parts = [p.strip(" ,") for p in _CLAUSE_SPLIT_RE.split(text or "")
+             if p and p.strip(" ,.")]
+    out: list[str] = []
+    context = ""
+    for part in parts:
+        is_command = bool(
+            _CUT_VERB_RE.search(part) or _ANGLE_VERB_RE.search(part)
+            or _PAUSE_RE.search(part) or _TASTE_RE.search(part))
+        if not is_command:
+            context = f"{context} {part}".strip()
+            continue
+        out.append(f"{context} {part}".strip() if context else part)
+        context = ""
+    if context:
+        if out:
+            out[-1] = f"{out[-1]} {context}"
+        else:
+            out.append(context)
+    return out
+
+
+def _offline_clause(job: JobContext, index: int, clause: str
+                    ) -> dict | None:
+    """One clause to one reply note, or None when no rule reads it."""
+    if _TASTE_RE.search(clause):
+        return _offline_note(index, heard=f"Remember: {clause}",
+                             kind="global", status="preference",
+                             taste=[clause.strip()])
+    camera = _camera_in_text(job, clause)
+    cut = _CUT_VERB_RE.search(clause)
+    quoting = bool(_SAY_RE.search(clause) or _QUOTED_RE.search(clause)
+                   or _MENTION_RE.search(clause))
+    if _PAUSE_RE.search(clause) and not quoting and re.search(
+            r"\b(?:tighten|shorten|too long|shorter|trim|cut)\b", clause,
+            re.IGNORECASE):
+        number = re.search(r"(\d+(?:\.\d+)?)\s*(?:s\b|sec|second)", clause)
+        limit = float(number.group(1)) if number else 0.5
+        op = _offline_op("set_pause_limit", pause_limit_s=limit)
+        return _offline_note(index, heard=f"Shorten pauses over {limit:g}s",
+                             kind="global", ops=[op])
+    cut_to = re.search(r"\bcut (?:to|over to)\b", clause, re.IGNORECASE)
+    if camera and (cut_to or not cut or _ANGLE_VERB_RE.search(
+            clause[:cut.start()] if cut else clause)):
+        where = ""
+        said = _SAY_RE.search(clause)
+        anchor = ""
+        if said:
+            phrase = _clean_quote(re.split(
+                r"[.!?]|\b(?:use|switch|go to|cut to)\b", said.group(1),
+                maxsplit=1, flags=re.IGNORECASE)[0])
+            anchor = _best_quote(job, phrase, unique=True) if phrase else ""
+            if anchor:
+                where = f" where you say “{anchor}”"
+        edge = match_cut_edge(clause)
+        if not where and edge == "start":
+            where = " at the very start"
+        elif not where and edge == "end":
+            where = " at the end"
+        elif not where and re.search(r"\bhere\b", clause, re.IGNORECASE):
+            where = " here"
+        op = _offline_op("set_angle", camera=camera,
+                         why=f"offline rules: “{clause[:80]}”")
+        return _offline_note(
+            index, heard=f"Use camera {camera}{where}",
+            kind="quote" if anchor else "beat", quote=anchor, ops=[op])
+    if cut and not cut_to:
+        phrase = _spoken_phrase(clause)
+        if not phrase:
+            return None
+        # "both/all/every" outside the quoted words ("all the things" is
+        # a phrase, not a request for every match).
+        take_all = bool(TAKE_ALL_RE.search(clause.replace(phrase, " ")))
+        quote = _best_quote(job, phrase) or phrase
+        every = " (every mention)" if take_all else ""
+        op = _offline_op("drop_words", why=f"offline rules: “{clause[:80]}”")
+        return _offline_note(index, heard=f"Cut “{quote}”{every}",
+                             kind="quote", quote=quote, ops=[op])
+    return None
+
+
+def offline_reply_notes(job: JobContext, groups: list[list[Turn]]
+                        ) -> list[dict]:
+    """Rule-based stand-in for the Spark reply: RESOLVE_SCHEMA `notes`.
+    Pure. Every group yields at least one entry; what no rule reads comes
+    back as a plain note with OFFLINE_HELP_MESSAGE (no ops), and a note
+    about the mix or colour is left to verify_resolved's mix rule."""
+    out: list[dict] = []
+    for index, group in enumerate(groups, 1):
+        raw = " ".join(t.text for t in group).strip()
+        made = [note for note in (_offline_clause(job, index, clause)
+                                  for clause in _clauses(raw))
+                if note is not None]
+        if made:
+            out.extend(made)
+        elif _mentions_mix(raw):
+            out.append(_offline_note(index, heard=raw, kind="none"))
+        else:
+            out.append(_offline_note(index, heard=raw, kind="none",
+                                     message=OFFLINE_HELP_MESSAGE))
+    return out
+
+
+def resolve_offline(*, turns: list[Turn], job: JobContext,
+                    anchors: list[float | None], reason: str
+                    ) -> tuple[list[ResolvedNote], float, list[str]]:
+    """The offline twin of `resolve_notes`: same grouping, same
+    verification, no API call, $0. Typed notes come in as one Turn."""
+    if not turns:
+        return [], 0.0, []
+    groups = [turns] if len(anchors) == 1 else group_turns(turns)
+    entries = _assemble_entries(groups, anchors,
+                                offline_reply_notes(job, groups))
+    notes = verify_resolved(job, entries)
+    tag = f"Resolved offline by rules (Muse unavailable: {reason})"
+    for note in notes:
+        if note.message != OFFLINE_HELP_MESSAGE:
+            note.message = (f"{note.message} · {tag}" if note.message
+                            else tag)
+    _, visual_warnings = confirm_visual_notes(job, notes,
+                                              skip_reason=reason)
+    return notes, 0.0, [OFFLINE_WARNING.format(reason=reason),
+                        *visual_warnings]
+
+
+def resolve_typed(job: JobContext, text: str, at_s: float | None = None,
+                  *, reason: str = "offline") -> list[ResolvedNote]:
+    """A typed note through the offline rules (one note, optional playhead).
+    Pure apart from the taste-file read in verification."""
+    turn = Turn(0.0, 1.0, str(text or "").strip())
+    notes, _spend, _warnings = resolve_offline(
+        turns=[turn] if turn.text else [], job=job, anchors=[at_s],
+        reason=reason)
+    return notes
+
+
 def resolve_notes(*, turns: list[Turn], job: JobContext,
                   anchors: list[float | None], model: str
                   ) -> tuple[list[ResolvedNote], float, list[str]]:
@@ -1901,12 +2288,16 @@ def resolve_notes(*, turns: list[Turn], job: JobContext,
 
     Pass `[at_s]` for a live recording (always exactly one note);
     pass `[]` for a file note (grouped mechanically at 1.5 s pauses).
-    Raises VoiceUnavailable only when guestlist cannot be imported.
+    When guestlist cannot be imported, or the Spark call fails for
+    billing, auth or network reasons (`muse_unavailable_reason`), the
+    notes are resolved by the offline rules instead (`resolve_offline`,
+    $0, warned); any other Spark failure raises VoiceError.
     """
     try:
         from guestlist.meta import cache, spark
-    except ImportError as error:
-        raise VoiceUnavailable(str(error)) from error
+    except ImportError:
+        return resolve_offline(turns=turns, job=job, anchors=anchors,
+                               reason="no Meta client")
     if not turns:
         return [], 0.0, []
     groups = [turns] if len(anchors) == 1 else group_turns(turns)
@@ -1920,8 +2311,8 @@ def resolve_notes(*, turns: list[Turn], job: JobContext,
         spend = 0.0
         warnings.append("resolve served from cache ($0)")
     else:
-        cache.guard(0.25)
         try:
+            cache.guard(0.25)
             result = spark._structured(
                 key, [{"type": "input_text", "text": prompt}],
                 schema=RESOLVE_SCHEMA, name="voice_resolve",
@@ -1929,6 +2320,10 @@ def resolve_notes(*, turns: list[Turn], job: JobContext,
                 max_output_tokens=RESOLVE_MAX_OUTPUT_TOKENS,
                 record={}, detail={"notes": len(groups)})
         except Exception as error:
+            reason = muse_unavailable_reason(error)
+            if reason is not None:
+                return resolve_offline(turns=turns, job=job,
+                                       anchors=anchors, reason=reason)
             raise VoiceError(
                 "voice: Muse could not resolve the notes "
                 f"({type(error).__name__}: {error}); the transcript is "
@@ -1961,7 +2356,8 @@ def _camera_on_screen(job: JobContext, at_s: float) -> str:
     return str(shot.get("camera", "")) if shot else ""
 
 
-def confirm_visual_notes(job: JobContext, notes: list[ResolvedNote]
+def confirm_visual_notes(job: JobContext, notes: list[ResolvedNote],
+                         *, skip_reason: str | None = None
                          ) -> tuple[float, list[str]]:
     """The one bounded image call per visual note. Mutates notes' ops.
 
@@ -1969,7 +2365,9 @@ def confirm_visual_notes(job: JobContext, notes: list[ResolvedNote]
     kitchen") and whose anchor landed by quote or timecode gets its
     set_angle ops confirmed against stills from cut.mp4. Unconfirmed —
     or over the four-frame budget — the angle becomes a note. Without
-    the Meta client the ops survive with a soft check.
+    the Meta client the ops survive with a soft check; so they do when
+    Muse is unavailable (`skip_reason`, or a billing/network failure on
+    the first call), with one warning and no further calls.
     """
     targets = [note for note in notes
                if note.status == "resolved"
@@ -1980,6 +2378,20 @@ def confirm_visual_notes(job: JobContext, notes: list[ResolvedNote]
                and _mentions_visual(f"{note.raw_text} {note.heard}")]
     if not targets:
         return 0.0, []
+
+    def _skip(reason: str, todo: list[ResolvedNote]) -> str:
+        for note in todo:
+            for op in note.ops:
+                if op.get("op") == "set_angle" and not op.get("blocked"):
+                    op["checks"] = list(op.get("checks", [])) + [{
+                        "ok": True,
+                        "text": (f"Frame check skipped (Muse unavailable: "
+                                 f"{reason})"),
+                        "hard": False}]
+        return f"Muse unavailable ({reason}), frame check skipped"
+
+    if skip_reason:
+        return 0.0, [_skip(skip_reason, targets)]
     try:
         from guestlist.meta import cache, spark
     except ImportError:
@@ -2038,6 +2450,10 @@ def confirm_visual_notes(job: JobContext, notes: list[ResolvedNote]
                 model=RESOLVE_MODEL, effort="medium",
                 max_output_tokens=500)
         except Exception as error:
+            reason = muse_unavailable_reason(error)
+            if reason is not None:
+                warnings.append(_skip(reason, targets[num:]))
+                break
             warnings.append(
                 f"voice_visual_failed:{type(error).__name__}")
             _downgrade_visual(note)
@@ -2333,9 +2749,10 @@ def run(*, note_path: Path, job_dir: Path | None = None,
     work.mkdir(parents=True, exist_ok=True)
     wav = work / f"{note_path.stem}.wav"
     run_command(extract_audio_command(note_path, wav))
+    heard_warnings: list[str] = []
     turns, engine, transcribe_spend = transcribe_wav(
         wav, duration_s=duration, allow_whisper=allow_whisper,
-        work_dir=work)
+        work_dir=work, warnings=heard_warnings)
     transcript = " ".join(t.text for t in turns)
     payload: dict = {
         "version": 1, "note_file": note_path.name, "engine": engine,
@@ -2344,7 +2761,7 @@ def run(*, note_path: Path, job_dir: Path | None = None,
         "turns": [{"start_s": round(t.start_s, 3),
                    "end_s": round(t.end_s, 3), "text": t.text,
                    "speaker": t.speaker} for t in turns],
-        "warnings": [],
+        "warnings": list(heard_warnings),
     }
     payload_path = job.job_dir / "voice.json"
 
@@ -2406,7 +2823,10 @@ def run(*, note_path: Path, job_dir: Path | None = None,
         note_dicts.append(note.as_dict())
     payload["notes"] = note_dicts
     payload["spend_usd"] = total
-    payload["warnings"] = list(warnings)
+    payload["warnings"] = list(heard_warnings) + list(warnings)
+    payload["resolver"] = ("rules" if any(
+        "resolved offline by rules" in str(w) for w in warnings)
+        else "muse")
     _, taste_warnings = load_taste_with_warnings(job.job_dir)
     payload["warnings"].extend(taste_warnings)
     if apply:

@@ -105,6 +105,7 @@ From [docs/muse-code/BUILD-LOG.md](docs/muse-code/BUILD-LOG.md) and the git log,
 | Slow push-in on every shot (`angles`/`cut --push-in`) | Built by Muse Code on muse-spark-1.3 from PUSH-BRIEF.md, after my review of the final take |
 | Phrase-level voice-note cuts (`drop_words`, quote ranges, cut-edge anchors) | Built by Muse Code on muse-spark-1.3 from VOICEFIX-BRIEF.md, after my review of the final take |
 | Card offload (`director offload`, Ghost on the Import tab) | Built by Muse Code on muse-wonder-1.0 from OFFLOAD-BRIEF.md, after the owner's review of the app on submission day |
+| Voice notes without Muse (offline resolver, Whisper fall-through on a 402) | Built by Claude Code (Opus) after the Meta API credit ran out on submission day; see BUILD-LOG.md, "VOICE-OFFLINE" |
 | The Director app, Render, and the test-run scripts in `scripts/` | Built by Claude Code with me (imported into this repository) |
 | The briefs in `docs/muse-code/` | Me, with Claude Code |
 
