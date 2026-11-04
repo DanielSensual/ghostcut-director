@@ -172,6 +172,23 @@ class PlanRunTests(unittest.TestCase):
             self.assertTrue(all(e.skipped for e in again.entries))
             self.assertEqual(again.bytes_to_copy, 0)
 
+    def test_skipped_file_changed_after_plan_is_copied_again(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source = root / "card" / "clip.mp4"
+            write(source, b"original")
+            clip = offload.ClipInfo(source, 8, 1.0, None, "mtime",
+                                    camera_label="Camera", volume=source.parent)
+            scan = offload.CardScan(source.parent, [clip])
+            offload.run_offload(offload.plan_offload([scan], root / "dest"))
+            plan = offload.plan_offload([scan], root / "dest")
+            self.assertTrue(plan.entries[0].skipped)
+            plan.entries[0].destination.write_bytes(b"corrupt!")
+            result = offload.run_offload(plan)
+            self.assertEqual(plan.entries[0].destination.read_bytes(), source.read_bytes())
+            self.assertTrue(result.entries[0].verified)
+            self.assertFalse(result.entries[0].skipped)
+
     def test_space_refusal_names_the_numbers(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

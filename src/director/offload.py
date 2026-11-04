@@ -1068,7 +1068,7 @@ def run_offload(plan: OffloadPlan, progress=None) -> OffloadResult:
         if entry.skipped:
             # Re-confirm cheaply: a same-size file is still there.
             try:
-                still = dest.is_file() and dest.stat().st_size == entry.size_bytes
+                still = dest.is_file() and dest.stat().st_size == entry.size_bytes and file_checksum(dest) == file_checksum(entry.source)
             except OSError:
                 still = False
             if still:
