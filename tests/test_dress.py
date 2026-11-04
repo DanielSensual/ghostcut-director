@@ -168,7 +168,7 @@ class AssTests(_NoKeys):
         ass = dress.build_ass(self.cards, measurer=measure)
         self.assertIn("PlayResX: 1920", ass)
         self.assertIn("0:00:05.00,0:00:07.60", ass)
-        self.assertIn("\\an5\\pos(330,150)", ass)
+        self.assertIn("\\an5\\pos(466,150)", ass)  # margin 60 + ghost slot 170 + half of a 472 px pill
         self.assertIn("\\t(0,140,\\fscx108\\fscy108)", ass)
         self.assertIn("\\fad(0,200)", ass)
         self.assertIn("\\p1", ass)

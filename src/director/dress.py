@@ -1020,10 +1020,13 @@ def _default_measurer(text: str) -> float:
         from PIL import ImageFont
 
         font = ImageFont.truetype(
-            str(captions_mod.SHIPPED_POPPINS), 64)
-        return float(font.getlength(text))
+            str(captions_mod.SHIPPED_POPPINS), CARD_FONT)
+        # libass sizes a font by its line height (ascent + descent), PIL
+        # by the em square, so scale PIL's width to what libass draws.
+        ascent, descent = font.getmetrics()
+        return float(font.getlength(text)) * CARD_FONT / (ascent + descent)
     except Exception:  # noqa: BLE001 - Pillow/font missing in tests
-        return float(len(text) * 34)
+        return float(len(text) * 28)
 
 
 def pill_path(width: float, height: float) -> str:
@@ -1048,7 +1051,12 @@ def pill_path(width: float, height: float) -> str:
 
 CARD_Y = 150
 CARD_MARGIN_X = 60
-PILL_PAD_X = 56
+PILL_PAD_X = 72
+CARD_FONT = 84
+PILL_H = 96.0
+# The ghost sits in this slot at the frame's outer edge, so it never
+# lands on the speaker's face in the middle of the frame.
+GHOST_SLOT = 170
 
 
 def card_position(card: dict, index: int,
@@ -1065,19 +1073,19 @@ def card_position(card: dict, index: int,
     if pos == "top-center":
         return (960, CARD_Y)
     if pos == "top-right":
-        return (int(min(1590, 1920 - CARD_MARGIN_X - half)), CARD_Y)
-    return (int(max(330, CARD_MARGIN_X + half)), CARD_Y)
+        return (int(1920 - CARD_MARGIN_X - GHOST_SLOT - half), CARD_Y)
+    return (int(CARD_MARGIN_X + GHOST_SLOT + half), CARD_Y)
 
 
 def ghost_position(card: dict, index: int,
                    pill_width: float) -> tuple[int, int]:
     """(x, y) of the ghost sprite centre beside its pill."""
-    x, y = card_position(card, index, pill_width)
-    offset = int(pill_width / 2 + 130)
+    _, y = card_position(card, index, pill_width)
+    edge = CARD_MARGIN_X + GHOST_SLOT // 2
     if card.get("pos") == "top-right" or (
             not card.get("pos") and index % 2 == 1):
-        return (x - offset, y)
-    return (x + offset, y)
+        return (1920 - edge, y)
+    return (edge, y)
 
 
 def build_ass(cards, *, base_ass: str | None = None, measurer=None,  # noqa: ANN001
@@ -1099,7 +1107,7 @@ def build_ass(cards, *, base_ass: str | None = None, measurer=None,  # noqa: ANN
         text = str(card.get("text", ""))
         pill_w = float(measure(text)) + PILL_PAD_X
         x, y = card_position(card, index, pill_w)
-        pill_h = 84.0
+        pill_h = PILL_H
         drawing = pill_path(pill_w, pill_h)
         start_s = captions_mod.format_ass_time(start)
         end_s = captions_mod.format_ass_time(end)
@@ -1118,9 +1126,9 @@ def build_ass(cards, *, base_ass: str | None = None, measurer=None,  # noqa: ANN
         card_lines.append(
             f"Dialogue: 1,{start_s},{end_s},Card,,0,0,0,,{text_event}")
     styles = (
-        "Style: Card,Poppins SemiBold,64,&H00FFFFFF,&H00FFFFFF,"
+        "Style: Card,Poppins SemiBold," + str(CARD_FONT) + ",&H00FFFFFF,&H00FFFFFF,"
         "&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,5,0,0,0,1\n"
-        "Style: CardPill,Poppins SemiBold,64,&H00FFFFFF,&H00FFFFFF,"
+        "Style: CardPill,Poppins SemiBold," + str(CARD_FONT) + ",&H00FFFFFF,&H00FFFFFF,"
         "&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,5,0,0,0,1")
     if base_ass is not None:
         base = base_ass if base_ass.endswith("\n") else base_ass + "\n"
@@ -1586,7 +1594,7 @@ def _default_plan(job: Path, source: Path, duration: float) -> dict:
         "title": title,
         "captions": {"enabled": caps is not None, "preset": "house"},
         "cards": [],
-        "ghost": {"enabled": True, "size_px": 200, "sfx": True},
+        "ghost": {"enabled": True, "size_px": 150, "sfx": True},
         "music": {"enabled": True, "prompt": DEFAULT_MUSIC_PROMPT,
                   "gain_db": MUSIC_GAIN_DEFAULT, "duck": True,
                   "asset": None},
